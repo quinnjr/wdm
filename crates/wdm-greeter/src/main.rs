@@ -77,6 +77,8 @@ struct App {
 
     user_index: usize,
     session_index: usize,
+    /// Whether the session drop-down is open.
+    menu_open: bool,
     prompt: Option<Prompt>,
     answer: String,
     error: Option<String>,
@@ -110,6 +112,7 @@ impl App {
             ready: false,
             user_index: 0,
             session_index: 0,
+            menu_open: false,
             prompt: None,
             answer: String::new(),
             error: None,
@@ -170,17 +173,68 @@ impl App {
         }
         self.user_index = (self.user_index + 1) % self.users.len();
         self.select_last_session();
+        // A drop-down left open would now be showing the previous user's choice.
+        self.menu_open = false;
         self.error = None;
         // The conversation is per user, so switching users means starting over.
         self.restart_auth();
     }
 
-    fn cycle_session(&mut self) {
+    /// Open or close the session drop-down.
+    fn toggle_menu(&mut self) {
         if self.sessions.len() < 2 {
             return;
         }
-        self.session_index = (self.session_index + 1) % self.sessions.len();
+        self.menu_open = !self.menu_open;
         self.needs_redraw = true;
+    }
+
+    /// Move the drop-down selection by `delta`, wrapping at both ends.
+    ///
+    /// Wrapping rather than clamping because the list is short and reaching the
+    /// last entry from the first should not need five keystrokes.
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.sessions.len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        let index = self.session_index as isize + delta;
+        self.session_index = index.rem_euclid(len) as usize;
+        self.needs_redraw = true;
+    }
+
+    /// Keys that belong to the drop-down while it is open.
+    ///
+    /// Returns true when the key was consumed, so Enter and Escape choose and
+    /// dismiss rather than submitting the password or clearing the field.
+    fn menu_key(&mut self, keysym: xkbcommon::xkb::Keysym) -> bool {
+        use xkbcommon::xkb::keysyms;
+
+        match keysym.raw() {
+            keysyms::KEY_Up | keysyms::KEY_k => self.move_selection(-1),
+            keysyms::KEY_Down | keysyms::KEY_j => self.move_selection(1),
+            keysyms::KEY_Home => {
+                self.session_index = 0;
+                self.needs_redraw = true;
+            }
+            keysyms::KEY_End => {
+                self.session_index = self.sessions.len().saturating_sub(1);
+                self.needs_redraw = true;
+            }
+            keysyms::KEY_Return
+            | keysyms::KEY_KP_Enter
+            | keysyms::KEY_Escape
+            | keysyms::KEY_F2 => {
+                // Escape and Enter both close on the highlighted row: moving the
+                // highlight *is* the selection, so there is nothing to revert.
+                self.menu_open = false;
+                self.needs_redraw = true;
+            }
+            _ => return false,
+        }
+
+        true
     }
 
     /// Answer the pending prompt.
@@ -278,18 +332,17 @@ impl App {
             ui::paint_message(&mut canvas, "No sessions installed", true);
         } else {
             let user = &self.users[self.user_index];
-            let session_name = self
-                .sessions
-                .get(self.session_index)
-                .map(|s| s.name.as_str())
-                .unwrap_or("none");
+            let session_names: Vec<String> =
+                self.sessions.iter().map(|s| s.name.clone()).collect();
 
             ui::paint(
                 &mut canvas,
                 &ui::View {
                     username: &user.name,
                     display_name: &user.display_name,
-                    session_name,
+                    sessions: &session_names,
+                    session_index: self.session_index,
+                    menu_open: self.menu_open,
                     prompt: self.prompt.as_ref().map(|p| p.text.as_str()),
                     answer: &self.answer,
                     // Masked unless PAM said the answer may be echoed. Defaulting
@@ -324,6 +377,12 @@ impl App {
     fn key(&mut self, keysym: xkbcommon::xkb::Keysym, utf8: String) {
         use xkbcommon::xkb::keysyms;
 
+        // The drop-down takes precedence: while it is open, Enter chooses a
+        // session rather than submitting a half-typed password.
+        if self.menu_open && self.menu_key(keysym) {
+            return;
+        }
+
         match keysym.raw() {
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => self.submit(),
 
@@ -339,7 +398,7 @@ impl App {
             }
 
             keysyms::KEY_F1 => self.cycle_user(),
-            keysyms::KEY_F2 => self.cycle_session(),
+            keysyms::KEY_F2 => self.toggle_menu(),
 
             // Ctrl+U, the readline convention for clearing the line.
             keysyms::KEY_U | keysyms::KEY_u if self.ctrl_held() => {
