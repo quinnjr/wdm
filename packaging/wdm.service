@@ -1,0 +1,35 @@
+[Unit]
+Description=wdm display manager
+Documentation=man:wdm(1)
+# systemd-user-sessions.target removes /run/nologin, so logins are permitted by
+# the time wdm offers a prompt.
+After=systemd-user-sessions.service plymouth-quit-wait.service
+After=getty@tty7.service
+# Deliberately no Conflicts=: wdm runs on VT 7, which no getty is enabled on.
+# tty1 stays a working text console, which is the recovery path when a
+# third-party greeter wedges.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wdm
+Restart=always
+RestartSec=1
+# Past the limit wdm stays down rather than flickering forever. tty1 still works.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# wdm needs to be root: it owns DRM master, reads the shadow database through
+# PAM, and drops privileges itself when launching the greeter and the session.
+User=root
+
+# The greeter's runtime directory and the Wayland socket live here, owned by the
+# unprivileged greeter user.
+RuntimeDirectory=wdm
+RuntimeDirectoryMode=0700
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+Alias=display-manager.service
+WantedBy=graphical.target

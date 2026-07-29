@@ -1,0 +1,20 @@
+# PAM configuration for wdm.
+#
+# Install as /etc/pam.d/wdm.
+#
+# Modelled on the stack a display manager needs: authenticate the user, check the
+# account is allowed in, then open a session so pam_systemd creates the logind
+# session and XDG_RUNTIME_DIR that wdm passes to the launched session. Without
+# pam_systemd there is no XDG_RUNTIME_DIR and most desktops will not start.
+
+auth        include     system-login
+-auth       optional    pam_gnome_keyring.so
+-auth       optional    pam_kwallet5.so
+
+account     include     system-login
+
+password    include     system-login
+
+session     include     system-login
+-session    optional    pam_gnome_keyring.so auto_start
+-session    optional    pam_kwallet5.so auto_start

@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wdm_greeter_v1">
+  <copyright>
+    Copyright © 2026 Joseph R. Quinn
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="wdm_greeter_v1" version="1">
+    <description summary="login and session control for a wdm greeter">
+      The singleton object a wdm greeter binds to log a user in.
+
+      The protocol has three phases. On bind the compositor pushes the
+      enumerate phase: the available users, the available sessions, the rank of
+      each output, and any error from a previous failed launch, terminated by
+      "done". The authenticate phase mirrors PAM's conversation, since PAM asks
+      an arbitrary number of questions in an arbitrary order. The launch phase
+      is a single start_session request, after which the compositor tears the
+      greeter down and hands the display to the user's session.
+
+      The compositor performs authentication itself; credentials never reach a
+      process that can read the shadow database. The greeter is untrusted and
+      rate limiting is enforced compositor-side.
+    </description>
+
+    <enum name="error">
+      <entry name="auth_in_progress" value="0"
+             summary="create_session while a conversation is already active"/>
+      <entry name="no_auth" value="1"
+             summary="respond or start_session outside an authenticated state"/>
+      <entry name="stale_prompt" value="2"
+             summary="respond carried an id that is not the pending prompt"/>
+      <entry name="invalid_session" value="3"
+             summary="start_session named a session id that was never advertised"/>
+      <entry name="invalid_env" value="4"
+             summary="the env array is not NUL-separated KEY=VALUE entries"/>
+    </enum>
+
+    <enum name="session_type">
+      <description summary="how a session expects to be displayed">
+        A wayland session is expected to acquire DRM master itself once the
+        compositor has released it. An x11 session is expected to bring up its
+        own X server; wdm never starts one.
+      </description>
+      <entry name="wayland" value="0" summary="from /usr/share/wayland-sessions"/>
+      <entry name="x11" value="1" summary="from /usr/share/xsessions"/>
+    </enum>
+
+    <enum name="prompt_style">
+      <description summary="how a prompt should be presented">
+        Mirrors PAM's message styles. secret and visible expect a response;
+        info and error do not, and the compositor advances the conversation on
+        its own after emitting them.
+      </description>
+      <entry name="secret" value="0" summary="response must not be echoed"/>
+      <entry name="visible" value="1" summary="response may be echoed"/>
+      <entry name="info" value="2" summary="informational, no response expected"/>
+      <entry name="error" value="3" summary="error text, no response expected"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="release the object">
+        Destroying the object cancels any conversation in progress.
+      </description>
+    </request>
+
+    <request name="create_session">
+      <description summary="begin authenticating a user">
+        Starts a PAM conversation for the named user. The compositor answers
+        with a series of prompt events and finally auth_ok or auth_failed.
+
+        Raises auth_in_progress if a conversation is already active; call
+        cancel first. The compositor rate limits repeated attempts and may
+        delay a response, so a greeter must not assume a prompt arrives
+        promptly.
+      </description>
+      <arg name="username" type="string" summary="a user advertised by a user event"/>
+    </request>
+
+    <request name="respond">
+      <description summary="answer the pending prompt">
+        The id must match the pending prompt or stale_prompt is raised; this
+        keeps a slow greeter from answering a question that has been replaced.
+      </description>
+      <arg name="id" type="uint" summary="the id from the prompt event"/>
+      <arg name="response" type="string" summary="the user's answer"/>
+    </request>
+
+    <request name="cancel">
+      <description summary="abandon the conversation">
+        Aborts the PAM conversation. No auth_ok or auth_failed follows. It is
+        not an error to cancel when no conversation is active.
+      </description>
+    </request>
+
+    <request name="start_session">
+      <description summary="launch a session for the authenticated user">
+        Valid only after auth_ok, otherwise no_auth is raised.
+
+        On success the compositor releases DRM master, disconnects the greeter,
+        and executes the session. There is no reply: a successful launch ends
+        this connection. If the launch fails the greeter is relaunched and told
+        why through last_error.
+      </description>
+      <arg name="session_id" type="string" summary="an id from a session event"/>
+      <arg name="env" type="array"
+           summary="additional NUL-separated KEY=VALUE entries for the session"/>
+    </request>
+
+    <event name="user">
+      <description summary="advertise a loginable user">
+        Sent during the enumerate phase for each user with a uid at or above
+        UID_MIN whose shell is not a nologin shell.
+      </description>
+      <arg name="name" type="string" summary="the login name"/>
+      <arg name="display_name" type="string" summary="from GECOS, may be empty"/>
+      <arg name="avatar_path" type="string" summary="absolute path, empty if none"/>
+      <arg name="last_session" type="string"
+           summary="session id used at this user's last successful login, empty if none"/>
+    </event>
+
+    <event name="session">
+      <description summary="advertise an available session"/>
+      <arg name="id" type="string" summary="stable identifier, the desktop file name"/>
+      <arg name="name" type="string" summary="human readable name"/>
+      <arg name="exec" type="string" summary="the command line to be executed"/>
+      <arg name="type" type="uint" enum="session_type" summary="wayland or x11"/>
+    </event>
+
+    <event name="output_rank">
+      <description summary="assign an output its priority">
+        Rank 0 is the primary output. Ranks are contiguous from 0 across all
+        currently connected outputs, ordered by the compositor's configuration.
+
+        Re-emitted whenever the set of connected outputs changes, so unplugging
+        the primary output promotes another to rank 0 and the greeter is
+        expected to move its login surface. Policy is the greeter's: it may
+        draw only on rank 0, or draw on every output and place the login form
+        on rank 0.
+      </description>
+      <arg name="output" type="object" interface="wl_output"/>
+      <arg name="rank" type="uint" summary="0 is primary"/>
+    </event>
+
+    <event name="last_error">
+      <description summary="report why the previous launch failed">
+        Sent during the enumerate phase only when the greeter was relaunched
+        after a failed session launch. Without this a user sees an unexplained
+        bounce back to the login screen.
+      </description>
+      <arg name="text" type="string" summary="human readable cause"/>
+    </event>
+
+    <event name="done">
+      <description summary="the enumerate phase is complete">
+        All initial user, session, output_rank and last_error events have been
+        sent. output_rank may still be re-emitted later on hotplug.
+      </description>
+    </event>
+
+    <event name="prompt">
+      <description summary="PAM is asking something">
+        Answer with respond carrying the same id. Only one prompt is pending at
+        a time. Prompts with style info or error expect no response.
+      </description>
+      <arg name="id" type="uint" summary="echo this back in respond"/>
+      <arg name="text" type="string" summary="the question or message"/>
+      <arg name="style" type="uint" enum="prompt_style"/>
+    </event>
+
+    <event name="auth_ok">
+      <description summary="the user is authenticated">
+        start_session may now be sent.
+      </description>
+    </event>
+
+    <event name="auth_failed">
+      <description summary="authentication did not succeed">
+        The conversation is over. create_session may be sent again, subject to
+        rate limiting.
+      </description>
+      <arg name="reason" type="string" summary="human readable cause"/>
+    </event>
+  </interface>
+</protocol>

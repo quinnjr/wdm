@@ -1,0 +1,15 @@
+[package]
+name = "wdm-greeter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+env_logger = "0.11.11"
+fontdue = "0.9.4"
+log.workspace = true
+rustix = { version = "1.1.4", features = ["fs"] }
+wayland-client.workspace = true
+wayland-protocols-wlr = { workspace = true, features = ["client"] }
+wdm-protocol = { workspace = true, features = ["client"] }
+xkbcommon = "0.9.0"

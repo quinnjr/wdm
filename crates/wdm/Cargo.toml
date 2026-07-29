@@ -1,0 +1,24 @@
+[package]
+name = "wdm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+calloop = "0.14.4"
+env_logger = "0.11.11"
+fontdue = "0.9.4"
+freedesktop-desktop-entry = "0.8.1"
+libc = "0.2.189"
+log.workspace = true
+pam-client2 = { version = "0.5.5", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_egl", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "renderer_gl", "wayland_frontend", "desktop", "use_system_lib", "backend_gbm"] }
+thiserror.workspace = true
+toml = "1.1.4"
+uzers = "0.12.2"
+wdm-protocol = { workspace = true, features = ["server"] }
+zeroize = "1.9.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

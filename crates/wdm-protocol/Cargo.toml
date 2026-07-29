@@ -1,0 +1,18 @@
+[package]
+name = "wdm-protocol"
+description = "Wayland protocol bindings for wdm greeters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+client = ["wayland-client", "wayland-protocols/client"]
+server = ["wayland-server", "wayland-protocols/server"]
+
+[dependencies]
+wayland-scanner.workspace = true
+wayland-protocols.workspace = true
+wayland-client = { workspace = true, optional = true }
+wayland-server = { workspace = true, optional = true }
+wayland-backend = "0.3"

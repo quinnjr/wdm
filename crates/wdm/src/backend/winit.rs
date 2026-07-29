@@ -1,0 +1,184 @@
+//! Nested backend: wdm as an ordinary window inside an existing session.
+//!
+//! This is the development and test path. It exercises the protocol, the PAM
+//! conversation, the greeter lifecycle, enumerate and output ranking with no
+//! root and no VT switching. What it deliberately does not exercise is DRM, the
+//! seat, and the handoff — there is no display to hand over, so a launched
+//! session runs without one and is only useful for checking that the environment
+//! and privilege drop are right.
+
+use std::time::{Duration, Instant};
+
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::{Color32F, Frame, Renderer};
+use smithay::backend::winit::{self, WinitEvent};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::wayland_server::Display;
+use smithay::reexports::winit::platform::pump_events::PumpStatus;
+use smithay::utils::{Rectangle, Transform};
+
+use crate::comp::{LoopData, Wdm};
+use crate::config::Config;
+
+use super::{Handled, handle_action, poll_greeter};
+
+/// How long the loop blocks waiting for events before drawing again.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut event_loop: EventLoop<'static, LoopData> = EventLoop::try_new()?;
+    let mut display: Display<Wdm> = Display::new()?;
+    let handle = display.handle();
+    let loop_handle = event_loop.handle();
+
+    // Never privileged: this backend exists to run as a normal user, so there is
+    // no separate greeter account and nothing to drop.
+    let (mut state, socket_name) = super::setup::build(&mut display, &loop_handle, config, false)?;
+
+    let (mut backend, mut winit_events) = winit::init::<GlesRenderer>()?;
+
+    // A stand-in for a connector. The name is not a real connector, so config
+    // output blocks will not match it — correct, since there is no monitor here.
+    let output = Output::new(
+        "WINIT-1".to_owned(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "wdm".to_owned(),
+            model: "winit".to_owned(),
+        },
+    );
+    output.create_global::<Wdm>(&handle);
+
+    let mut mode = Mode {
+        size: backend.window_size(),
+        refresh: 60_000,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.set_outputs(vec![output.clone()]);
+
+    let mut data = LoopData { state, display };
+    super::setup::start(&mut data, &socket_name)?;
+
+    let start = Instant::now();
+
+    while data.state.running {
+        let status = winit_events.dispatch_new_events(|event| match event {
+            WinitEvent::Resized { size, .. } => {
+                mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
+                output.change_current_state(Some(mode), None, None, None);
+                output.set_preferred(mode);
+                // The greeter must be reconfigured before the next frame or it
+                // draws at the old size.
+                data.state.configure_layers();
+            }
+            WinitEvent::Input(event) => {
+                if let Some(vt) = crate::input::handle(&mut data.state, event) {
+                    // There is no seat here, so this is the one input behaviour
+                    // the nested backend cannot honour.
+                    log::info!("ignoring VT switch to {} in the nested backend", vt.0);
+                }
+            }
+            WinitEvent::CloseRequested => data.state.running = false,
+            _ => {}
+        });
+
+        if matches!(status, PumpStatus::Exit(_)) {
+            data.state.running = false;
+        }
+
+        poll_greeter(&mut data, &loop_handle);
+
+        if let Handled::HandOff(launch) = handle_action(&mut data, &loop_handle) {
+            // Nothing to release: the nested backend never held a display. The
+            // session is still spawned so the environment and privilege drop can
+            // be inspected, but it will not find a compositor to talk to.
+            log::warn!(
+                "launching a session for {} without a display to hand over",
+                launch.username()
+            );
+            match launch.spawn() {
+                Ok(child) => data.state.session = Some(child),
+                Err(e) => log::error!("spawning session: {e}"),
+            }
+            data.state.running = false;
+        }
+
+        if let Err(e) = render(&mut data, &mut backend, &output, start) {
+            log::error!("rendering: {e}");
+        }
+
+        if let Err(e) = data.dispatch() {
+            log::error!("dispatching clients: {e}");
+        }
+
+        if event_loop
+            .dispatch(Some(FRAME_INTERVAL), &mut data)
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn render(
+    data: &mut LoopData,
+    backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
+    output: &Output,
+    start: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let size = backend.window_size();
+    let damage = [Rectangle::from_size(size)];
+    let give_up = data.state.give_up_reason.clone();
+
+    // Scoped: the framebuffer borrows the backend, and submit() needs it back.
+    {
+        let (renderer, mut framebuffer) = backend.bind()?;
+
+        // The error screen is an image, not a client surface, so it is built and
+        // uploaded per frame. Wasteful, but it only happens once wdm has stopped
+        // trying to run a greeter and nothing else is competing for the GPU.
+        let error_texture = match &give_up {
+            Some(reason) => Some(crate::render::error_texture(renderer, reason, size)?),
+            None => None,
+        };
+
+        let elements = match &error_texture {
+            Some(_) => Vec::new(),
+            None => data.state.elements(renderer, output),
+        };
+
+        // Flipped180 because winit's framebuffer origin is the opposite of ours.
+        let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+        frame.clear(Color32F::new(0.05, 0.05, 0.07, 1.0), &damage)?;
+
+        if let Some(texture) = &error_texture {
+            crate::render::draw_fullscreen(&mut frame, texture, size, &damage)?;
+        } else {
+            smithay::backend::renderer::utils::draw_render_elements(
+                &mut frame, 1.0, &elements, &damage,
+            )?;
+        }
+
+        // The nested compositor synchronises for us, so the fence needs no wait.
+        let _sync = frame.finish()?;
+    }
+
+    backend.submit(Some(&damage))?;
+
+    data.state.send_frames(start.elapsed().as_millis() as u32);
+
+    Ok(())
+}

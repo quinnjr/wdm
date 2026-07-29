@@ -1,0 +1,48 @@
+# wdm configuration. Install as /etc/wdm/wdm.toml.
+# Every value shown is the default unless noted; the file itself is optional.
+
+# Virtual terminal to run on. VT 7 is free on a default systemd install, so wdm
+# needs no Conflicts= against a getty and tty1 remains available for recovery.
+vt = 7
+
+# Session offered to a user with no recorded last session. wdm reports this to
+# the greeter as a fallback; preselecting it is the greeter's policy.
+#default_session = "hyprland.desktop"
+
+[greeter]
+command = "/usr/lib/wdm/wdm-greeter"
+# Must not be root. The greeter is untrusted code hosted by the process that
+# owns DRM master, so it runs as an unprivileged account with no shell.
+user = "wdm"
+
+# xkb settings for the login screen. Configured here because there is no user
+# whose preferences could be consulted yet, and someone who cannot type their
+# password on their own layout cannot log in.
+[keyboard]
+layout = "us"
+#variant = ""
+#model = ""
+#options = "ctrl:nocaps"
+#rules = ""
+
+# Outputs, in priority order. Array position is the rank: the first entry is
+# rank 0, the primary, and that is where a greeter puts its login form. Ranks are
+# recomputed on hotplug, so unplugging the primary promotes the next entry.
+#
+# Connectors not listed rank after every listed one, sorted by name — so the
+# primary output does not move between boots.
+#
+#[[output]]
+#connector = "DP-1"
+#mode = "2560x1440@144"     # WIDTHxHEIGHT or WIDTHxHEIGHT@REFRESH
+#scale = 1.5                # fractional scales are allowed
+#transform = "normal"       # normal, 90, 180, 270, flipped, flipped-90, ...
+#
+#[[output]]
+#connector = "DP-2"
+#mode = "1920x1080@60"
+#
+# A display that should never show a password prompt: blanked, and given no rank.
+#[[output]]
+#connector = "HDMI-A-1"
+#enable = false
