@@ -10,13 +10,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
 wdm-protocol = { path = "crates/wdm-protocol", version = "0.1.0" }
-wdm-greeter-client = { path = "crates/wdm-greeter-client", version = "0.1.1" }
+wdm-greeter-client = { path = "crates/wdm-greeter-client", version = "0.1.2" }
 
 wayland-server = "0.31"
 wayland-client = "0.31"
