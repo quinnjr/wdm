@@ -21,7 +21,7 @@ makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
 # nothing in the repositories provides it.
 provides=('wdm-greeter-implementation')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('8cd9793c483cb63eb5ab2933ae56a75d998104d120821df99449dd06be2641a3')
+sha256sums=('37026b6934eb9b030fa3a3767866735823df906ab26bd2c81c7108754f1a23ef')
 
 prepare() {
   cd "$pkgbase-$pkgver"
