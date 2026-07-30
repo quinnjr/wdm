@@ -1,0 +1,103 @@
+# Maintainer: Joseph R. Quinn <quinn.josephr@protonmail.com>
+
+pkgbase=wdm
+pkgname=('wdm' 'wdm-greeter' 'wdm-gtk-greeter')
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A Wayland display manager that is its own compositor'
+arch=('x86_64' 'aarch64')
+url='https://github.com/quinnjr/wdm'
+license=('MIT')
+makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
+             'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell')
+# wdm needs *a* greeter, and either of the two below satisfies it, so pacman
+# prompts for a choice when only `wdm` is requested. The greeters deliberately
+# do not depend on wdm in return: that would make the pair circular.
+#
+# namcap reports "Split PKGBUILD needs additional makedepends
+# ['wdm-greeter-implementation']" for this. It is a false positive — namcap
+# does not resolve a virtual provided by a sibling package of the same split,
+# and adding it to makedepends would make the package unbuildable, since
+# nothing in the repositories provides it.
+provides=('wdm-greeter-implementation')
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('375bed8aa4556629a06591a1965ef7cc3b447af68d079650069bff450f2d7b40')
+
+prepare() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-targets
+}
+
+check() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Tests are in-file unit tests; a few read the real passwd database and the
+  # session directories, and assert invariants rather than specific contents,
+  # so they are safe in a clean chroot.
+  cargo test --frozen --release
+}
+
+package_wdm() {
+  depends=('libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm' 'libxkbcommon'
+           'pam' 'wdm-greeter-implementation')
+  unset provides
+  backup=('etc/pam.d/wdm' 'etc/wdm/wdm.toml')
+  install=wdm.install
+
+  cd "$pkgbase-$pkgver"
+
+  install -Dm755 target/release/wdm "$pkgdir/usr/bin/wdm"
+
+  # PAM is required, not optional: without it every login attempt fails with
+  # "Authentication failure".
+  install -Dm644 packaging/pam.d-wdm "$pkgdir/etc/pam.d/wdm"
+  install -Dm644 packaging/wdm.service "$pkgdir/usr/lib/systemd/system/wdm.service"
+
+  # The shipped example is a working configuration, so it is installed as the
+  # config rather than as documentation.
+  install -Dm644 packaging/wdm.toml.example "$pkgdir/etc/wdm/wdm.toml"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+
+  # The greeter runs unprivileged. systemd-sysusers creates the account rather
+  # than a post-install script, so it is declarative and removable.
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/wdm.conf" <<-EOF
+	u wdm - "wdm greeter" /var/lib/wdm /usr/bin/nologin
+	EOF
+
+  # State directory for the per-user last-session record.
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/tmpfiles.d/wdm.conf" <<-EOF
+	d /var/lib/wdm 0755 wdm wdm -
+	EOF
+}
+
+package_wdm-greeter() {
+  pkgdesc='Reference greeter for wdm, software-rendered with no toolkit'
+  # Deliberately does not depend on wdm: wdm depends on the virtual this
+  # provides, and naming wdm here would make the pair circular.
+  depends=('libxkbcommon')
+  provides=('wdm-greeter-implementation')
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/wdm-greeter "$pkgdir/usr/lib/wdm/wdm-greeter"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_wdm-gtk-greeter() {
+  pkgdesc='GTK4 greeter for wdm'
+  depends=('gtk4' 'gtk4-layer-shell')
+  provides=('wdm-greeter-implementation')
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/wdm-gtk-greeter "$pkgdir/usr/lib/wdm/wdm-gtk-greeter"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

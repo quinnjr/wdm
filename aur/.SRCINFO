@@ -1,0 +1,45 @@
+pkgbase = wdm
+	pkgdesc = A Wayland display manager that is its own compositor
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/quinnjr/wdm
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = libinput
+	makedepends = seatd
+	makedepends = systemd-libs
+	makedepends = mesa
+	makedepends = libdrm
+	makedepends = libxkbcommon
+	makedepends = pam
+	makedepends = gtk4
+	makedepends = gtk4-layer-shell
+	provides = wdm-greeter-implementation
+	source = wdm-0.1.0.tar.gz::https://github.com/quinnjr/wdm/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 375bed8aa4556629a06591a1965ef7cc3b447af68d079650069bff450f2d7b40
+
+pkgname = wdm
+	install = wdm.install
+	depends = libinput
+	depends = seatd
+	depends = systemd-libs
+	depends = mesa
+	depends = libdrm
+	depends = libxkbcommon
+	depends = pam
+	depends = wdm-greeter-implementation
+	backup = etc/pam.d/wdm
+	backup = etc/wdm/wdm.toml
+
+pkgname = wdm-greeter
+	pkgdesc = Reference greeter for wdm, software-rendered with no toolkit
+	depends = libxkbcommon
+	provides = wdm-greeter-implementation
+
+pkgname = wdm-gtk-greeter
+	pkgdesc = GTK4 greeter for wdm
+	depends = gtk4
+	depends = gtk4-layer-shell
+	provides = wdm-greeter-implementation
