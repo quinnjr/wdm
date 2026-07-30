@@ -2,11 +2,8 @@
 layout: ../layouts/Base.astro
 title: wdm
 description: A Wayland display manager that is its own compositor — no kiosk, no nesting, no X server.
+hero: true
 ---
-
-# wdm
-
-A Wayland display manager that **is** the compositor.
 
 Every other Wayland display manager delegates the actual displaying. SDDM's
 Wayland mode, greetd and lightdm's Wayland experiments all spawn a *separate*
