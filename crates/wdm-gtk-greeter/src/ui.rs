@@ -227,38 +227,51 @@ fn connect(ui: &Rc<Ui>) {
 impl Ui {
     /// Rebuild the user and session lists from the model.
     fn reload_lists(&self) {
-        let model = self.model.borrow();
+        // Everything is read out first and the borrow released before any widget
+        // is touched. `set_model` emits `notify::selected` *synchronously*, and
+        // that handler re-enters this type and borrows the model again — holding
+        // a borrow across it is a panic waiting for the right handler.
+        let (users, sessions, no_users, no_sessions) = {
+            let model = self.model.borrow();
+            (
+                model.users.iter().map(|u| u.label()).collect::<Vec<_>>(),
+                model
+                    .sessions
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+                model.users.is_empty(),
+                model.sessions.is_empty(),
+            )
+        };
 
-        let users: Vec<String> = model.users.iter().map(|u| u.label()).collect();
-        self.users
-            .set_model(Some(&StringList::new(&refs(&users))));
-
-        let sessions: Vec<String> = model.sessions.iter().map(|s| s.name.clone()).collect();
+        self.users.set_model(Some(&StringList::new(&refs(&users))));
         self.sessions
             .set_model(Some(&StringList::new(&refs(&sessions))));
 
         // A machine with nothing to log into is worth saying out loud rather
         // than presenting an empty form.
-        let usable = !model.users.is_empty() && !model.sessions.is_empty();
+        let usable = !no_users && !no_sessions;
         self.entry.set_sensitive(usable);
         self.submit.set_sensitive(usable);
         if !usable {
-            self.error.set_label(if model.users.is_empty() {
+            self.error.set_label(if no_users {
                 "No users available to log in"
             } else {
                 "No sessions installed"
             });
+            self.error.set_visible(true);
         }
 
-        drop(model);
         self.select_preferred_session();
     }
 
     fn select_preferred_session(&self) {
-        let index = self
-            .model
-            .borrow()
-            .preferred_session(self.users.selected() as usize);
+        // Scoped: set_selected re-enters through notify::selected.
+        let index = {
+            let model = self.model.borrow();
+            model.preferred_session(self.users.selected() as usize)
+        };
         self.sessions.set_selected(index as u32);
     }
 
@@ -282,6 +295,13 @@ impl Ui {
         self.attempting.set(true);
 
         drop(model);
+
+        // The previous attempt's verdict no longer applies to this one.
+        {
+            let mut model = self.model.borrow_mut();
+            model.conversation_over = false;
+            model.error = None;
+        }
         self.entry.set_text("");
         self.prompt.set_label("Waiting…");
     }
@@ -337,13 +357,14 @@ impl Ui {
             self.reload_lists();
         }
 
-        let (prompt, error, info, authenticated) = {
+        let (prompt, error, info, authenticated, conversation_over) = {
             let model = self.model.borrow();
             (
                 model.prompt.clone(),
                 model.error.clone(),
                 model.info.clone(),
                 model.authenticated,
+                model.conversation_over,
             )
         };
 
@@ -371,10 +392,14 @@ impl Ui {
             return;
         }
 
-        // A failure with no prompt means the conversation is over. Start another
-        // so the user can simply retype: the compositor delays its refusal until
-        // the rate limit expires, so this waits rather than spinning.
-        if error.is_some() && prompt.is_none() && !authenticated {
+        // Only auth_failed ends a conversation. Keying off `error` instead would
+        // also fire on last_error and on PAM's own error-style messages — which
+        // arrive *during* a live conversation — cancelling it and throwing away
+        // an answer the user already gave.
+        //
+        // Restarting is safe: the compositor defers its refusal until the rate
+        // limit expires, so this waits rather than spinning.
+        if conversation_over && prompt.is_none() && !authenticated {
             self.attempting.set(false);
             self.prompt.set_label("");
             self.begin_auth();

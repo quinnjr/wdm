@@ -154,9 +154,11 @@ fn avatar_for(name: &str, home: &Path) -> String {
 /// Goes through the passwd database rather than reading `/etc/passwd`, so users
 /// provided by LDAP, SSSD or systemd-homed appear too.
 pub fn discover(range: UidRange, last_sessions: &LastSessions) -> Vec<User> {
-    // SAFETY: getpwent is not reentrant and shares a static iteration cursor.
-    // wdm calls this only from the event loop thread; the PAM threads never
-    // touch the passwd database directly.
+    // SAFETY: getpwent is not reentrant and shares a static iteration cursor, so
+    // the invariant is that no other thread calls getpwent/setpwent/endpwent.
+    // wdm calls this only from the event loop thread. The PAM threads do resolve
+    // accounts through NSS, but via getpwnam_r, which does not touch that
+    // cursor — the earlier justification named the wrong reason.
     let all = unsafe { uzers::all_users() };
 
     let mut users: Vec<User> = all
@@ -270,7 +272,21 @@ impl LastSessions {
             file.sync_all()?;
         }
 
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+
+        // The rename is the operation that has to survive a power cut, and only
+        // a directory sync makes it durable — syncing the file alone leaves the
+        // directory entry in the page cache, so the rename itself can be lost.
+        // Best effort: losing a session preference is cosmetic, and failing the
+        // save here would be worse than a stale preference.
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            log::debug!("syncing {}: {e}", parent.display());
+        }
+
+        Ok(())
     }
 }
 

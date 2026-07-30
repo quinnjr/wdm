@@ -50,7 +50,8 @@
       <entry name="invalid_session" value="3"
              summary="start_session named a session id that was never advertised"/>
       <entry name="invalid_env" value="4"
-             summary="the env array is not NUL-separated KEY=VALUE entries"/>
+             summary="the env array is not NUL-separated NAME=VALUE entries with
+                      NAME matching [A-Za-z0-9_]+"/>
     </enum>
 
     <enum name="session_type">
@@ -137,7 +138,11 @@
     </event>
 
     <event name="session">
-      <description summary="advertise an available session"/>
+      <description summary="advertise an available session">
+        Scanned from the wayland-sessions and xsessions directories under
+        /usr/local/share and /usr/share, in that order — an entry in
+        /usr/local/share shadows a distribution entry with the same id.
+      </description>
       <arg name="id" type="string" summary="stable identifier, the desktop file name"/>
       <arg name="name" type="string" summary="human readable name"/>
       <arg name="exec" type="string" summary="the command line to be executed"/>

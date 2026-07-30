@@ -42,8 +42,40 @@ fn next_prompt_id() -> u32 {
 /// How long a prompt may go unanswered before the attempt is abandoned.
 ///
 /// A greeter that stops answering would otherwise pin a thread and a PAM
-/// transaction forever.
+/// transaction forever. Measured from when the prompt was emitted, not from the
+/// last message received, so a stream of stale responses cannot extend it.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What wdm tells pam_systemd about the seat before opening a session.
+///
+/// These have to reach PAM's own environment before `pam_open_session`;
+/// putting them only in the launched child's environment is too late, because
+/// pam_systemd has already registered the logind session by then.
+#[derive(Debug, Clone)]
+pub struct SessionDescription {
+    pub seat: String,
+    pub vtnr: u32,
+    /// `wayland` or `x11`.
+    pub session_type: String,
+    /// The desktop id, without the `.desktop` suffix. Empty until the greeter
+    /// has chosen one, which is why it is not required to be set.
+    pub desktop: String,
+}
+
+impl SessionDescription {
+    fn pam_items(&self) -> Vec<(&'static str, String)> {
+        let mut items = vec![
+            ("XDG_SEAT", self.seat.clone()),
+            ("XDG_VTNR", self.vtnr.to_string()),
+            ("XDG_SESSION_CLASS", "user".to_owned()),
+            ("XDG_SESSION_TYPE", self.session_type.clone()),
+        ];
+        if !self.desktop.is_empty() {
+            items.push(("XDG_SESSION_DESKTOP", self.desktop.clone()));
+        }
+        items
+    }
+}
 
 /// How a prompt should be presented, mirroring PAM's message styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,12 +138,15 @@ struct PromptResponse {
 }
 
 impl Drop for PromptResponse {
-    /// Zeroize on every path, not just the two inside the conversation.
+    /// Zeroize every path this `String` can take.
     ///
-    /// A response can also be dropped when the channel is closed (the value
-    /// comes back inside `SendError`), when the attempt has already ended, or
-    /// still queued in the receiver when the thread unwinds. Doing it here
-    /// covers all of them rather than the happy path only.
+    /// A response can be dropped when the channel is closed (the value comes
+    /// back inside `SendError`), when the attempt has already ended, or still
+    /// queued in the receiver when the thread unwinds. This covers all of them.
+    ///
+    /// It does *not* cover the copies downstream: `CString` owns one and libpam
+    /// owns another, and neither is scrubbed. Closing that would mean patching
+    /// PAM.
     fn drop(&mut self) {
         self.secret.zeroize();
     }
@@ -131,10 +166,12 @@ impl AuthHandle {
     /// Spawn a thread to authenticate `username`.
     ///
     /// `tty` is set as `PAM_TTY` so modules that make policy decisions based on
-    /// the terminal (`pam_access`, `pam_time`) see the VT wdm runs on.
+    /// the terminal (`pam_access`, `pam_time`) see the VT wdm runs on, and
+    /// `session` describes the seat to pam_systemd.
     pub fn start(
         username: &str,
         tty: &str,
+        session: SessionDescription,
         events: calloop::channel::Sender<AuthEvent>,
     ) -> std::io::Result<Self> {
         let (responses_tx, responses_rx) = mpsc::channel();
@@ -146,7 +183,14 @@ impl AuthHandle {
         std::thread::Builder::new()
             .name(format!("pam-{username}"))
             .spawn(move || {
-                run(&thread_user, &thread_tty, &events, responses_rx, commands_rx);
+                run(
+                    &thread_user,
+                    &thread_tty,
+                    &session,
+                    &events,
+                    responses_rx,
+                    commands_rx,
+                );
             })?;
 
         Ok(Self {
@@ -197,6 +241,7 @@ impl AuthHandle {
 fn run(
     username: &str,
     tty: &str,
+    session: &SessionDescription,
     events: &calloop::channel::Sender<AuthEvent>,
     responses: mpsc::Receiver<PromptResponse>,
     commands: mpsc::Receiver<AuthCommand>,
@@ -220,6 +265,17 @@ fn run(
     if let Err(e) = context.set_tty(Some(tty)) {
         // Not fatal: modules that care about the tty are the exception.
         log::warn!("setting PAM_TTY to {tty}: {e}");
+    }
+
+    // pam_systemd reads these from the PAM environment, not from the child's.
+    // Without them it registers the logind session as Type=tty with no desktop,
+    // so `loginctl` misreports it and anything keying off sd_session_get_type —
+    // screen lockers, logind's own idle handling — sees a tty session driving a
+    // Wayland compositor.
+    for (key, value) in session.pam_items() {
+        if let Err(e) = context.putenv(format!("{key}={value}").as_str()) {
+            log::warn!("setting {key} for PAM: {e}");
+        }
     }
 
     // DISALLOW_NULL_AUTHTOK: an account with an empty password must not be
@@ -340,8 +396,11 @@ impl ChannelConversation {
         let id = next_prompt_id();
         self.emit(id, prompt, style)?;
 
+        let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+
         loop {
-            let response = match self.responses.recv_timeout(RESPONSE_TIMEOUT) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let response = match self.responses.recv_timeout(remaining) {
                 Ok(response) => response,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     log::info!("no response to prompt {id} within {RESPONSE_TIMEOUT:?}");
@@ -362,11 +421,18 @@ impl ChannelConversation {
 
             // CString rejects interior NUL, which cannot be part of a password
             // PAM could ever verify.
-            // response is dropped at the end of this scope, zeroizing it.
-            return CString::new(response.secret.as_bytes()).map_err(|_| {
+            // The String is zeroized when `response` drops. The intermediate
+            // Vec is zeroized here explicitly, because CString takes ownership
+            // of a copy and neither it nor libpam's own copy of the answer is
+            // ever scrubbed — so the plaintext survives in freed heap either
+            // way. This narrows the window rather than closing it.
+            let mut bytes = response.secret.as_bytes().to_vec();
+            let result = CString::new(bytes.clone()).map_err(|_| {
                 log::info!("response to prompt {id} contained a NUL byte");
                 ErrorCode::CONV_ERR
             });
+            bytes.zeroize();
+            return result;
         }
     }
 

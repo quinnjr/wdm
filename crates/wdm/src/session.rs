@@ -279,10 +279,10 @@ pub(crate) fn supplementary_groups(username: &str, gid: u32) -> std::io::Result<
 
 /// Assemble the session's environment.
 ///
-/// Later sources win. PAM's environment comes first because it is
-/// authoritative for `XDG_RUNTIME_DIR`; then wdm's own session variables, which
-/// describe facts about the seat that must be correct; then the greeter's
-/// additions.
+/// Later sources win. PAM's environment comes first because it is authoritative
+/// for `XDG_RUNTIME_DIR`; then the greeter's filtered additions; then wdm's own
+/// session variables, which describe facts about the seat and must therefore be
+/// last so nothing can contradict them.
 fn build_env(
     session: &Session,
     username: &str,
@@ -314,7 +314,7 @@ fn build_env(
     // Applied before wdm's own facts, and filtered, so a greeter can localise a
     // session but cannot influence how it loads code or who it runs as.
     for (key, value) in extra_env {
-        if greeter_may_set(&key) {
+        if greeter_may_set(&key, &value) {
             set(&key, value);
         } else {
             log::warn!("ignoring environment variable {key} requested by the greeter");
@@ -352,11 +352,26 @@ fn build_env(
 /// `PATH`, `SHELL`, `IFS`, `BASH_ENV` and `ENV` are equally good, and enumerating
 /// them is a game one eventually loses. Only presentation variables are allowed
 /// through, which is all a greeter has any business setting.
-fn greeter_may_set(key: &str) -> bool {
+fn greeter_may_set(key: &str, value: &str) -> bool {
     const ALLOWED: &[&str] = &["LANG", "LANGUAGE"];
     const ALLOWED_PREFIXES: &[&str] = &["LC_", "XKB_"];
 
-    ALLOWED.contains(&key) || ALLOWED_PREFIXES.iter().any(|p| key.starts_with(p))
+    if !(ALLOWED.contains(&key) || ALLOWED_PREFIXES.iter().any(|p| key.starts_with(p))) {
+        return false;
+    }
+
+    // Values are checked too, not just keys. glibc treats a locale name
+    // containing a slash as a path and loads the locale from there — it only
+    // refuses that for setuid binaries, which a user session is not — and
+    // libxkbcommon honours XKB_CONFIG_ROOT as a data root. Either would let the
+    // greeter point the authenticated user's session at files it controls.
+    if value.contains('/') || value.contains('\0') {
+        return false;
+    }
+
+    // A locale or layout name is short. A long value is not one, and is a
+    // plausible attempt at something else.
+    value.len() <= 64
 }
 
 #[cfg(test)]
@@ -494,7 +509,10 @@ mod tests {
         ];
 
         for key in dangerous {
-            assert!(!greeter_may_set(key), "{key} must not be greeter-settable");
+            assert!(
+                !greeter_may_set(key, "x"),
+                "{key} must not be greeter-settable"
+            );
         }
 
         let env = build_env(
@@ -517,6 +535,21 @@ mod tests {
         assert_eq!(env_of(&env, "SHELL").as_deref(), Some("/bin/sh"));
         assert_eq!(env_of(&env, "XDG_VTNR").as_deref(), Some("7"));
         assert_ne!(env_of(&env, "PATH").as_deref(), Some("/tmp/evil"));
+    }
+
+    #[test]
+    fn allowlisted_keys_still_reject_path_values() {
+        // glibc loads a locale from a path if the name contains a slash, and
+        // libxkbcommon honours XKB_CONFIG_ROOT as a data root. Allowing the key
+        // is not the same as allowing any value for it.
+        assert!(greeter_may_set("LANG", "de_DE.UTF-8"));
+        assert!(greeter_may_set("LC_ALL", "en_GB.UTF-8"));
+        assert!(greeter_may_set("XKB_DEFAULT_LAYOUT", "de"));
+
+        assert!(!greeter_may_set("LC_ALL", "/tmp/evil/locale"));
+        assert!(!greeter_may_set("LANG", "../../tmp/evil"));
+        assert!(!greeter_may_set("XKB_CONFIG_ROOT", "/tmp/evil"));
+        assert!(!greeter_may_set("LANG", &"a".repeat(4096)));
     }
 
     #[test]

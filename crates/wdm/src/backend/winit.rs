@@ -10,7 +10,9 @@
 use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
@@ -18,7 +20,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
-use smithay::utils::{Rectangle, Transform};
+use smithay::utils::{Physical, Rectangle, Size, Transform};
 
 use crate::comp::{LoopData, Wdm};
 use crate::config::Config;
@@ -80,6 +82,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     super::setup::start(&mut data, &loop_handle, &socket_name);
 
     let start = Instant::now();
+    let mut error_screen = None;
 
     while data.state.running {
         let status = winit_events.dispatch_new_events(|event| match event {
@@ -126,7 +129,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             data.state.running = false;
         }
 
-        if let Err(e) = render(&mut data, &mut backend, &output, start) {
+        data.state.cleanup_popups();
+
+        if let Err(e) = render(&mut data, &mut backend, &output, start, &mut error_screen) {
             log::error!("rendering: {e}");
         }
 
@@ -150,6 +155,7 @@ fn render(
     backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
     output: &Output,
     start: Instant,
+    error_screen: &mut Option<(String, Size<i32, Physical>, MemoryRenderBuffer)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = backend.window_size();
     let damage = [Rectangle::from_size(size)];
@@ -163,11 +169,22 @@ fn render(
             // Same element path as the DRM backend, so the give-up screen is
             // exercised by whichever backend is in use rather than only here.
             Some(reason) => {
-                let buffer = crate::render::error_buffer(reason, size);
+                // Cached on message *and* size, as the DRM backend does.
+                // Rasterising a full-screen image every frame is exactly what
+                // render::error_buffer's doc says must not happen.
+                if error_screen
+                    .as_ref()
+                    .is_none_or(|(cached, cached_size, _)| cached != reason || *cached_size != size)
+                {
+                    *error_screen =
+                        Some((reason.clone(), size, crate::render::error_buffer(reason, size)));
+                }
+
+                let (_, _, buffer) = error_screen.as_ref().expect("just populated");
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     (0.0, 0.0),
-                    &buffer,
+                    buffer,
                     None,
                     None,
                     None,

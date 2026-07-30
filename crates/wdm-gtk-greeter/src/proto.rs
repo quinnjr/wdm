@@ -66,6 +66,13 @@ pub struct Model {
     pub info: Option<String>,
     /// Set by `auth_ok`; the UI launches a session in response.
     pub authenticated: bool,
+    /// Set only by `auth_failed`, and cleared when a new attempt starts.
+    ///
+    /// The UI's auto-retry keys off this rather than off `error`, which also
+    /// carries `last_error` and PAM's own error-style messages: retrying on
+    /// those cancelled a live conversation and discarded an answer the user had
+    /// already given.
+    pub conversation_over: bool,
     pub revision: u64,
 }
 
@@ -242,6 +249,7 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
 
             wdm_greeter_v1::Event::AuthOk => {
                 state.authenticated = true;
+                state.conversation_over = false;
                 state.prompt = None;
                 state.error = None;
                 state.touch();
@@ -249,6 +257,7 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
 
             wdm_greeter_v1::Event::AuthFailed { reason } => {
                 state.authenticated = false;
+                state.conversation_over = true;
                 state.prompt = None;
                 state.error = Some(reason);
                 state.touch();

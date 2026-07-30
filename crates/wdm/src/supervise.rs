@@ -44,14 +44,16 @@ pub enum GreeterError {
     NoSuchUser(String),
     #[error("greeter.command is empty")]
     EmptyCommand,
-    #[error("resolving groups for {0}: {1}")]
-    Groups(String, #[source] std::io::Error),
     #[error("preparing {0}: {1}")]
     RuntimeDir(PathBuf, #[source] std::io::Error),
     // No "spawning greeter:" prefix here: callers add their own context, and
     // the give-up screen shows this text verbatim.
     #[error("{0}")]
     Spawn(#[source] std::io::Error),
+    #[error("a greeter is already running")]
+    AlreadyRunning,
+    #[error("wdm has stopped trying to start a greeter")]
+    GaveUp,
 }
 
 /// What to do after the greeter exited.
@@ -109,8 +111,12 @@ impl Greeter {
             Some(Credentials {
                 uid: account.uid(),
                 gid,
-                groups: crate::session::supplementary_groups(user, gid)
-                    .map_err(|e| GreeterError::Groups(user.to_owned(), e))?,
+                // Deliberately just the primary group, not getgrouplist: the
+                // greeter is untrusted code and the spec promises it has no
+                // supplementary groups. Deriving them from the account would
+                // make that true only by packaging convention — add the greeter
+                // user to `video` and it silently gains DRM access.
+                groups: vec![gid],
                 home: account.home_dir().to_owned(),
             })
         } else {
@@ -158,15 +164,16 @@ impl Greeter {
         self.gave_up
     }
 
-    #[cfg(test)]
-    fn is_running(&self) -> bool {
-        self.child.is_some()
-    }
-
     /// Launch the greeter.
     pub fn spawn(&mut self) -> Result<(), GreeterError> {
         if self.gave_up {
-            return Ok(());
+            return Err(GreeterError::GaveUp);
+        }
+        if self.child.is_some() {
+            // Overwriting the handle would orphan the running greeter: nothing
+            // would ever kill or reap it, and it would survive into the user's
+            // session drawing over their screen.
+            return Err(GreeterError::AlreadyRunning);
         }
 
         let mut command = Command::new(&self.argv[0]);
@@ -214,7 +221,7 @@ impl Greeter {
                     // The greeter running as root would defeat the entire
                     // privilege split, so refuse rather than exec.
                     if libc::getuid() != uid || libc::geteuid() != uid {
-                        return Err(std::io::Error::other("greeter uid did not change"));
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                     }
                     Ok(())
                 });
@@ -272,6 +279,12 @@ impl Greeter {
         );
 
         self.record_failure(rapid, describe_exit(status))
+    }
+
+    /// Whether a greeter process is currently running.
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.child.is_some()
     }
 
     /// Record a greeter that could not be started at all.

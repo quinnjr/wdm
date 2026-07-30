@@ -28,7 +28,7 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Logical, Rectangle, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::compositor::{
@@ -65,6 +65,7 @@ use smithay::{
 
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
+    get_popup_toplevel_coords,
 };
 
 use crate::config::Config;
@@ -111,6 +112,9 @@ pub struct Wdm {
     /// Created once the backend has a renderer, since its advertised formats
     /// come from that renderer. `None` until then.
     pub dmabuf_state: Option<DmabufState>,
+    dmabuf_global: Option<DmabufGlobal>,
+    /// What the live global advertises, so a renderer change can be detected.
+    dmabuf_formats: Vec<DrmFormat>,
 
     /// What the pointer should look like right now.
     pub cursor: CursorImageStatus,
@@ -148,6 +152,11 @@ pub struct Wdm {
 
     /// The running user session, once one has been launched.
     pub session: Option<std::process::Child>,
+
+    /// A scheduled greeter respawn, kept so it can be cancelled. A timer left
+    /// armed across a login fires in the next generation and starts a second
+    /// greeter beside the first.
+    pub respawn_token: Option<smithay::reexports::calloop::RegistrationToken>,
 
     /// Actions queued by greeter requests and auth events for the event loop to
     /// act on once dispatch returns. Requests are handled inside Wayland
@@ -226,6 +235,8 @@ impl Wdm {
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(display),
             data_device_state: DataDeviceState::new::<Self>(display),
             dmabuf_state: None,
+            dmabuf_global: None,
+            dmabuf_formats: Vec::new(),
             cursor: CursorImageStatus::default_named(),
             viewporter_state: ViewporterState::new::<Self>(display),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(display),
@@ -245,6 +256,7 @@ impl Wdm {
             login,
             greeter,
             session: None,
+            respawn_token: None,
             pending_actions: std::collections::VecDeque::new(),
             requests: Vec::new(),
             started: std::time::Instant::now(),
@@ -275,17 +287,29 @@ impl Wdm {
 
     /// Advertise `zwp_linux_dmabuf_v1` with the renderer's formats.
     ///
-    /// Called by the backend once a renderer exists. Without this a greeter
+    /// Called by the backend whenever a renderer exists. Without this a greeter
     /// built on GTK4, Qt or wgpu cannot attach a GPU buffer and must fall back
     /// to `wl_shm` or fail to start — which would make "any toolkit" untrue for
     /// exactly the third-party greeters wdm exists to host.
+    ///
+    /// Re-advertised when the formats change, which happens when the GPU is
+    /// hot-removed and a different one is opened. Keeping the first GPU's
+    /// formats would promise a client buffers the current renderer cannot
+    /// import, and it would find out by never appearing on screen.
     pub fn init_dmabuf(&mut self, display: &DisplayHandle, formats: Vec<DrmFormat>) {
-        if self.dmabuf_state.is_some() {
+        if self.dmabuf_formats == formats {
             return;
         }
-        let mut state = DmabufState::new();
-        state.create_global::<Self>(display, formats);
-        self.dmabuf_state = Some(state);
+
+        // The old global names formats that are no longer true; withdraw it so
+        // clients renegotiate rather than binding a stale one.
+        if let (Some(state), Some(global)) = (&mut self.dmabuf_state, self.dmabuf_global.take()) {
+            state.destroy_global::<Self>(display, global);
+        }
+
+        let state = self.dmabuf_state.get_or_insert_with(DmabufState::new);
+        self.dmabuf_global = Some(state.create_global::<Self>(display, formats.clone()));
+        self.dmabuf_formats = formats;
     }
 
     /// The primary output, if anything is connected.
@@ -372,12 +396,12 @@ impl Wdm {
         }
     }
 
-    /// Render elements for one output, back to front.
+    /// Render elements for one output, front to back.
     ///
-    /// Popups are emitted before their parent layer surface so they land on top,
-    /// and at the offset the popup manager resolved for them — an `xdg_popup` is
-    /// its own surface, not a subsurface, so walking the parent's tree does not
-    /// reach it.
+    /// smithay treats index 0 as topmost, so popups are emitted before their
+    /// parent layer surface in order to land on top of it. An `xdg_popup` is its
+    /// own surface, not a subsurface, so walking the parent's tree does not
+    /// reach one.
     pub fn elements(
         &self,
         renderer: &mut GlesRenderer,
@@ -398,7 +422,11 @@ impl Wdm {
                     render_elements_from_surface_tree(
                         renderer,
                         popup.wl_surface(),
-                        (offset.x, offset.y),
+                        // The popup manager resolves offsets in logical
+                        // coordinates; this API takes physical. They only agree
+                        // at scale 1, which is why the nested backend never
+                        // showed this.
+                        to_physical(offset, scale),
                         scale,
                         1.0,
                         Kind::Unspecified,
@@ -447,8 +475,9 @@ impl Wdm {
         }
 
         let scale = output.current_scale().fractional_scale();
-        let location = pointer.current_location();
-        let position = (location.x.round() as i32, location.y.round() as i32);
+        // current_location and clamp_to_output both work in logical pixels; the
+        // element APIs below take physical ones.
+        let location = pointer.current_location().to_physical(scale);
 
         match &self.cursor {
             CursorImageStatus::Hidden => Vec::new(),
@@ -463,10 +492,16 @@ impl Wdm {
                         .unwrap_or_default()
                 });
 
+                // The hotspot is logical too, so it is scaled with the
+                // position rather than subtracted from a physical one.
+                let hotspot = hotspot.to_f64().to_physical(scale);
                 render_elements_from_surface_tree(
                     renderer,
                     surface,
-                    (position.0 - hotspot.x, position.1 - hotspot.y),
+                    (
+                        (location.x - hotspot.x).round() as i32,
+                        (location.y - hotspot.y).round() as i32,
+                    ),
                     scale,
                     1.0,
                     Kind::Cursor,
@@ -480,7 +515,7 @@ impl Wdm {
                 let buffer = crate::render::pointer_buffer();
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    (f64::from(position.0), f64::from(position.1)),
+                    (location.x, location.y),
                     buffer,
                     None,
                     None,
@@ -615,6 +650,18 @@ impl CompositorHandler for Wdm {
         }
         surface.send_configure();
     }
+}
+
+/// Convert a logical offset to the physical one the render APIs take.
+///
+/// smithay's `render_elements_from_surface_tree` and
+/// `MemoryRenderBufferRenderElement::from_buffer` both declare their location
+/// parameter as `Physical`, while `PopupManager` and pointer positions are
+/// `Logical`. The two coincide at scale 1, so getting this wrong is invisible
+/// on an unscaled display and misplaces every popup and the cursor on a scaled
+/// one.
+fn to_physical(offset: Point<i32, Logical>, scale: f64) -> Point<i32, Physical> {
+    offset.to_f64().to_physical(scale).to_i32_round()
 }
 
 /// An output's size in logical pixels, which is what a client is configured with.
@@ -798,20 +845,38 @@ impl Wdm {
             return;
         };
 
-        // The parent is a fullscreen layer surface at the output origin, so the
-        // available area is simply the output.
-        let target = Rectangle::from_size((w, h).into());
+        // smithay documents the target rectangle as relative to the *parent
+        // surface's* geometry. For a popup hanging off the fullscreen layer
+        // surface that is the output at the origin, but for a nested popup — a
+        // submenu, or a combo inside a menu — the parent sits at some offset, so
+        // the output has to be shifted back by it. Without this a submenu near
+        // the bottom of the screen is told it fits when it does not.
+        let offset = get_popup_toplevel_coords(&PopupKind::Xdg(surface.clone()));
+        let target = Rectangle::new((-offset.x, -offset.y).into(), (w, h).into());
+
         surface.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+
+    /// Drop dead popups and finished grabs.
+    ///
+    /// smithay only prunes these here; `iter_popups` filters dead nodes without
+    /// removing them, so without a periodic call every drop-down a greeter ever
+    /// opened stays in the tree and is walked once per output per frame. It is
+    /// also what releases a grab whose popup died, which otherwise keeps
+    /// swallowing focus changes.
+    pub fn cleanup_popups(&mut self) {
+        self.popups.cleanup();
     }
 }
 
 impl DmabufHandler for Wdm {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
-        self.dmabuf_state
-            .as_mut()
-            .expect("dmabuf requests cannot arrive before the global is created")
+        // Cannot be reached before init_dmabuf, since no global exists to bind
+        // until then — but a panic here would take the whole login screen down,
+        // so the state is created rather than asserted.
+        self.dmabuf_state.get_or_insert_with(DmabufState::new)
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, _dmabuf: Dmabuf, notifier: ImportNotifier) {
@@ -915,5 +980,37 @@ impl LoopData {
     pub fn dispatch(&mut self) -> std::io::Result<()> {
         self.display.dispatch_clients(&mut self.state)?;
         self.display.flush_clients()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_offsets_scale_to_physical() {
+        // The defect this guards: passing a logical offset to an API that takes
+        // physical. At scale 1 the two agree, which is why an unscaled test
+        // display hides it entirely.
+        let offset = Point::<i32, Logical>::from((100, 50));
+
+        assert_eq!(to_physical(offset, 1.0), Point::from((100, 50)));
+        assert_eq!(to_physical(offset, 2.0), Point::from((200, 100)));
+        assert_eq!(to_physical(offset, 1.5), Point::from((150, 75)));
+    }
+
+    #[test]
+    fn physical_offsets_grow_with_scale() {
+        let offset = Point::<i32, Logical>::from((10, 10));
+        let single = to_physical(offset, 1.0);
+        let double = to_physical(offset, 2.0);
+        assert!(double.x > single.x && double.y > single.y);
+    }
+
+    #[test]
+    fn fractional_scales_round_rather_than_truncate() {
+        // 1.25 * 7 = 8.75; truncating would put a popup a pixel high and drift
+        // further the further down the screen it is.
+        assert_eq!(to_physical(Point::from((7, 7)), 1.25), Point::from((9, 9)));
     }
 }

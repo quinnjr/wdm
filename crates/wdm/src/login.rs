@@ -127,6 +127,9 @@ pub struct Login {
     /// Incremented for every attempt, so a timer armed for one attempt cannot
     /// act on a later one.
     generation: u64,
+    /// The pending deferred failure report, so it can be replaced rather than
+    /// stacked.
+    failure_timer: Option<smithay::reexports::calloop::RegistrationToken>,
     /// Session chosen by `start_session`, held until PAM reports the session
     /// environment.
     chosen: Option<(Session, Vec<(String, String)>)>,
@@ -160,6 +163,7 @@ impl Login {
             failures: 0,
             cooldown_until: None,
             generation: 0,
+            failure_timer: None,
             chosen: None,
             events,
             loop_handle,
@@ -300,6 +304,15 @@ impl Login {
     pub fn handle_auth_event(&mut self, event: AuthEvent) -> Action {
         match event {
             AuthEvent::Prompt { id, text, style } => {
+                // Same guard as the Ok arm below. The PAM thread holds a clone
+                // of the sender, so a prompt emitted just before cancel is still
+                // in the channel; forwarding it makes the greeter ask a question
+                // whose answer wdm then kills it for (no_auth).
+                if self.auth.is_none() {
+                    log::debug!("discarding a prompt for an abandoned attempt");
+                    return Action::None;
+                }
+
                 self.pending_prompt = if style.expects_response() {
                     Some(id)
                 } else {
@@ -401,6 +414,13 @@ impl Login {
     fn report_failure_after(&mut self, reason: String, delay: Duration) {
         self.phase = Phase::Cooldown;
 
+        // One pending report at a time. Stacking timers would deliver several
+        // auth_failed events for one conversation, and the greeter would treat
+        // each as a fresh failure.
+        if let Some(token) = self.failure_timer.take() {
+            self.loop_handle.remove(token);
+        }
+
         // Tagged with the current attempt so a timer armed here cannot fire into
         // a later, possibly successful, one and force it back to Idle with a
         // spurious auth_failed.
@@ -409,6 +429,7 @@ impl Login {
 
         let result = self.loop_handle.insert_source(timer, move |_, _, data| {
             let login = &mut data.state.login;
+            login.failure_timer = None;
             if login.generation == generation && login.phase == Phase::Cooldown {
                 login.phase = Phase::Idle;
                 login.broadcast(|g| g.auth_failed(reason.clone()));
@@ -418,13 +439,17 @@ impl Login {
             TimeoutAction::Drop
         });
 
-        if let Err(e) = result {
-            // Without a timer the failure would never be reported and the greeter
-            // would hang, so report it immediately instead. The cooldown deadline
-            // still applies, so this degrades to a busy greeter, not an open door.
-            log::error!("arming backoff timer: {e}");
-            self.phase = Phase::Idle;
-            self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
+        match result {
+            Ok(token) => self.failure_timer = Some(token),
+            Err(e) => {
+                // Without a timer the failure would never be reported and the
+                // greeter would hang, so report it immediately instead. The
+                // cooldown deadline still applies, so this degrades to a busy
+                // greeter, not an open door.
+                log::error!("arming backoff timer: {e}");
+                self.phase = Phase::Idle;
+                self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
+            }
         }
     }
 
@@ -468,6 +493,18 @@ impl GlobalDispatch<WdmGreeterV1, ()> for Wdm {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let greeter = data_init.init(resource, ());
+
+        // One conversation, one driver. A second object could otherwise cancel
+        // the first's conversation simply by destroying itself, and nothing
+        // limits how many times a client may bind.
+        if !state.login.bound.is_empty() {
+            greeter.post_error(
+                wdm_greeter_v1::Error::AuthInProgress,
+                "wdm_greeter_v1 is already bound",
+            );
+            return;
+        }
+
         state.login.bound.push(greeter.clone());
         state.login.send_initial_state(&greeter);
     }
@@ -545,16 +582,29 @@ impl Wdm {
             // the whole cooldown. Answering late makes its retry land exactly
             // when it is allowed to.
             log::debug!("deferring create_session for {remaining:?}");
-            if self.login.phase != Phase::Cooldown {
-                self.login
-                    .report_failure_after("too many attempts".to_owned(), remaining);
-            }
+            // Armed unconditionally, and disarming any existing timer first, so
+            // every accepted create_session gets exactly one terminal event. The
+            // previous guard skipped arming while already in Cooldown, which
+            // silently dropped the request and hung a greeter that waits for a
+            // reply per request.
+            self.login
+                .report_failure_after("too many attempts".to_owned(), remaining);
             return Action::None;
         }
 
         match self.login.phase {
             Phase::Idle | Phase::Cooldown => {}
-            _ => {
+
+            // The conversation is over — auth_ok was already delivered — so this
+            // is a greeter backing out to pick a different account. The XML never
+            // says cancel is required after auth_ok, so killing it here would
+            // punish a conforming client. Treated as an implicit cancel.
+            Phase::Authenticated => {
+                log::debug!("create_session after auth_ok, restarting the conversation");
+                self.login.reset();
+            }
+
+            Phase::Authenticating | Phase::Launching => {
                 resource.post_error(
                     wdm_greeter_v1::Error::AuthInProgress,
                     "a conversation is already in progress",
@@ -573,7 +623,23 @@ impl Wdm {
         let tty = format!("/dev/tty{}", self.login.vt);
         self.login.begin_attempt();
 
-        match AuthHandle::start(&username, &tty, self.login.events.clone()) {
+        // The session type is not known until start_session, so the seat facts
+        // that are known now are supplied and the type defaults to wayland —
+        // the overwhelmingly common case, and better than pam_systemd's own
+        // fallback of "tty".
+        let description = crate::auth::SessionDescription {
+            seat: "seat0".to_owned(),
+            vtnr: self.login.vt,
+            session_type: "wayland".to_owned(),
+            desktop: String::new(),
+        };
+
+        match AuthHandle::start(
+            &username,
+            &tty,
+            description,
+            self.login.events.clone(),
+        ) {
             Ok(handle) => {
                 self.login.auth = Some(handle);
                 self.login.phase = Phase::Authenticating;

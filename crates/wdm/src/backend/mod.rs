@@ -65,8 +65,11 @@ pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
             Action::Launch(request) => {
                 if let Some(launch) = prepare(data, request) {
                     // Anything still queued is moot: the display is about to
-                    // change hands and the greeter is about to be killed.
+                    // change hands and the greeter is about to be killed. A
+                    // pending respawn is moot too, and would otherwise fire in
+                    // the next login generation.
                     data.state.pending_actions.clear();
+                    disarm_respawn(data, loop_handle);
                     return Handled::HandOff(launch);
                 }
             }
@@ -159,15 +162,36 @@ pub fn restart_greeter(
 /// would close a call cycle, and a policy that ever returned a zero delay would
 /// turn it into unbounded recursion. Respawning is scheduled directly instead.
 pub fn spawn_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
-    let Err(e) = data.state.greeter.spawn() else {
-        return;
-    };
+    // This attempt is happening now, so any timer scheduling another one is
+    // stale. Without disarming it a timer armed before a login can fire in the
+    // next generation and start a second greeter alongside the first.
+    disarm_respawn(data, loop_handle);
 
-    log::error!("spawning greeter: {e}");
+    match data.state.greeter.spawn() {
+        Ok(()) => {}
 
-    match data.state.greeter.note_spawn_failure(&e.to_string()) {
-        Disposition::Restart(delay) => arm_respawn(data, loop_handle, delay),
-        Disposition::GaveUp { reason } => give_up(data, reason),
+        // Not failures of this attempt: the policy has already spoken, or a
+        // greeter is already up. Re-running the failure accounting would count
+        // a success against the budget.
+        Err(e @ (crate::supervise::GreeterError::GaveUp
+            | crate::supervise::GreeterError::AlreadyRunning)) => {
+            log::debug!("not starting a greeter: {e}");
+        }
+
+        Err(e) => {
+            log::error!("spawning greeter: {e}");
+            match data.state.greeter.note_spawn_failure(&e.to_string()) {
+                Disposition::Restart(delay) => arm_respawn(data, loop_handle, delay),
+                Disposition::GaveUp { reason } => give_up(data, reason),
+            }
+        }
+    }
+}
+
+/// Cancel a pending respawn, if one is scheduled.
+pub fn disarm_respawn(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
+    if let Some(token) = data.state.respawn_token.take() {
+        loop_handle.remove(token);
     }
 }
 
@@ -177,17 +201,24 @@ fn arm_respawn(
     loop_handle: &LoopHandle<'static, LoopData>,
     delay: Duration,
 ) {
+    disarm_respawn(data, loop_handle);
+
     let handle = loop_handle.clone();
     let timer = Timer::from_duration(delay);
 
-    if let Err(e) = loop_handle.insert_source(timer, move |_, _, data| {
+    match loop_handle.insert_source(timer, move |_, _, data| {
+        data.state.respawn_token = None;
         spawn_greeter(data, &handle);
         TimeoutAction::Drop
     }) {
-        // Without the timer nothing would ever restart the greeter. Giving up is
-        // better than a blank screen, because it puts the reason on the display.
-        log::error!("arming greeter restart timer: {e}");
-        give_up(data, format!("cannot schedule a greeter restart: {e}"));
+        Ok(token) => data.state.respawn_token = Some(token),
+        Err(e) => {
+            // Without the timer nothing would ever restart the greeter. Giving
+            // up is better than a blank screen, because it puts the reason on
+            // the display.
+            log::error!("arming greeter restart timer: {e}");
+            give_up(data, format!("cannot schedule a greeter restart: {e}"));
+        }
     }
 }
 
