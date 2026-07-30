@@ -397,17 +397,17 @@ mod tests {
     fn sets_the_session_variables() {
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/zsh"),
             7,
             Vec::new(),
             Vec::new(),
         );
 
-        assert_eq!(env_of(&env, "USER").as_deref(), Some("joseph"));
-        assert_eq!(env_of(&env, "LOGNAME").as_deref(), Some("joseph"));
-        assert_eq!(env_of(&env, "HOME").as_deref(), Some("/home/joseph"));
+        assert_eq!(env_of(&env, "USER").as_deref(), Some("testuser"));
+        assert_eq!(env_of(&env, "LOGNAME").as_deref(), Some("testuser"));
+        assert_eq!(env_of(&env, "HOME").as_deref(), Some("/home/testuser"));
         assert_eq!(env_of(&env, "SHELL").as_deref(), Some("/bin/zsh"));
         assert_eq!(env_of(&env, "XDG_VTNR").as_deref(), Some("7"));
         assert_eq!(env_of(&env, "XDG_SEAT").as_deref(), Some("seat0"));
@@ -422,8 +422,8 @@ mod tests {
     fn x11_sessions_are_labelled_x11() {
         let env = build_env(
             &session(SessionType::X11),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             Vec::new(),
@@ -437,8 +437,8 @@ mod tests {
         // XDG_RUNTIME_DIR must come from pam_systemd, never be invented by wdm.
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
@@ -455,8 +455,8 @@ mod tests {
         // A stale XDG_VTNR from PAM would point the session at the wrong VT.
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             vec![("XDG_VTNR".to_owned(), "1".to_owned())],
@@ -469,8 +469,8 @@ mod tests {
     fn greeter_may_localise_the_session() {
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             Vec::new(),
@@ -517,8 +517,8 @@ mod tests {
 
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             Vec::new(),
@@ -531,7 +531,7 @@ mod tests {
         assert!(env_of(&env, "LD_PRELOAD").is_none());
         assert!(env_of(&env, "LD_LIBRARY_PATH").is_none());
         // The ones wdm sets itself must hold wdm's values, not the greeter's.
-        assert_eq!(env_of(&env, "HOME").as_deref(), Some("/home/joseph"));
+        assert_eq!(env_of(&env, "HOME").as_deref(), Some("/home/testuser"));
         assert_eq!(env_of(&env, "SHELL").as_deref(), Some("/bin/sh"));
         assert_eq!(env_of(&env, "XDG_VTNR").as_deref(), Some("7"));
         assert_ne!(env_of(&env, "PATH").as_deref(), Some("/tmp/evil"));
@@ -558,8 +558,8 @@ mod tests {
         // cannot displace a fact about the seat.
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             Vec::new(),
@@ -572,8 +572,8 @@ mod tests {
     fn keys_are_never_duplicated() {
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             vec![("PATH".to_owned(), "/pam".to_owned())],
@@ -612,8 +612,8 @@ mod tests {
         // it will try to nest inside wdm instead of taking over the display.
         let env = build_env(
             &session(SessionType::Wayland),
-            "joseph",
-            Path::new("/home/joseph"),
+            "testuser",
+            Path::new("/home/testuser"),
             Path::new("/bin/sh"),
             7,
             Vec::new(),
