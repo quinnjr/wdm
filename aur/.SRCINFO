@@ -1,6 +1,6 @@
 pkgbase = wdm
 	pkgdesc = A Wayland display manager that is its own compositor
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/quinnjr/wdm
 	arch = x86_64
@@ -17,8 +17,8 @@ pkgbase = wdm
 	makedepends = gtk4
 	makedepends = gtk4-layer-shell
 	provides = wdm-greeter-implementation
-	source = wdm-0.1.0.tar.gz::https://github.com/quinnjr/wdm/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = 375bed8aa4556629a06591a1965ef7cc3b447af68d079650069bff450f2d7b40
+	source = wdm-0.1.1.tar.gz::https://github.com/quinnjr/wdm/archive/refs/tags/v0.1.1.tar.gz
+	sha256sums = 8cd9793c483cb63eb5ab2933ae56a75d998104d120821df99449dd06be2641a3
 
 pkgname = wdm
 	install = wdm.install
