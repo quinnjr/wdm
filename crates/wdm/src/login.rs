@@ -330,7 +330,6 @@ impl Login {
             AuthEvent::Failed(reason) => {
                 self.auth = None;
                 self.pending_prompt = None;
-                self.phase = Phase::Cooldown;
 
                 let delay = self.next_backoff();
                 self.failures = self.failures.saturating_add(1);
@@ -338,31 +337,7 @@ impl Login {
                 // it survives destroy, rebind and greeter respawn.
                 self.cooldown_until = Some(Instant::now() + delay);
 
-                // Tagged with the current attempt so a timer armed for this
-                // failure cannot fire into a later, possibly successful, attempt
-                // and force it back to Idle with a spurious auth_failed.
-                let generation = self.generation;
-                let timer = Timer::from_duration(delay);
-                let result = self.loop_handle.insert_source(timer, move |_, _, data| {
-                    let login = &mut data.state.login;
-                    if login.generation == generation && login.phase == Phase::Cooldown {
-                        login.phase = Phase::Idle;
-                        login.broadcast(|g| g.auth_failed(reason.clone()));
-                    } else {
-                        log::debug!("dropping a backoff timer from an abandoned attempt");
-                    }
-                    TimeoutAction::Drop
-                });
-
-                if let Err(e) = result {
-                    // Without a timer the failure would never be reported and the
-                    // greeter would hang, so report it immediately instead. The
-                    // cooldown deadline still applies.
-                    log::error!("arming backoff timer: {e}");
-                    self.phase = Phase::Idle;
-                    self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
-                }
-
+                self.report_failure_after(reason, delay);
                 Action::None
             }
 
@@ -414,6 +389,43 @@ impl Login {
     pub fn begin_attempt(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.last_error = None;
+    }
+
+    /// Report a failure once `delay` has elapsed.
+    ///
+    /// Reporting late *is* the rate limit: a greeter cannot start another
+    /// attempt until it hears how the last one went, so the delay is what slows
+    /// a brute force down. Answering immediately would leave a greeter that
+    /// retries on failure — which is the natural thing to write — spinning at
+    /// full speed for the whole cooldown.
+    fn report_failure_after(&mut self, reason: String, delay: Duration) {
+        self.phase = Phase::Cooldown;
+
+        // Tagged with the current attempt so a timer armed here cannot fire into
+        // a later, possibly successful, one and force it back to Idle with a
+        // spurious auth_failed.
+        let generation = self.generation;
+        let timer = Timer::from_duration(delay);
+
+        let result = self.loop_handle.insert_source(timer, move |_, _, data| {
+            let login = &mut data.state.login;
+            if login.generation == generation && login.phase == Phase::Cooldown {
+                login.phase = Phase::Idle;
+                login.broadcast(|g| g.auth_failed(reason.clone()));
+            } else {
+                log::debug!("dropping a backoff timer from an abandoned attempt");
+            }
+            TimeoutAction::Drop
+        });
+
+        if let Err(e) = result {
+            // Without a timer the failure would never be reported and the greeter
+            // would hang, so report it immediately instead. The cooldown deadline
+            // still applies, so this degrades to a busy greeter, not an open door.
+            log::error!("arming backoff timer: {e}");
+            self.phase = Phase::Idle;
+            self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
+        }
     }
 
     fn next_backoff(&self) -> Duration {
@@ -527,10 +539,16 @@ impl Wdm {
         // Checked before the phase, because the phase is the part a greeter can
         // reset at will and this is the part it cannot.
         if let Some(remaining) = self.login.rate_limited() {
-            // Not a protocol error: the greeter may try again, just not yet.
-            // Telling it so keeps it from hanging.
-            log::debug!("refusing create_session for {remaining:?} more");
-            resource.auth_failed("too many attempts, try again shortly".to_owned());
+            // Not a protocol error: the greeter may try again, just not yet. The
+            // refusal is delayed until the limit expires rather than sent now,
+            // because a greeter that retries on failure would otherwise spin for
+            // the whole cooldown. Answering late makes its retry land exactly
+            // when it is allowed to.
+            log::debug!("deferring create_session for {remaining:?}");
+            if self.login.phase != Phase::Cooldown {
+                self.login
+                    .report_failure_after("too many attempts".to_owned(), remaining);
+            }
             return Action::None;
         }
 

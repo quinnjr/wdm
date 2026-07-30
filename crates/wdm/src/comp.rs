@@ -50,7 +50,8 @@ use smithay::wayland::shell::wlr_layer::{
     WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    PopupSurface, PositionerState, ToplevelSurface, XdgPopupSurfaceData, XdgShellHandler,
+    XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::text_input::TextInputManagerState;
@@ -543,9 +544,37 @@ impl CompositorHandler for Wdm {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // Tracks popup geometry and sends the initial configure a popup needs
-        // before it may attach a buffer.
         self.popups.commit(surface);
+
+        // A popup may not attach a buffer until it has been configured, and
+        // nothing else sends that first configure — PopupManager only tracks
+        // geometry. Without this a GTK drop-down opens a popup that never maps,
+        // so clicking it appears to do nothing at all.
+        if let Some(popup) = self.popups.find_popup(surface) {
+            match popup {
+                PopupKind::Xdg(ref xdg) => {
+                    let sent = smithay::wayland::compositor::with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<XdgPopupSurfaceData>()
+                            .is_some_and(|data| {
+                                data.lock()
+                                    .expect("popup state is not poisoned")
+                                    .initial_configure_sent
+                            })
+                    });
+
+                    if !sent {
+                        self.unconstrain_popup(xdg);
+                        if let Err(e) = xdg.send_configure() {
+                            log::warn!("configuring popup: {e}");
+                        }
+                    }
+                }
+                // Input method popups are configured by their own protocol.
+                PopupKind::InputMethod(_) => {}
+            }
+        }
 
         // A layer surface may not commit content until it has been configured,
         // and the client's initial state is not known until its first commit —
@@ -693,9 +722,8 @@ impl XdgShellHandler for Wdm {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        // A popup must be configured before it may attach a buffer, so failing
-        // to do this leaves any greeter that opens a menu stalled forever.
-        self.unconstrain_popup(&surface);
+        // The initial configure is sent from commit(), once the client has
+        // supplied the state that decides its geometry.
         if let Err(e) = self.popups.track_popup(PopupKind::Xdg(surface)) {
             log::warn!("tracking popup: {e}");
         }
