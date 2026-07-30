@@ -11,6 +11,11 @@ vt = 7
 
 [greeter]
 command = "/usr/lib/wdm/wdm-greeter"
+# The other two, if their package is installed. The webkit greeter takes the
+# theme to run — a name under /usr/share/wdm/webkit-greeter/themes, or a path —
+# and refuses to start if it is missing rather than quietly showing another.
+#command = "/usr/lib/wdm/wdm-gtk-greeter"
+#command = "/usr/lib/wdm/wdm-webkit-greeter --theme default"
 # Must not be root. The greeter is untrusted code hosted by the process that
 # owns DRM master, so it runs as an unprivileged account with no shell.
 user = "wdm"

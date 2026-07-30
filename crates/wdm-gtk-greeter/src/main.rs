@@ -1,6 +1,7 @@
 //! A GTK4 greeter for wdm.
 //!
-//! Talks `wdm_greeter_v1` over the connection GDK already owns (see [`proto`]),
+//! Talks `wdm_greeter_v1` over the connection GDK already owns (see
+//! [`wdm_greeter_client`]),
 //! and puts its window on screen with `gtk4-layer-shell`. Layer shell is not
 //! optional: wdm exposes no `xdg_toplevel` at all, so an ordinary GTK window is
 //! closed as soon as it is created.
@@ -11,7 +12,6 @@
 //! and because it demonstrates the protocol works from a toolkit that owns its
 //! own event loop and its own Wayland connection.
 
-mod proto;
 mod ui;
 
 // gtk4-layer-shell works by interposing a handful of libwayland-client symbols,
@@ -34,7 +34,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{Application, glib};
 
-use proto::Link;
+use wdm_greeter_client::Link;
 
 const APP_ID: &str = "ai.lexmata.wdm.Greeter";
 
@@ -80,11 +80,7 @@ fn main() -> ExitCode {
 
 fn activate(app: &Application) -> Result<(), Box<dyn std::error::Error>> {
     let display = gtk4::gdk::Display::default().ok_or("no display")?;
-    let wayland = display
-        .downcast_ref::<gdk4_wayland::WaylandDisplay>()
-        .ok_or("wdm-gtk-greeter requires a Wayland session")?;
-
-    let (link, model) = Link::connect(wayland)?;
+    let (link, model) = Link::connect(&display)?;
 
     log::info!(
         "connected: {} user(s), {} session(s)",
@@ -92,8 +88,8 @@ fn activate(app: &Application) -> Result<(), Box<dyn std::error::Error>> {
         model.sessions.len()
     );
 
-    let model: proto::Shared = Rc::new(RefCell::new(model));
-    let link: proto::SharedLink = Rc::new(RefCell::new(link));
+    let model: wdm_greeter_client::Shared = Rc::new(RefCell::new(model));
+    let link: wdm_greeter_client::SharedLink = Rc::new(RefCell::new(link));
 
     let (window, ui) = ui::build(app, model.clone(), link.clone());
     window.present();

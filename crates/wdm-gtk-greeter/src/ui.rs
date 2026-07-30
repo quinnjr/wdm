@@ -10,7 +10,7 @@ use gtk4::{
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell, KeyboardMode};
 
-use crate::proto::{Shared, SharedLink};
+use wdm_greeter_client::{Shared, SharedLink};
 
 const STYLE: &str = "
 window { background: #12131a; }

@@ -16,7 +16,7 @@ Built on smithay 0.7 with a hand-rolled Wayland protocol, `wdm_greeter_v1`.
 
 ```bash
 cargo build                       # whole workspace
-cargo test --workspace            # 128 tests, all in-file #[cfg(test)] modules
+cargo test --workspace            # all in-file #[cfg(test)] modules
 cargo test -p wdm login::         # one module
 cargo test -p wdm the_test_name   # one test
 cargo clippy --workspace --all-targets   # must be clean; CI does not exist yet
@@ -59,6 +59,12 @@ wdm calls `env_clear()` when spawning, so the variable cannot be inherited.
   toolkit. The shipped default, and the proof the protocol is implementable
   from scratch.
 - **`wdm-gtk-greeter`** — GTK4 greeter, for deployments that want theming.
+- **`wdm-webkit-greeter`** — WebKitGTK greeter; themes are HTML/CSS/JS driving a
+  `window.wdm` API. Holds no policy — retrying, session preselection and what a
+  failure looks like are the theme's, which is why the default theme is part of
+  the contract and not a demo.
+- **`wdm-greeter-client`** — the protocol client both toolkit greeters share:
+  the connection, the queue, and the `Model` events write into.
 
 ## Architecture
 
