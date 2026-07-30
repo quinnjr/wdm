@@ -1,0 +1,89 @@
+---
+import "../styles/global.css";
+import GreeterPanel from "../components/GreeterPanel.astro";
+
+const { frontmatter } = Astro.props;
+const title = frontmatter?.title ?? "wdm";
+const description =
+  frontmatter?.description ??
+  "A Wayland display manager that is its own compositor.";
+const hero = frontmatter?.hero ?? false;
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const pages = [
+  ["", "Overview"],
+  ["/install", "Install"],
+  ["/configuration", "Configuration"],
+  ["/protocol", "Protocol"],
+  ["/greeters", "Writing a greeter"],
+];
+const here = Astro.url.pathname.replace(/\/$/, "");
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title === "wdm" ? "wdm — a Wayland-native display manager" : `${title} — wdm`}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+  </head>
+
+  <body class="bg-surface font-sans text-text antialiased">
+    <a
+      href="#content"
+      class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:rounded-md focus:border focus:border-edge focus:bg-panel focus:px-3 focus:py-2"
+      >Skip to content</a
+    >
+
+    <div class="mx-auto w-full max-w-3xl px-5 pb-24 pt-8">
+      <header class="flex flex-wrap items-baseline gap-x-6 gap-y-2 border-b border-edge pb-4">
+        <a href={base || "/"} class="font-mono text-sm font-medium tracking-tight text-text no-underline">wdm</a>
+        <nav class="flex flex-wrap gap-x-5 gap-y-1 text-sm">
+          {
+            pages.slice(1).map(([href, label]) => (
+              <a
+                href={`${base}${href}`}
+                aria-current={here === `${base}${href}` ? "page" : undefined}
+                class="text-dim no-underline transition-colors hover:text-beam aria-[current=page]:font-medium aria-[current=page]:text-text"
+              >
+                {label}
+              </a>
+            ))
+          }
+        </nav>
+        <a
+          href="https://github.com/quinnjr/wdm"
+          class="ml-auto text-sm text-dim no-underline transition-colors hover:text-beam">GitHub</a
+        >
+      </header>
+
+      {
+        hero && (
+          <div class="grid items-center gap-10 border-b border-edge py-12 sm:grid-cols-[1fr_auto]">
+            <div>
+              <h1 class="text-3xl font-semibold tracking-tight sm:text-4xl">
+                The display manager <span class="text-beam">is</span> the compositor.
+              </h1>
+              <p class="mt-4 max-w-md text-dim">
+                No kiosk compositor to host the greeter. No nested session. No X
+                server. wdm takes DRM master itself and hands it to yours at login.
+              </p>
+            </div>
+            <GreeterPanel />
+          </div>
+        )
+      }
+
+      <main id="content" class="prose prose-neutral max-w-none pt-10">
+        <slot />
+      </main>
+
+      <footer class="mt-20 flex flex-wrap gap-x-4 gap-y-1 border-t border-edge pt-5 font-mono text-xs text-dim">
+        <span>MIT licensed</span>
+        <a href="https://github.com/quinnjr/wdm" class="text-dim no-underline hover:text-beam">source</a>
+        <a href="https://github.com/quinnjr/wdm/issues" class="text-dim no-underline hover:text-beam">issues</a>
+      </footer>
+    </div>
+  </body>
+</html>

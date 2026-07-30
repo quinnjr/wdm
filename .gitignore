@@ -1,3 +1,10 @@
 /target
 /.worktrees/
-/docs/
+
+# The design spec is local-only; the docs site alongside it is not.
+/docs/superpowers/
+
+# Astro
+/docs/node_modules/
+/docs/dist/
+/docs/.astro/
