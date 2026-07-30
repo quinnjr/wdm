@@ -4,7 +4,7 @@ post_install() {
 	    working text console. Verify you can reach it before enabling the
 	    unit: if wdm fails to start you will have no graphical login.
 
-	>>> The DRM path in 0.1.1 has not yet run on real hardware. Development
+	>>> The DRM path in 0.1.2 has not yet run on real hardware. Development
 	    used a nested backend that cannot exercise DRM, the seat, or the
 	    handoff to a session.
 

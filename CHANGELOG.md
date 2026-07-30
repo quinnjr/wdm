@@ -3,6 +3,31 @@
 Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 [Semantic Versioning].
 
+## [0.1.2] — 2026-07-30
+
+### Added
+
+- **`wdm-webkit-greeter`**, a WebKitGTK greeter whose themes are written in
+  HTML, CSS and JavaScript — the same idea as `lightdm-webkit2-greeter`. A theme
+  is a directory with an `index.html` in it, selected with
+  `--theme <name-or-path>`, and drives the login through a `window.wdm` API.
+  The greeter holds no policy of its own: preselecting a session, retrying a
+  failed attempt and deciding what a failure looks like all belong to the theme,
+  so the default theme is part of the contract rather than a demo.
+- **`wdm-greeter-client`**, the `wdm_greeter_v1` client both toolkit greeters
+  share: the connection, the event queue and the model events write into.
+  Extracted from `wdm-gtk-greeter` rather than copied.
+
+### Security
+
+- Everything the webkit greeter puts into the page is a JSON literal. PAM's
+  prompt and message text reaches JavaScript verbatim, so building script by
+  concatenation would hand whoever writes a PAM message the run of the login
+  screen.
+- The webkit greeter refuses navigation outside its theme directory, keeps no
+  persistent storage, and enables developer tools only when `WDM_GREETER_DEBUG`
+  is set.
+
 ## [0.1.1] — 2026-07-30
 
 ### Fixed
@@ -67,5 +92,6 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2
 [0.1.1]: https://github.com/quinnjr/wdm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/quinnjr/wdm/releases/tag/v0.1.0
