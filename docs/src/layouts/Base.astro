@@ -1,0 +1,109 @@
+---
+const { frontmatter } = Astro.props;
+const title = frontmatter?.title ?? "wdm";
+const description =
+  frontmatter?.description ??
+  "A Wayland-native display manager that is its own compositor.";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const pages = [
+  ["", "Overview"],
+  ["/install", "Install"],
+  ["/configuration", "Configuration"],
+  ["/protocol", "Protocol"],
+  ["/greeters", "Writing a greeter"],
+];
+const here = Astro.url.pathname.replace(/\/$/, "");
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title === "wdm" ? title : `${title} — wdm`}</title>
+    <meta name="description" content={description} />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #1c1e28;
+        --dim: #5c6070;
+        --rule: #e2e4ec;
+        --accent: #2f5fd0;
+        --code-bg: #f5f6fa;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #12131a;
+          --fg: #e8e8ef;
+          --dim: #8b8fa3;
+          --rule: #2c2f3d;
+          --accent: #6f9dff;
+          --code-bg: #1c1e28;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0 auto;
+        padding: 2rem 1.25rem 5rem;
+        max-width: 46rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        padding-bottom: 1rem;
+        margin-bottom: 2.5rem;
+        border-bottom: 1px solid var(--rule);
+        font-size: 0.9rem;
+      }
+      nav a { color: var(--dim); text-decoration: none; }
+      nav a:hover { color: var(--accent); }
+      nav a[aria-current="page"] { color: var(--fg); font-weight: 600; }
+      h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 0.4rem; }
+      h2 { font-size: 1.25rem; margin: 2.5rem 0 0.75rem; }
+      h3 { font-size: 1.02rem; margin: 1.75rem 0 0.5rem; }
+      a { color: var(--accent); }
+      code {
+        background: var(--code-bg);
+        padding: 0.12em 0.35em;
+        border-radius: 4px;
+        font-size: 0.88em;
+      }
+      pre {
+        background: var(--code-bg);
+        padding: 0.9rem 1rem;
+        border-radius: 8px;
+        overflow-x: auto;
+      }
+      pre code { background: none; padding: 0; }
+      table { border-collapse: collapse; width: 100%; display: block; overflow-x: auto; }
+      th, td { text-align: left; padding: 0.45rem 0.8rem 0.45rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+      blockquote {
+        margin: 1.5rem 0;
+        padding: 0.1rem 0 0.1rem 1rem;
+        border-left: 3px solid var(--rule);
+        color: var(--dim);
+      }
+      footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--dim); font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <nav>
+      {pages.map(([href, label]) => (
+        <a href={`${base}${href}` || "/"} aria-current={here === `${base}${href}` ? "page" : undefined}>{label}</a>
+      ))}
+      <a href="https://github.com/quinnjr/wdm" style="margin-left:auto">GitHub</a>
+    </nav>
+    <main>
+      <slot />
+    </main>
+    <footer>
+      wdm is MIT licensed. Documentation built from the
+      <a href="https://github.com/quinnjr/wdm">repository</a>.
+    </footer>
+  </body>
+</html>
