@@ -1,0 +1,19 @@
+[package]
+name = "wdm-webkit-greeter"
+description = "WebKitGTK greeter for wdm, with themes written in HTML, CSS and JavaScript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wdm-greeter-client.workspace = true
+gtk4.workspace = true
+gtk4-layer-shell.workspace = true
+env_logger.workspace = true
+log.workspace = true
+
+webkit6 = "0.6"
+# Only ever used to *emit* JavaScript literals. Values reaching the page come
+# from PAM and from the account database, so escaping them by hand is a code
+# injection waiting to happen.
+serde_json = "1"

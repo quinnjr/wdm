@@ -1,15 +1,15 @@
 # Maintainer: Joseph R. Quinn <quinn.josephr@protonmail.com>
 
 pkgbase=wdm
-pkgname=('wdm' 'wdm-greeter' 'wdm-gtk-greeter')
-pkgver=0.1.1
+pkgname=('wdm' 'wdm-greeter' 'wdm-gtk-greeter' 'wdm-webkit-greeter')
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='A Wayland display manager that is its own compositor'
 arch=('x86_64' 'aarch64')
 url='https://github.com/quinnjr/wdm'
 license=('MIT')
 makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
-             'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell')
+             'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell' 'webkitgtk-6.0')
 # wdm needs *a* greeter, and either of the two below satisfies it, so pacman
 # prompts for a choice when only `wdm` is requested. The greeters deliberately
 # do not depend on wdm in return: that would make the pair circular.
@@ -21,7 +21,7 @@ makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
 # nothing in the repositories provides it.
 provides=('wdm-greeter-implementation')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('375bed8aa4556629a06591a1965ef7cc3b447af68d079650069bff450f2d7b40')
+sha256sums=('8cd9793c483cb63eb5ab2933ae56a75d998104d120821df99449dd06be2641a3')
 
 prepare() {
   cd "$pkgbase-$pkgver"
@@ -99,5 +99,25 @@ package_wdm-gtk-greeter() {
 
   cd "$pkgbase-$pkgver"
   install -Dm755 target/release/wdm-gtk-greeter "$pkgdir/usr/lib/wdm/wdm-gtk-greeter"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_wdm-webkit-greeter() {
+  pkgdesc='WebKitGTK greeter for wdm, with themes written in HTML, CSS and JavaScript'
+  depends=('gtk4' 'gtk4-layer-shell' 'webkitgtk-6.0')
+  provides=('wdm-greeter-implementation')
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/wdm-webkit-greeter "$pkgdir/usr/lib/wdm/wdm-webkit-greeter"
+
+  # Themes are data, not documentation: the greeter refuses to start without
+  # the one it was pointed at, and the default is the worked example of the
+  # JavaScript API a theme author copies.
+  local themes="$pkgdir/usr/share/wdm/webkit-greeter/themes"
+  install -Dm644 -t "$themes/default" \
+    crates/wdm-webkit-greeter/themes/default/index.html \
+    crates/wdm-webkit-greeter/themes/default/style.css \
+    crates/wdm-webkit-greeter/themes/default/theme.js
+
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

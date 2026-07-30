@@ -1,0 +1,35 @@
+<!doctype html>
+<!--
+  The default theme, and the worked example of the API.
+
+  Everything it uses is in window.wdm and in the four callbacks below. A theme
+  is a directory with an index.html in it; copy this one and start editing.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>wdm</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <form id="login" autocomplete="off">
+      <h1>Sign in</h1>
+
+      <label for="user">User</label>
+      <select id="user"></select>
+
+      <label id="prompt" for="answer">Waiting…</label>
+      <input id="answer" type="password" autofocus />
+
+      <p id="error" hidden></p>
+      <p id="message" hidden></p>
+
+      <label for="session">Session</label>
+      <select id="session"></select>
+
+      <button type="submit">Log in</button>
+    </form>
+
+    <script src="theme.js"></script>
+  </body>
+</html>

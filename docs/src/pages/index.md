@@ -35,12 +35,16 @@ same connection it renders on. It runs as an unprivileged user and never sees
 the shadow database: wdm runs PAM itself and forwards each question the PAM
 stack asks.
 
-Two greeters ship in the repository:
+Three greeters ship in the repository:
 
 - **`wdm-greeter`** — the default. Software-rendered into `wl_shm` with no
   toolkit at all, which keeps the shipped default dependency-free and makes it a
   readable example of the protocol.
 - **`wdm-gtk-greeter`** — GTK4, for deployments that want theming.
+- **`wdm-webkit-greeter`** — WebKitGTK, the same idea as
+  `lightdm-webkit2-greeter`: the login screen is a web page, and the theme
+  drives it through a small JavaScript API. See
+  [writing a theme](/wdm/themes).
 
 Anything that can speak Wayland can be a greeter. See
 [writing a greeter](/wdm/greeters).
@@ -48,6 +52,6 @@ Anything that can speak Wayland can be a greeter. See
 ## Status
 
 wdm is young. The compositor, protocol, PAM conversation, session launch and
-both greeters are implemented and tested, but **the DRM path has not yet run on
+all three greeters are implemented and tested, but **the DRM path has not yet run on
 real hardware** — development uses a nested backend that cannot exercise DRM,
 the seat, or the handoff. Treat it accordingly.

@@ -1,5 +1,10 @@
 //! `wdm_greeter_v1` over GTK's own Wayland connection.
 //!
+//! Everything a toolkit greeter needs that is not its user interface: the
+//! connection, the event queue, and the [`Model`] the protocol's events write
+//! into. Shared by `wdm-gtk-greeter` and `wdm-webkit-greeter`, which differ
+//! only in how they draw it.
+//!
 //! A GTK application does not own its Wayland connection — GDK does, and GDK
 //! knows nothing about `wdm_greeter_v1`. Opening a second connection to the
 //! compositor would not work either: wdm's socket accepts the greeter once, and
@@ -13,6 +18,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gdk4_wayland::gdk;
+use gdk4_wayland::prelude::*;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wdm_protocol::client::wdm_greeter_v1::{self, WdmGreeterV1};
@@ -151,15 +158,17 @@ pub struct Link {
 impl Link {
     /// Bind `wdm_greeter_v1` on GDK's connection.
     ///
-    /// Returns once the enumerate phase has been received, so the UI can be
-    /// built against a populated model rather than flickering into one.
-    pub fn connect(
-        display: &gdk4_wayland::WaylandDisplay,
-    ) -> Result<(Self, Model), Box<dyn std::error::Error>> {
+    /// Returns once the enumerate phase has been received, so a UI can be built
+    /// against a populated model rather than flickering into one.
+    pub fn connect(display: &gdk::Display) -> Result<(Self, Model), Box<dyn std::error::Error>> {
+        let display = display
+            .downcast_ref::<gdk4_wayland::WaylandDisplay>()
+            .ok_or("a wdm greeter needs a Wayland session")?;
+
         // wl_display() is inherent on WaylandDisplay, not on an extension trait.
         let wl_display = display
             .wl_display()
-            .ok_or("GDK is not running on Wayland; wdm-gtk-greeter needs a Wayland session")?;
+            .ok_or("GDK is not running on Wayland; a wdm greeter needs a Wayland session")?;
 
         let backend = wl_display
             .backend()

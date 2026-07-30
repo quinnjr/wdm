@@ -1,0 +1,125 @@
+/* Deliberately close to the GTK greeter's look, so switching greeters is not a
+   visual change as well as a functional one. */
+
+:root {
+  --bg: #12131a;
+  --card: #1b1d26;
+  --field: #0d0e13;
+  --line: #2a2d3a;
+  --text: #e8e8ef;
+  --dim: #9aa0b4;
+  --accent: #6ea8ff;
+  --bad: #ff7b72;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--text);
+  font: 11pt system-ui, sans-serif;
+  /* A login screen is not a document. */
+  user-select: none;
+  cursor: default;
+}
+
+form {
+  width: 22rem;
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+h1 {
+  margin: 0 0 0.75rem;
+  font-size: 1.35rem;
+}
+
+label {
+  color: var(--dim);
+  font-size: 9pt;
+}
+
+/* The prompt is PAM's own words, so it gets the emphasis a label does not. */
+label[for="answer"] {
+  color: var(--text);
+  font-size: 10pt;
+  margin-top: 0.5rem;
+}
+
+input,
+select {
+  /* WebKit draws its own form controls otherwise, in its own light palette —
+     a white drop-down on a dark card. */
+  appearance: none;
+  min-height: 2.4rem;
+  padding: 0 0.6rem;
+  color: var(--text);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* appearance: none takes the arrow with it, so it is drawn back in. */
+select {
+  padding-right: 1.8rem;
+  background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-position:
+    right 1rem top 55%,
+    right 0.7rem top 55%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+#error {
+  margin: 0.5rem 0 0;
+  font-size: 10pt;
+  color: var(--bad);
+}
+
+#message {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.6rem;
+  font-size: 10pt;
+  border-radius: 4px;
+  border-left: 3px solid var(--bad);
+  background: rgba(255, 123, 114, 0.12);
+}
+
+button {
+  margin-top: 1rem;
+  align-self: flex-end;
+  padding: 0.5rem 1.1rem;
+  color: #06101f;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+}
+
+button:hover {
+  filter: brightness(1.1);
+}
+
+input:disabled {
+  opacity: 0.6;
+}

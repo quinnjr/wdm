@@ -1,0 +1,12 @@
+[package]
+name = "wdm-greeter-client"
+description = "wdm_greeter_v1 client library for greeters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wdm-protocol = { workspace = true, features = ["client"] }
+wayland-client.workspace = true
+gdk4-wayland.workspace = true
+log.workspace = true
