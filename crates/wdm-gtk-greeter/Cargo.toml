@@ -1,0 +1,19 @@
+[package]
+name = "wdm-gtk-greeter"
+description = "GTK4 greeter for wdm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wdm-protocol = { workspace = true, features = ["client"] }
+wayland-client.workspace = true
+log.workspace = true
+
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+# wayland_crate exposes GDK's own objects as wayland-client proxies, which is
+# what lets this greeter bind wdm_greeter_v1 on the connection GTK already has
+# rather than opening a second one.
+gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
+env_logger = "0.11"

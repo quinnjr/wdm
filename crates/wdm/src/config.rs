@@ -70,16 +70,26 @@ fn default_vt() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct Greeter {
     /// Command line, split on whitespace. Not run through a shell.
+    #[serde(default = "default_greeter_command")]
     pub command: String,
     /// Unprivileged user the greeter runs as. Must not be root.
+    #[serde(default = "default_greeter_user")]
     pub user: String,
+}
+
+fn default_greeter_command() -> String {
+    "/usr/lib/wdm/wdm-greeter".to_owned()
+}
+
+fn default_greeter_user() -> String {
+    "wdm".to_owned()
 }
 
 impl Default for Greeter {
     fn default() -> Self {
         Self {
-            command: "/usr/lib/wdm/wdm-greeter".to_owned(),
-            user: "wdm".to_owned(),
+            command: default_greeter_command(),
+            user: default_greeter_user(),
         }
     }
 }
@@ -89,14 +99,17 @@ impl Default for Greeter {
 /// This has to be configured here because there is no user whose preferences
 /// could be consulted yet, and a user who cannot type their password on their
 /// own layout cannot log in.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keyboard {
     #[serde(default)]
     pub rules: String,
     #[serde(default)]
     pub model: String,
-    #[serde(default)]
+    /// Defaults to `us`, which is what the example config documents. An empty
+    /// layout is not the same thing: xkb would fall back to its own build-time
+    /// default, which need not be `us`.
+    #[serde(default = "default_layout")]
     pub layout: String,
     #[serde(default)]
     pub variant: String,
@@ -130,6 +143,22 @@ pub struct Output {
 
 fn enabled() -> bool {
     true
+}
+
+fn default_layout() -> String {
+    "us".to_owned()
+}
+
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self {
+            rules: String::new(),
+            model: String::new(),
+            layout: default_layout(),
+            variant: String::new(),
+            options: None,
+        }
+    }
 }
 
 /// Output rotation and reflection, named as in `wl_output`.
@@ -516,6 +545,24 @@ mod tests {
         assert_eq!(c.default_session.as_deref(), Some("hyprland.desktop"));
         assert_eq!(c.output_for("DP-1").unwrap().scale, Some(1.5));
         assert!(!c.output_for("HDMI-A-1").unwrap().enable);
+    }
+
+    #[test]
+    fn a_partial_greeter_table_uses_defaults_for_the_rest() {
+        // The example config documents both fields as having defaults, so
+        // overriding one must not make the file unparseable — which, since a
+        // malformed config is fatal, would stop wdm starting at all.
+        let c: Config = toml::from_str("[greeter]\nuser = \"login\"\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.greeter.user, "login");
+        assert_eq!(c.greeter.command, default_greeter_command());
+    }
+
+    #[test]
+    fn the_documented_keyboard_default_is_the_real_default() {
+        assert_eq!(Config::default().keyboard.layout, "us");
+        let c: Config = toml::from_str("[keyboard]\nvariant = \"dvorak\"\n").unwrap();
+        assert_eq!(c.keyboard.layout, "us");
     }
 
     #[test]

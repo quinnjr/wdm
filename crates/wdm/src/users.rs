@@ -92,6 +92,11 @@ impl UidRange {
             }
         }
 
+        // Root is never a login target, whatever local policy says. A
+        // `UID_MIN 0` in login.defs would otherwise enumerate root to the
+        // untrusted greeter.
+        range.min = range.min.max(1);
+
         if range.min > range.max {
             log::warn!(
                 "{LOGIN_DEFS}: UID_MIN {} exceeds UID_MAX {}, using defaults",
@@ -149,9 +154,11 @@ fn avatar_for(name: &str, home: &Path) -> String {
 /// Goes through the passwd database rather than reading `/etc/passwd`, so users
 /// provided by LDAP, SSSD or systemd-homed appear too.
 pub fn discover(range: UidRange, last_sessions: &LastSessions) -> Vec<User> {
-    // SAFETY: getpwent is not reentrant and shares a static iteration cursor.
-    // wdm calls this only from the event loop thread; the PAM threads never
-    // touch the passwd database directly.
+    // SAFETY: getpwent is not reentrant and shares a static iteration cursor, so
+    // the invariant is that no other thread calls getpwent/setpwent/endpwent.
+    // wdm calls this only from the event loop thread. The PAM threads do resolve
+    // accounts through NSS, but via getpwnam_r, which does not touch that
+    // cursor — the earlier justification named the wrong reason.
     let all = unsafe { uzers::all_users() };
 
     let mut users: Vec<User> = all
@@ -253,8 +260,33 @@ impl LastSessions {
         }
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.to_text())?;
-        std::fs::rename(&tmp, path)
+
+        // Written through a File and synced before the rename: `fs::write` plus
+        // `rename` is atomic against a process crash, but after a power cut the
+        // filesystem can expose a zero-length file at the target, which loses
+        // every user's preference rather than one.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(self.to_text().as_bytes())?;
+            file.sync_all()?;
+        }
+
+        std::fs::rename(&tmp, path)?;
+
+        // The rename is the operation that has to survive a power cut, and only
+        // a directory sync makes it durable — syncing the file alone leaves the
+        // directory entry in the page cache, so the rename itself can be lost.
+        // Best effort: losing a session preference is cosmetic, and failing the
+        // save here would be worse than a stale preference.
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            log::debug!("syncing {}: {e}", parent.display());
+        }
+
+        Ok(())
     }
 }
 
@@ -283,6 +315,14 @@ mod tests {
     fn login_defs_ignores_trailing_comments() {
         let range = UidRange::parse_login_defs("UID_MIN 2000 # start here\n");
         assert_eq!(range.min, 2000);
+    }
+
+    #[test]
+    fn root_is_never_inside_the_range() {
+        // Local policy does not get to make root loginable from a display
+        // manager documented as never offering it.
+        assert!(!UidRange::parse_login_defs("UID_MIN 0\n").contains(0));
+        assert!(!UidRange::default().contains(0));
     }
 
     #[test]
@@ -326,7 +366,7 @@ mod tests {
 
     #[test]
     fn takes_first_gecos_field() {
-        assert_eq!(display_name_from_gecos("Joseph Quinn,,,"), "Joseph Quinn");
+        assert_eq!(display_name_from_gecos("Test User,,,"), "Test User");
         assert_eq!(display_name_from_gecos(""), "");
         assert_eq!(display_name_from_gecos("  Spaced  ,x"), "Spaced");
     }
@@ -348,11 +388,11 @@ mod tests {
     #[test]
     fn last_sessions_round_trip() {
         let mut store = LastSessions::default();
-        store.set("joseph", "hyprland.desktop");
+        store.set("testuser", "hyprland.desktop");
         store.set("ada", "sway.desktop");
 
         let reloaded = LastSessions::parse(&store.to_text());
-        assert_eq!(reloaded.get("joseph"), Some("hyprland.desktop"));
+        assert_eq!(reloaded.get("testuser"), Some("hyprland.desktop"));
         assert_eq!(reloaded.get("ada"), Some("sway.desktop"));
         assert_eq!(reloaded.get("nobody"), None);
     }
@@ -360,8 +400,8 @@ mod tests {
     #[test]
     fn last_sessions_skips_malformed_lines() {
         // One bad line must not lose the other users' preferences.
-        let store = LastSessions::parse("joseph\thyprland.desktop\ngarbage\n\tno-user\nada\t\n");
-        assert_eq!(store.get("joseph"), Some("hyprland.desktop"));
+        let store = LastSessions::parse("testuser\thyprland.desktop\ngarbage\n\tno-user\nada\t\n");
+        assert_eq!(store.get("testuser"), Some("hyprland.desktop"));
         assert_eq!(store.get("ada"), None);
     }
 
@@ -385,11 +425,11 @@ mod tests {
         let path = dir.path().join("state").join("last-session");
 
         let mut store = LastSessions::default();
-        store.set("joseph", "hyprland.desktop");
+        store.set("testuser", "hyprland.desktop");
         store.save(&path).unwrap();
 
         assert_eq!(
-            LastSessions::load(&path).get("joseph"),
+            LastSessions::load(&path).get("testuser"),
             Some("hyprland.desktop")
         );
         // The temporary file must not be left behind.

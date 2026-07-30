@@ -23,20 +23,25 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
-use smithay::reexports::wayland_server::Display;
-use smithay::utils::DeviceFd;
+use smithay::reexports::wayland_server::{Display, DisplayHandle, backend::GlobalId};
+use smithay::utils::{DeviceFd, Physical, Size};
 
 use crate::comp::{LoopData, Wdm};
+use crate::render::WdmElement;
 use crate::config::{self, Config};
 
 use super::{Handled, Request, handle_action, poll_greeter};
@@ -68,6 +73,10 @@ struct Device {
     renderer: GlesRenderer,
     /// One entry per active CRTC.
     outputs: HashMap<crtc::Handle, Head>,
+    /// The give-up screen, rasterised once and reused. It never changes, and
+    /// rebuilding a full-screen image every frame on the one path that runs when
+    /// everything else has failed would be gratuitous.
+    error_screen: Option<(String, Size<i32, Physical>, MemoryRenderBuffer)>,
     /// Wayland output globals, dropped with the device so clients see the
     /// outputs go away.
     drm_token: RegistrationToken,
@@ -80,6 +89,13 @@ struct Device {
 struct Head {
     compositor: Compositor,
     output: Output,
+    /// The advertised `wl_output`. Kept because it is the only handle that can
+    /// withdraw the global again: `Output` has no `Drop` that removes it, and
+    /// the global's own data holds a strong `Output` clone, so dropping the head
+    /// alone leaks both. Without this a greeter never sees `global_remove` for
+    /// an unplugged monitor, and every login cycle adds one global per
+    /// connector for the lifetime of the process.
+    global: GlobalId,
     /// Tracked here rather than asked of the compositor, because deciding whether
     /// an output survived a hotplug means comparing against the connectors the
     /// kernel now reports.
@@ -108,17 +124,28 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let (state, socket_name) = super::setup::build(&mut display, &loop_handle, config, true)?;
     let mut data = LoopData { state, display };
 
+    // Without this the udev backend has exactly one exit — a login handoff — so
+    // `systemctl stop wdm` never runs Greeter's Drop and the greeter is orphaned
+    // until SIGKILL.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
+    loop_handle.insert_source(signals, |event, _, data| {
+        log::info!("caught {:?}, shutting down", event.signal());
+        data.state.running = false;
+    })?;
+
     let vt = data.state.config.vt;
 
     loop {
         let mut udev = Udev::new(&loop_handle, &mut data, vt)?;
 
-        super::setup::start(&mut data, &socket_name)?;
+        super::setup::start(&mut data, &loop_handle, &socket_name);
 
         let launch = pump(&mut event_loop, &mut data, &mut udev, &loop_handle)?;
 
         let Some(launch) = launch else {
-            // The loop ended without a launch: wdm is shutting down.
+            // The loop ended without a launch: a signal asked wdm to stop. The
+            // greeter is killed by Greeter's Drop as `data` goes out of scope.
+            log::info!("shutting down");
             return Ok(());
         };
 
@@ -126,7 +153,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // first so it stops drawing, then the device, then the seat.
         data.state.greeter.kill();
         data.state.layers.clear();
-        udev.release(&loop_handle);
+        udev.release(&loop_handle, &data.state.display.clone());
         drop(udev);
 
         let username = launch.username().to_owned();
@@ -179,6 +206,7 @@ fn pump(
     while data.state.running {
         udev.drain_requests(data, loop_handle);
         poll_greeter(data, loop_handle);
+        data.state.cleanup_popups();
 
         if let Handled::HandOff(launch) = handle_action(data, loop_handle) {
             return Ok(Some(launch));
@@ -342,6 +370,10 @@ impl Udev {
             .copied()
             .collect::<Vec<_>>();
 
+        // Advertised now that a renderer exists to name the formats.
+        data.state
+            .init_dmabuf(&data.state.display.clone(), render_formats.clone());
+
         let allocator = GbmAllocator::new(
             gbm.clone(),
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -369,6 +401,7 @@ impl Udev {
             output_manager,
             renderer,
             outputs: HashMap::new(),
+            error_screen: None,
             drm_token,
             device_id: node.dev_id(),
         });
@@ -396,17 +429,30 @@ impl Udev {
         let connected: Vec<connector::Info> = resources
             .connectors()
             .iter()
-            .filter_map(|handle| device.output_manager.device().get_connector(*handle, true).ok())
+            // force_probe only where the kernel does not already know: a forced
+            // probe is a blocking DDC/EDID round trip of roughly 100ms per
+            // connector, and doing it for all of them stalls the event loop
+            // every time a cable moves.
+            .filter_map(|handle| {
+                let device = device.output_manager.device();
+                let known = device
+                    .get_connector(*handle, false)
+                    .ok()
+                    .filter(|info| info.state() != connector::State::Unknown);
+                known.or_else(|| device.get_connector(*handle, true).ok())
+            })
             .filter(|info| info.state() == connector::State::Connected)
             .collect();
 
         // Outputs whose connector went away must go, or wdm keeps trying to
         // commit to a CRTC that is no longer driving anything.
         let live: Vec<connector::Handle> = connected.iter().map(connector::Info::handle).collect();
+        let display = data.state.display.clone();
         device.outputs.retain(|_, head| {
             let keep = live.contains(&head.connector);
             if !keep {
                 log::info!("output {} disconnected", head.output.name());
+                display.remove_global::<Wdm>(head.global.clone());
             }
             keep
         });
@@ -472,7 +518,7 @@ impl Udev {
                 model: info.interface().as_str().to_owned(),
             },
         );
-        output.create_global::<Wdm>(&data.state.display);
+        let global = output.create_global::<Wdm>(&data.state.display);
 
         let wl_mode = OutputMode::from(mode);
         let scale = output_config.and_then(|c| c.scale).unwrap_or(1.0);
@@ -488,10 +534,8 @@ impl Udev {
         );
         output.set_preferred(wl_mode);
 
-        let elements: DrmOutputRenderElements<
-            GlesRenderer,
-            WaylandSurfaceRenderElement<GlesRenderer>,
-        > = DrmOutputRenderElements::default();
+        let elements: DrmOutputRenderElements<GlesRenderer, WdmElement<GlesRenderer>> =
+            DrmOutputRenderElements::default();
 
         let compositor = device.output_manager.initialize_output(
             crtc,
@@ -508,6 +552,7 @@ impl Udev {
             Head {
                 compositor,
                 output,
+                global,
                 connector: info.handle(),
             },
         );
@@ -517,6 +562,12 @@ impl Udev {
 
     /// Act on everything the event sources queued.
     fn drain_requests(&mut self, data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
+        // udev emits Changed in bursts while a cable settles, and each rescan
+        // force-probes every connector — a blocking DDC round trip per
+        // connector, on the thread that also serves input and the greeter.
+        // Coalescing keeps one burst to one probe.
+        let mut rescan = false;
+
         for request in std::mem::take(&mut data.state.requests) {
             match request {
                 Request::SwitchVt(vt) => {
@@ -530,15 +581,32 @@ impl Udev {
                     self.active = active;
                     if active {
                         log::info!("seat activated");
-                        self.libinput.resume().ok();
-                        // The screen is stale after another VT had it, so every
-                        // surface is reconfigured and the next frame is a full
-                        // redraw.
-                        if let Some(device) = &mut self.device
-                            && let Err(e) = device.output_manager.activate(false)
-                        {
-                            log::error!("reactivating the drm device: {e}");
+                        if let Err(()) = self.libinput.resume() {
+                            // Without input there is no way to type a password
+                            // and no way to use the VT chord that is the
+                            // documented escape hatch, so this must not be silent.
+                            log::error!("resuming input after vt switch failed");
                         }
+
+                        if let Some(device) = &mut self.device {
+                            // `true` so smithay resets the device state: whatever
+                            // held the VT may have left conflicting CRTC and
+                            // connector routing, and with `false` every
+                            // subsequent atomic commit fails and the screen
+                            // stays black with only the journal to say why.
+                            if let Err(e) = device.output_manager.activate(true) {
+                                log::error!("reactivating the drm device: {e}");
+                            }
+                            // Whatever had the VT drew over the framebuffers, so
+                            // damage tracking from before the switch describes a
+                            // screen that no longer exists. Resetting the buffers
+                            // forces the next frame to be a full redraw instead of
+                            // an incremental one against someone else's pixels.
+                            for head in device.outputs.values() {
+                                head.compositor.reset_buffers();
+                            }
+                        }
+
                         data.state.configure_layers();
                     } else {
                         log::info!("seat paused");
@@ -549,7 +617,7 @@ impl Udev {
                     }
                 }
 
-                Request::RescanConnectors => self.scan_connectors(data),
+                Request::RescanConnectors => rescan = true,
 
                 Request::DeviceAdded(path) => {
                     if self.device.is_none() {
@@ -572,6 +640,9 @@ impl Udev {
                         log::error!("the gpu wdm was using was removed");
                         if let Some(device) = self.device.take() {
                             loop_handle.remove(device.drm_token);
+                            for head in device.outputs.into_values() {
+                                data.state.display.remove_global::<Wdm>(head.global);
+                            }
                         }
                         data.state.set_outputs(Vec::new());
                     }
@@ -587,6 +658,10 @@ impl Udev {
                 }
             }
         }
+
+        if rescan {
+            self.scan_connectors(data);
+        }
     }
 
     /// Draw every output that needs it.
@@ -595,8 +670,9 @@ impl Udev {
             return;
         };
 
-        let give_up = data.state.give_up_reason.clone();
+        let give_up = data.state.give_up_reason.as_deref();
         let crtcs: Vec<crtc::Handle> = device.outputs.keys().copied().collect();
+        let mut drew = false;
 
         for crtc in crtcs {
             let Some(head) = device.outputs.get_mut(&crtc) else {
@@ -604,12 +680,51 @@ impl Udev {
             };
             let output = head.output.clone();
 
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = match &give_up {
+            let elements: Vec<WdmElement<GlesRenderer>> = match give_up {
                 // Once wdm has given up there is no greeter to draw, so the
-                // error screen is composited instead. It is uploaded per frame,
-                // which is wasteful but only happens when nothing else is
-                // drawing.
-                Some(_) => Vec::new(),
+                // error screen is composited instead. Drawing nothing here would
+                // leave a flat colour with no explanation, which is exactly the
+                // failure the give-up path exists to avoid.
+                Some(reason) => {
+                    let size = output
+                        .current_mode()
+                        .map(|m| m.size)
+                        .unwrap_or_else(|| (640, 480).into());
+
+                    // Keyed on the size as well as the message: two outputs of
+                    // different resolutions would otherwise share one raster and
+                    // the second would show the text in a box of the wrong size.
+                    if device
+                        .error_screen
+                        .as_ref()
+                        .is_none_or(|(cached, cached_size, _)| {
+                            cached != reason || *cached_size != size
+                        })
+                    {
+                        device.error_screen = Some((
+                            reason.to_owned(),
+                            size,
+                            crate::render::error_buffer(reason, size),
+                        ));
+                    }
+
+                    let (_, _, buffer) = device.error_screen.as_ref().expect("just populated");
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        &mut device.renderer,
+                        (0.0, 0.0),
+                        buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        Ok(element) => vec![WdmElement::Image(element)],
+                        Err(e) => {
+                            log::error!("building the error screen: {e}");
+                            Vec::new()
+                        }
+                    }
+                }
                 None => data.state.elements(&mut device.renderer, &output),
             };
 
@@ -621,6 +736,7 @@ impl Udev {
                     if frame.is_empty {
                         continue;
                     }
+                    drew = true;
                     if let Err(e) = head.compositor.queue_frame(()) {
                         log::error!("queueing frame on {}: {e}", output.name());
                     }
@@ -629,8 +745,14 @@ impl Udev {
             }
         }
 
-        data.state
-            .send_frames(data.state.uptime().as_millis() as u32);
+        // Only when something was actually committed: releasing frame callbacks
+        // for a frame that was not drawn asks the greeter to render again
+        // immediately, which on an idle login screen is a busy loop between two
+        // processes.
+        if drew {
+            data.state
+                .send_frames(data.state.uptime().as_millis() as u32);
+        }
     }
 
 
@@ -638,9 +760,14 @@ impl Udev {
     ///
     /// Removes every event source first: leaving a libinput or DRM source
     /// registered against a closed device makes calloop spin on a dead fd.
-    fn release(&mut self, loop_handle: &LoopHandle<'static, LoopData>) {
-        if let Some(device) = self.device.take() {
+    fn release(&mut self, loop_handle: &LoopHandle<'static, LoopData>, display: &DisplayHandle) {
+        if let Some(mut device) = self.device.take() {
             loop_handle.remove(device.drm_token);
+            // Each login generation builds fresh Outputs; without withdrawing
+            // these the globals accumulate one per connector per login.
+            for (_, head) in device.outputs.drain() {
+                display.remove_global::<Wdm>(head.global);
+            }
             // Dropping the manager and renderer closes the DRM fd, which is what
             // actually drops master.
             drop(device);

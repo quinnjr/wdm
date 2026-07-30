@@ -1,10 +1,14 @@
 //! Software text rasterisation.
 //!
 //! The greeter draws into a `wl_shm` buffer with no toolkit, so it rasterises
-//! glyphs itself. A login screen redraws on keystrokes, not at 60Hz, so software
-//! rendering costs nothing that matters and saves depending on GTK or Qt just to
-//! draw two text fields.
+//! glyphs itself. That saves depending on GTK or Qt to draw two text fields.
+//!
+//! Keystrokes *are* the hot path on a login screen — every one repaints the
+//! form — so rasterised glyphs are cached. Without the cache every character
+//! typed re-rasterises every glyph on screen.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use fontdue::layout::{CoordinateSystem, Layout, LayoutSettings, TextStyle};
@@ -78,6 +82,31 @@ impl Canvas {
     }
 }
 
+thread_local! {
+    /// Rasterised glyphs, keyed by character and size.
+    ///
+    /// Bounded in practice by the handful of sizes the UI uses and the
+    /// characters actually typed, so it needs no eviction policy: a login
+    /// screen's lifetime is one login.
+    static GLYPHS: RefCell<HashMap<fontdue::layout::GlyphRasterConfig, (fontdue::Metrics, Vec<u8>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Rasterise a glyph, reusing the cached coverage map when there is one.
+fn rasterize<T>(
+    font: &Font,
+    key: fontdue::layout::GlyphRasterConfig,
+    f: impl FnOnce(&fontdue::Metrics, &[u8]) -> T,
+) -> T {
+    GLYPHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let (metrics, coverage) = cache
+            .entry(key)
+            .or_insert_with(|| font.rasterize_config(key));
+        f(metrics, coverage)
+    })
+}
+
 fn font() -> Option<&'static Font> {
     static FONT: OnceLock<Option<Font>> = OnceLock::new();
 
@@ -131,10 +160,14 @@ pub fn draw(canvas: &mut Canvas, x: f32, y: f32, size: f32, color: u32, text: &s
     layout.append(&[font], &TextStyle::new(text, size, 0));
 
     for glyph in layout.glyphs() {
-        let (metrics, coverage) = font.rasterize_config(glyph.key);
-        if metrics.width == 0 || metrics.height == 0 {
+        // Copied out of the cache rather than blended under its borrow, because
+        // blend takes &mut Canvas and the cache borrow would still be live.
+        let Some((metrics, coverage)) = rasterize(font, glyph.key, |metrics, coverage| {
+            (metrics.width > 0 && metrics.height > 0).then(|| (*metrics, coverage.to_vec()))
+        }) else {
             continue;
-        }
+        };
+
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 canvas.blend(

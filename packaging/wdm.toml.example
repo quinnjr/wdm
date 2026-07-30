@@ -42,7 +42,9 @@ layout = "us"
 #connector = "DP-2"
 #mode = "1920x1080@60"
 #
-# A display that should never show a password prompt: blanked, and given no rank.
+# A display that should never show a password prompt. It is left unprogrammed
+# and given no rank; it is not actively blanked, so whatever was on it before
+# wdm started remains until the mode times out.
 #[[output]]
 #connector = "HDMI-A-1"
 #enable = false

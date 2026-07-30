@@ -17,6 +17,7 @@
 //! close the session and end the PAM transaction.
 
 use std::ffi::{CStr, CString, OsStr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -26,11 +27,55 @@ use zeroize::Zeroize;
 /// PAM service name; wdm ships `/etc/pam.d/wdm`.
 pub const SERVICE: &str = "wdm";
 
+/// Source of prompt ids, shared by every attempt in the process.
+///
+/// Per-attempt counters would restart at 0, so a late `respond` carrying id 0
+/// from a cancelled conversation would match the first prompt of the *next*
+/// one — feeding one user's secret to another user's PAM stack. An id must
+/// identify the question it was issued for, which means it may never be reused.
+static NEXT_PROMPT_ID: AtomicU32 = AtomicU32::new(0);
+
+fn next_prompt_id() -> u32 {
+    NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// How long a prompt may go unanswered before the attempt is abandoned.
 ///
 /// A greeter that stops answering would otherwise pin a thread and a PAM
-/// transaction forever.
+/// transaction forever. Measured from when the prompt was emitted, not from the
+/// last message received, so a stream of stale responses cannot extend it.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What wdm tells pam_systemd about the seat before opening a session.
+///
+/// These have to reach PAM's own environment before `pam_open_session`;
+/// putting them only in the launched child's environment is too late, because
+/// pam_systemd has already registered the logind session by then.
+#[derive(Debug, Clone)]
+pub struct SessionDescription {
+    pub seat: String,
+    pub vtnr: u32,
+    /// `wayland` or `x11`.
+    pub session_type: String,
+    /// The desktop id, without the `.desktop` suffix. Empty until the greeter
+    /// has chosen one, which is why it is not required to be set.
+    pub desktop: String,
+}
+
+impl SessionDescription {
+    fn pam_items(&self) -> Vec<(&'static str, String)> {
+        let mut items = vec![
+            ("XDG_SEAT", self.seat.clone()),
+            ("XDG_VTNR", self.vtnr.to_string()),
+            ("XDG_SESSION_CLASS", "user".to_owned()),
+            ("XDG_SESSION_TYPE", self.session_type.clone()),
+        ];
+        if !self.desktop.is_empty() {
+            items.push(("XDG_SESSION_DESKTOP", self.desktop.clone()));
+        }
+        items
+    }
+}
 
 /// How a prompt should be presented, mirroring PAM's message styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +133,23 @@ enum AuthCommand {
 /// An answer to a specific prompt.
 struct PromptResponse {
     id: u32,
-    /// Zeroized after being handed to PAM: this is frequently a password.
+    /// Zeroized on drop: this is frequently a password.
     secret: String,
+}
+
+impl Drop for PromptResponse {
+    /// Zeroize every path this `String` can take.
+    ///
+    /// A response can be dropped when the channel is closed (the value comes
+    /// back inside `SendError`), when the attempt has already ended, or still
+    /// queued in the receiver when the thread unwinds. This covers all of them.
+    ///
+    /// It does *not* cover the copies downstream: `CString` owns one and libpam
+    /// owns another, and neither is scrubbed. Closing that would mean patching
+    /// PAM.
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 /// Handle to a running authentication attempt.
@@ -106,10 +166,12 @@ impl AuthHandle {
     /// Spawn a thread to authenticate `username`.
     ///
     /// `tty` is set as `PAM_TTY` so modules that make policy decisions based on
-    /// the terminal (`pam_access`, `pam_time`) see the VT wdm runs on.
+    /// the terminal (`pam_access`, `pam_time`) see the VT wdm runs on, and
+    /// `session` describes the seat to pam_systemd.
     pub fn start(
         username: &str,
         tty: &str,
+        session: SessionDescription,
         events: calloop::channel::Sender<AuthEvent>,
     ) -> std::io::Result<Self> {
         let (responses_tx, responses_rx) = mpsc::channel();
@@ -121,7 +183,14 @@ impl AuthHandle {
         std::thread::Builder::new()
             .name(format!("pam-{username}"))
             .spawn(move || {
-                run(&thread_user, &thread_tty, &events, responses_rx, commands_rx);
+                run(
+                    &thread_user,
+                    &thread_tty,
+                    &session,
+                    &events,
+                    responses_rx,
+                    commands_rx,
+                );
             })?;
 
         Ok(Self {
@@ -172,6 +241,7 @@ impl AuthHandle {
 fn run(
     username: &str,
     tty: &str,
+    session: &SessionDescription,
     events: &calloop::channel::Sender<AuthEvent>,
     responses: mpsc::Receiver<PromptResponse>,
     commands: mpsc::Receiver<AuthCommand>,
@@ -179,7 +249,6 @@ fn run(
     let conv = ChannelConversation {
         events: events.clone(),
         responses,
-        next_id: 0,
     };
 
     let mut context = match Context::new(SERVICE, Some(username), conv) {
@@ -196,6 +265,17 @@ fn run(
     if let Err(e) = context.set_tty(Some(tty)) {
         // Not fatal: modules that care about the tty are the exception.
         log::warn!("setting PAM_TTY to {tty}: {e}");
+    }
+
+    // pam_systemd reads these from the PAM environment, not from the child's.
+    // Without them it registers the logind session as Type=tty with no desktop,
+    // so `loginctl` misreports it and anything keying off sd_session_get_type —
+    // screen lockers, logind's own idle handling — sees a tty session driving a
+    // Wayland compositor.
+    for (key, value) in session.pam_items() {
+        if let Err(e) = context.putenv(format!("{key}={value}").as_str()) {
+            log::warn!("setting {key} for PAM: {e}");
+        }
     }
 
     // DISALLOW_NULL_AUTHTOK: an account with an empty password must not be
@@ -308,21 +388,19 @@ fn os_to_string(s: &OsStr) -> Option<String> {
 struct ChannelConversation {
     events: calloop::channel::Sender<AuthEvent>,
     responses: mpsc::Receiver<PromptResponse>,
-    next_id: u32,
 }
 
 impl ChannelConversation {
     /// Emit a prompt and block until the matching response arrives.
     fn ask(&mut self, prompt: &CStr, style: PromptStyle) -> Result<CString, ErrorCode> {
-        let id = self.next_id;
-        // Wrapping is unreachable in practice but must not panic on a login
-        // screen; the id only has to be unique among live prompts.
-        self.next_id = self.next_id.wrapping_add(1);
-
+        let id = next_prompt_id();
         self.emit(id, prompt, style)?;
 
+        let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+
         loop {
-            let mut response = match self.responses.recv_timeout(RESPONSE_TIMEOUT) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let response = match self.responses.recv_timeout(remaining) {
                 Ok(response) => response,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     log::info!("no response to prompt {id} within {RESPONSE_TIMEOUT:?}");
@@ -336,29 +414,32 @@ impl ChannelConversation {
                 // A response the greeter sent for a prompt that has already been
                 // superseded. The protocol raises stale_prompt for this, but a
                 // race can still deliver one legitimately, so drop it rather
-                // than failing the whole attempt.
+                // than failing the whole attempt. Drop zeroizes it.
                 log::debug!("discarding response for stale prompt {}", response.id);
-                response.secret.zeroize();
                 continue;
             }
 
             // CString rejects interior NUL, which cannot be part of a password
             // PAM could ever verify.
-            let result = CString::new(response.secret.as_bytes()).map_err(|_| {
+            // The String is zeroized when `response` drops. The intermediate
+            // Vec is zeroized here explicitly, because CString takes ownership
+            // of a copy and neither it nor libpam's own copy of the answer is
+            // ever scrubbed — so the plaintext survives in freed heap either
+            // way. This narrows the window rather than closing it.
+            let mut bytes = response.secret.as_bytes().to_vec();
+            let result = CString::new(bytes.clone()).map_err(|_| {
                 log::info!("response to prompt {id} contained a NUL byte");
                 ErrorCode::CONV_ERR
             });
-            response.secret.zeroize();
+            bytes.zeroize();
             return result;
         }
     }
 
     /// Emit a message the greeter is not expected to answer.
     fn tell(&mut self, msg: &CStr, style: PromptStyle) {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
         // Nothing to do on failure: PAM's text_info and error_msg cannot fail.
-        let _ = self.emit(id, msg, style);
+        let _ = self.emit(next_prompt_id(), msg, style);
     }
 
     fn emit(&self, id: u32, text: &CStr, style: PromptStyle) -> Result<(), ErrorCode> {
@@ -403,8 +484,18 @@ mod tests {
         assert!(!PromptStyle::Error.expects_response());
     }
 
-    /// Drive the conversation directly, without libpam, to check the id
-    /// matching and cancellation behaviour that the protocol depends on.
+    #[test]
+    fn prompt_ids_are_never_reused() {
+        // The whole point of the global counter: a late response from a
+        // cancelled conversation must not match a prompt in the next one.
+        let a = next_prompt_id();
+        let b = next_prompt_id();
+        assert_ne!(a, b);
+        assert!(b > a);
+    }
+
+    /// Drive the conversation directly, without libpam, to check the id matching
+    /// and cancellation behaviour the protocol depends on.
     fn conversation() -> (
         ChannelConversation,
         mpsc::Sender<PromptResponse>,
@@ -415,61 +506,135 @@ mod tests {
         let conv = ChannelConversation {
             events: events_tx,
             responses: responses_rx,
-            next_id: 0,
         };
         (conv, responses_tx, events_rx)
     }
 
+    /// Reads prompts off the event channel as they are emitted.
+    ///
+    /// Prompt ids come from a process-global counter, so a test cannot predict
+    /// them — it has to read them back off the wire, which is what a real
+    /// greeter does too.
+    struct PromptStream {
+        event_loop: calloop::EventLoop<'static, Vec<(u32, String, PromptStyle)>>,
+        seen: Vec<(u32, String, PromptStyle)>,
+        taken: usize,
+    }
+
+    impl PromptStream {
+        fn new(channel: calloop::channel::Channel<AuthEvent>) -> Self {
+            let event_loop = calloop::EventLoop::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(channel, |event, _, seen: &mut Vec<_>| {
+                    if let calloop::channel::Event::Msg(AuthEvent::Prompt { id, text, style }) =
+                        event
+                    {
+                        seen.push((id, text, style));
+                    }
+                })
+                .unwrap();
+            Self {
+                event_loop,
+                seen: Vec::new(),
+                taken: 0,
+            }
+        }
+
+        /// Block until the next prompt arrives.
+        fn next(&mut self) -> (u32, String, PromptStyle) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.seen.len() <= self.taken {
+                assert!(std::time::Instant::now() < deadline, "prompt never arrived");
+                self.event_loop
+                    .dispatch(Duration::from_millis(20), &mut self.seen)
+                    .unwrap();
+            }
+            self.taken += 1;
+            self.seen[self.taken - 1].clone()
+        }
+    }
+
     #[test]
     fn answers_a_prompt() {
-        let (mut conv, responses, _events) = conversation();
+        let (mut conv, responses, events) = conversation();
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let (id, _, style) = PromptStream::new(events).next();
+        assert_eq!(style, PromptStyle::Secret);
         responses
             .send(PromptResponse {
-                id: 0,
+                id,
                 secret: "hunter2".to_owned(),
             })
             .unwrap();
 
-        let answer = conv.prompt_echo_off(c"Password:").unwrap();
+        let answer = worker.join().unwrap().unwrap();
         assert_eq!(answer.to_str().unwrap(), "hunter2");
     }
 
     #[test]
     fn ignores_stale_responses_and_keeps_waiting() {
-        let (mut conv, responses, _events) = conversation();
-        // The greeter answers a prompt that no longer exists, then the real one.
+        let (mut conv, responses, events) = conversation();
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let (id, _, _) = PromptStream::new(events).next();
+
+        // An answer to a prompt that no longer exists, then the real one.
         responses
             .send(PromptResponse {
-                id: 99,
+                id: id.wrapping_add(999),
                 secret: "stale".to_owned(),
             })
             .unwrap();
         responses
             .send(PromptResponse {
-                id: 0,
+                id,
                 secret: "fresh".to_owned(),
             })
             .unwrap();
 
-        let answer = conv.prompt_echo_off(c"Password:").unwrap();
+        let answer = worker.join().unwrap().unwrap();
         assert_eq!(answer.to_str().unwrap(), "fresh");
     }
 
     #[test]
-    fn prompt_ids_advance() {
-        let (mut conv, responses, _events) = conversation();
-        for id in 0..3 {
-            responses
-                .send(PromptResponse {
-                    id,
-                    secret: format!("s{id}"),
-                })
-                .unwrap();
-            assert_eq!(
-                conv.prompt_echo_on(c"Token:").unwrap().to_str().unwrap(),
-                format!("s{id}")
-            );
-        }
+    fn a_multi_prompt_conversation_uses_distinct_ids() {
+        // PAM asks in sequence — password, then a token, then an expiry notice.
+        // Each question must carry its own id or a slow greeter could answer the
+        // wrong one.
+        let (mut conv, responses, events) = conversation();
+        let worker = std::thread::spawn(move || {
+            let first = conv.prompt_echo_on(c"Username:")?;
+            let second = conv.prompt_echo_off(c"Password:")?;
+            Ok::<_, ErrorCode>((first, second))
+        });
+
+        let mut prompts = PromptStream::new(events);
+
+        let (first_id, text, style) = prompts.next();
+        assert_eq!(text, "Username:");
+        assert_eq!(style, PromptStyle::Visible);
+        responses
+            .send(PromptResponse {
+                id: first_id,
+                secret: "testuser".to_owned(),
+            })
+            .unwrap();
+
+        let (second_id, _, style) = prompts.next();
+        assert_eq!(style, PromptStyle::Secret);
+        assert_ne!(first_id, second_id, "ids must not repeat within a conversation");
+        responses
+            .send(PromptResponse {
+                id: second_id,
+                secret: "hunter2".to_owned(),
+            })
+            .unwrap();
+
+        let (username, password) = worker.join().unwrap().unwrap();
+        assert_eq!(username.to_str().unwrap(), "testuser");
+        assert_eq!(password.to_str().unwrap(), "hunter2");
     }
 
     #[test]
@@ -485,72 +650,55 @@ mod tests {
 
     #[test]
     fn rejects_response_containing_nul() {
-        let (mut conv, responses, _events) = conversation();
+        let (mut conv, responses, events) = conversation();
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let (id, _, _) = PromptStream::new(events).next();
         responses
             .send(PromptResponse {
-                id: 0,
+                id,
                 secret: "bad\0password".to_owned(),
             })
             .unwrap();
-        assert_eq!(
-            conv.prompt_echo_off(c"Password:").unwrap_err(),
-            ErrorCode::CONV_ERR
-        );
+
+        assert_eq!(worker.join().unwrap().unwrap_err(), ErrorCode::CONV_ERR);
     }
 
     #[test]
-    fn emits_prompts_to_the_event_loop() {
-        let (mut conv, responses, events) = conversation();
-        responses
-            .send(PromptResponse {
-                id: 0,
-                secret: "x".to_owned(),
-            })
-            .unwrap();
-        conv.prompt_echo_off(c"Password:").unwrap();
+    fn informational_messages_need_no_response() {
+        let (mut conv, _responses, events) = conversation();
+        // text_info and error_msg must not block waiting for an answer.
         conv.text_info(c"Welcome");
         conv.error_msg(c"Nope");
 
-        // The channel is an event source, so draining it means running a loop.
-        let mut event_loop: calloop::EventLoop<Vec<(u32, String, PromptStyle)>> =
-            calloop::EventLoop::try_new().unwrap();
-        event_loop
-            .handle()
-            .insert_source(events, |event, _, seen| {
-                if let calloop::channel::Event::Msg(AuthEvent::Prompt { id, text, style }) = event {
-                    seen.push((id, text, style));
-                }
-            })
-            .unwrap();
+        let mut prompts = PromptStream::new(events);
+        let (info_id, text, style) = prompts.next();
+        assert_eq!(text, "Welcome");
+        assert_eq!(style, PromptStyle::Info);
 
-        let mut seen = Vec::new();
-        while seen.len() < 3 {
-            event_loop
-                .dispatch(Duration::from_millis(50), &mut seen)
-                .unwrap();
-        }
-
-        assert_eq!(
-            seen,
-            vec![
-                (0, "Password:".to_owned(), PromptStyle::Secret),
-                (1, "Welcome".to_owned(), PromptStyle::Info),
-                (2, "Nope".to_owned(), PromptStyle::Error),
-            ]
-        );
+        let (error_id, text, style) = prompts.next();
+        assert_eq!(text, "Nope");
+        assert_eq!(style, PromptStyle::Error);
+        assert!(error_id > info_id, "ids must advance");
     }
 
     #[test]
     fn handles_non_utf8_pam_messages() {
-        let (mut conv, responses, _events) = conversation();
+        let (mut conv, responses, events) = conversation();
+        // Modules are not required to emit UTF-8; this must not panic.
+        let worker = std::thread::spawn(move || {
+            let msg = CString::new([0xff, 0xfe, b'?']).unwrap();
+            conv.prompt_echo_off(&msg)
+        });
+
+        let (id, _, _) = PromptStream::new(events).next();
         responses
             .send(PromptResponse {
-                id: 0,
+                id,
                 secret: "x".to_owned(),
             })
             .unwrap();
-        // Modules are not required to emit UTF-8; this must not panic.
-        let msg = CString::new([0xff, 0xfe, b'?']).unwrap();
-        assert!(conv.prompt_echo_off(&msg).is_ok());
+
+        assert!(worker.join().unwrap().is_ok());
     }
 }

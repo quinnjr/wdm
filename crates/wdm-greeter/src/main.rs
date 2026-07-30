@@ -14,6 +14,8 @@ mod ui;
 use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
@@ -48,6 +50,104 @@ struct Session {
     name: String,
 }
 
+/// Double-buffered `wl_shm` storage for the surface.
+///
+/// One pool, two slots, reused across frames. A fresh memfd and pool per frame
+/// meant a full-screen allocation, copy and fd round trip *per keystroke* —
+/// roughly 33MB each way on a 4K output, on the one path a login screen
+/// actually exercises.
+struct Buffers {
+    file: std::fs::File,
+    pool: WlShmPool,
+    size: (i32, i32),
+    slots: Vec<Slot>,
+}
+
+struct Slot {
+    buffer: WlBuffer,
+    offset: usize,
+    /// Cleared when the compositor sends `wl_buffer.release`.
+    ///
+    /// Destroying a buffer at commit time, as this greeter used to, hands the
+    /// compositor a resource that is dead before it renders from it. Atomic
+    /// because wayland-client requires object user data to be `Send + Sync`,
+    /// not because anything here is threaded.
+    busy: Arc<AtomicBool>,
+}
+
+impl Buffers {
+    fn new(
+        shm: &WlShm,
+        qh: &QueueHandle<App>,
+        width: i32,
+        height: i32,
+    ) -> Option<Self> {
+        use rustix::fs::{MemfdFlags, memfd_create};
+
+        let slot_len = (width as usize) * (height as usize) * 4;
+        let total = slot_len * 2;
+
+        let fd = match memfd_create("wdm-greeter", MemfdFlags::CLOEXEC) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::error!("memfd_create: {e}");
+                return None;
+            }
+        };
+
+        let file = std::fs::File::from(fd);
+        if let Err(e) = file.set_len(total as u64) {
+            log::error!("sizing the frame buffer: {e}");
+            return None;
+        }
+
+        let pool = shm.create_pool(file.as_fd(), total as i32, qh, ());
+        let slots = (0..2)
+            .map(|index| {
+                let offset = index * slot_len;
+                let busy = Arc::new(AtomicBool::new(false));
+                let buffer = pool.create_buffer(
+                    offset as i32,
+                    width,
+                    height,
+                    width * 4,
+                    wl_shm::Format::Argb8888,
+                    qh,
+                    busy.clone(),
+                );
+                Slot {
+                    buffer,
+                    offset,
+                    busy,
+                }
+            })
+            .collect();
+
+        Some(Self {
+            file,
+            pool,
+            size: (width, height),
+            slots,
+        })
+    }
+
+    /// A slot the compositor is not currently reading from.
+    fn free_slot(&self) -> Option<&Slot> {
+        self.slots
+            .iter()
+            .find(|s| !s.busy.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for Buffers {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            slot.buffer.destroy();
+        }
+        self.pool.destroy();
+    }
+}
+
 /// A prompt awaiting an answer.
 struct Prompt {
     id: u32,
@@ -65,6 +165,7 @@ struct App {
 
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
+    buffers: Option<Buffers>,
     width: i32,
     height: i32,
     configured: bool,
@@ -77,6 +178,8 @@ struct App {
 
     user_index: usize,
     session_index: usize,
+    /// Whether the session drop-down is open.
+    menu_open: bool,
     prompt: Option<Prompt>,
     answer: String,
     error: Option<String>,
@@ -101,6 +204,7 @@ impl App {
             outputs: HashMap::new(),
             surface: None,
             layer_surface: None,
+            buffers: None,
             width: 0,
             height: 0,
             configured: false,
@@ -110,6 +214,7 @@ impl App {
             ready: false,
             user_index: 0,
             session_index: 0,
+            menu_open: false,
             prompt: None,
             answer: String::new(),
             error: None,
@@ -170,17 +275,68 @@ impl App {
         }
         self.user_index = (self.user_index + 1) % self.users.len();
         self.select_last_session();
+        // A drop-down left open would now be showing the previous user's choice.
+        self.menu_open = false;
         self.error = None;
         // The conversation is per user, so switching users means starting over.
         self.restart_auth();
     }
 
-    fn cycle_session(&mut self) {
+    /// Open or close the session drop-down.
+    fn toggle_menu(&mut self) {
         if self.sessions.len() < 2 {
             return;
         }
-        self.session_index = (self.session_index + 1) % self.sessions.len();
+        self.menu_open = !self.menu_open;
         self.needs_redraw = true;
+    }
+
+    /// Move the drop-down selection by `delta`, wrapping at both ends.
+    ///
+    /// Wrapping rather than clamping because the list is short and reaching the
+    /// last entry from the first should not need five keystrokes.
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.sessions.len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        let index = self.session_index as isize + delta;
+        self.session_index = index.rem_euclid(len) as usize;
+        self.needs_redraw = true;
+    }
+
+    /// Keys that belong to the drop-down while it is open.
+    ///
+    /// Returns true when the key was consumed, so Enter and Escape choose and
+    /// dismiss rather than submitting the password or clearing the field.
+    fn menu_key(&mut self, keysym: xkbcommon::xkb::Keysym) -> bool {
+        use xkbcommon::xkb::keysyms;
+
+        match keysym.raw() {
+            keysyms::KEY_Up | keysyms::KEY_k => self.move_selection(-1),
+            keysyms::KEY_Down | keysyms::KEY_j => self.move_selection(1),
+            keysyms::KEY_Home => {
+                self.session_index = 0;
+                self.needs_redraw = true;
+            }
+            keysyms::KEY_End => {
+                self.session_index = self.sessions.len().saturating_sub(1);
+                self.needs_redraw = true;
+            }
+            keysyms::KEY_Return
+            | keysyms::KEY_KP_Enter
+            | keysyms::KEY_Escape
+            | keysyms::KEY_F2 => {
+                // Escape and Enter both close on the highlighted row: moving the
+                // highlight *is* the selection, so there is nothing to revert.
+                self.menu_open = false;
+                self.needs_redraw = true;
+            }
+            _ => return false,
+        }
+
+        true
     }
 
     /// Answer the pending prompt.
@@ -278,18 +434,17 @@ impl App {
             ui::paint_message(&mut canvas, "No sessions installed", true);
         } else {
             let user = &self.users[self.user_index];
-            let session_name = self
-                .sessions
-                .get(self.session_index)
-                .map(|s| s.name.as_str())
-                .unwrap_or("none");
+            let session_names: Vec<String> =
+                self.sessions.iter().map(|s| s.name.clone()).collect();
 
             ui::paint(
                 &mut canvas,
                 &ui::View {
                     username: &user.name,
                     display_name: &user.display_name,
-                    session_name,
+                    sessions: &session_names,
+                    session_index: self.session_index,
+                    menu_open: self.menu_open,
                     prompt: self.prompt.as_ref().map(|p| p.text.as_str()),
                     answer: &self.answer,
                     // Masked unless PAM said the answer may be echoed. Defaulting
@@ -305,24 +460,57 @@ impl App {
             );
         }
 
-        let Some(buffer) = shm_buffer(shm, qh, &canvas) else {
+        // Rebuilt only when the surface is resized.
+        if self
+            .buffers
+            .as_ref()
+            .is_none_or(|b| b.size != (self.width, self.height))
+        {
+            self.buffers = Buffers::new(shm, qh, self.width, self.height);
+        }
+
+        let Some(buffers) = &self.buffers else {
+            return;
+        };
+        let Some(slot) = buffers.free_slot() else {
+            // Both slots are still held by the compositor. Leaving needs_redraw
+            // set means the next dispatch — the release that frees one — repaints
+            // rather than dropping the frame.
+            log::debug!("no free buffer, deferring the frame");
             return;
         };
 
-        surface.attach(Some(&buffer), 0, 0);
+        // Written through the mapping the compositor already has, so no new fd
+        // and no new pool.
+        {
+            use std::os::unix::fs::FileExt;
+            if let Err(e) = buffers.file.write_all_at(&canvas.data, slot.offset as u64) {
+                log::error!("writing the frame: {e}");
+                return;
+            }
+        }
+
+        slot.busy.store(true, Ordering::Relaxed);
+        surface.attach(Some(&slot.buffer), 0, 0);
+        // ponytail: whole-surface damage and a whole-surface repaint. The
+        // allocation and fd churn are gone and glyphs are cached, so what
+        // remains is one memset plus a redraw of a mostly-static form per
+        // keystroke. Track a dirty rect for the answer field if that ever shows
+        // up in a profile.
         surface.damage_buffer(0, 0, self.width, self.height);
         surface.commit();
-
-        // Destroyed immediately: the compositor keeps the mapping it needs, and
-        // this greeter draws on keystrokes rather than at 60Hz, so there is no
-        // pool worth tracking.
-        buffer.destroy();
 
         self.needs_redraw = false;
     }
 
     fn key(&mut self, keysym: xkbcommon::xkb::Keysym, utf8: String) {
         use xkbcommon::xkb::keysyms;
+
+        // The drop-down takes precedence: while it is open, Enter chooses a
+        // session rather than submitting a half-typed password.
+        if self.menu_open && self.menu_key(keysym) {
+            return;
+        }
 
         match keysym.raw() {
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => self.submit(),
@@ -339,7 +527,7 @@ impl App {
             }
 
             keysyms::KEY_F1 => self.cycle_user(),
-            keysyms::KEY_F2 => self.cycle_session(),
+            keysyms::KEY_F2 => self.toggle_menu(),
 
             // Ctrl+U, the readline convention for clearing the line.
             keysyms::KEY_U | keysyms::KEY_u if self.ctrl_held() => {
@@ -364,46 +552,6 @@ impl App {
             .as_ref()
             .is_some_and(|s| s.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE))
     }
-}
-
-/// Build a `wl_shm` buffer holding the canvas.
-///
-/// A fresh memfd per frame rather than a reused pool: the greeter draws only when
-/// something changed, so the allocation is off any hot path, and it removes the
-/// need to track buffer release.
-fn shm_buffer(shm: &WlShm, qh: &QueueHandle<App>, canvas: &Canvas) -> Option<WlBuffer> {
-    use rustix::fs::{MemfdFlags, memfd_create};
-    use std::io::Write;
-
-    let fd = match memfd_create("wdm-greeter", MemfdFlags::CLOEXEC) {
-        Ok(fd) => fd,
-        Err(e) => {
-            log::error!("memfd_create: {e}");
-            return None;
-        }
-    };
-
-    let mut file = std::fs::File::from(fd);
-    if let Err(e) = file.write_all(&canvas.data) {
-        log::error!("writing the frame: {e}");
-        return None;
-    }
-
-    let pool = shm.create_pool(file.as_fd(), canvas.data.len() as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        canvas.width,
-        canvas.height,
-        canvas.width * 4,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    // The pool is not needed once the buffer exists; the mapping lives until the
-    // buffer is destroyed.
-    pool.destroy();
-
-    Some(buffer)
 }
 
 impl Dispatch<WlRegistry, ()> for App {
@@ -489,6 +637,9 @@ impl Dispatch<WdmGreeterV1, ()> for App {
                 if let Some(old) = state.surface.take() {
                     old.destroy();
                 }
+                // Sized for the old surface, and its slots belong to a pool the
+                // compositor no longer has a surface for.
+                state.buffers = None;
                 state.configured = false;
             }
 
@@ -535,8 +686,13 @@ impl Dispatch<WdmGreeterV1, ()> for App {
                 state.answer.clear();
                 state.error = Some(reason);
                 state.needs_redraw = true;
-                // Ask again straight away so the user can retry without pressing
-                // anything. wdm rate limits, so this cannot become a hot loop.
+                // Ask again so the user can retry without pressing anything.
+                //
+                // wdm delays each failure response, and the delay grows, so this
+                // converges rather than spinning — but the first failure of a
+                // conversation is reported with no delay at all, so a PAM stack
+                // that denies instantly does produce one uncontrolled round trip
+                // before the backoff engages.
                 state.begin_auth();
             }
 
@@ -677,9 +833,24 @@ impl Dispatch<WlKeyboard, ()> for App {
 delegate_noop!(App: ignore WlCompositor);
 delegate_noop!(App: ignore WlShm);
 delegate_noop!(App: ignore WlShmPool);
-delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: ignore WlSurface);
 delegate_noop!(App: ignore ZwlrLayerShellV1);
+
+impl Dispatch<WlBuffer, Arc<AtomicBool>> for App {
+    fn event(
+        _: &mut Self,
+        _: &WlBuffer,
+        event: wayland_client::protocol::wl_buffer::Event,
+        busy: &Arc<AtomicBool>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Release means the compositor is done reading; the slot can be redrawn.
+        if let wayland_client::protocol::wl_buffer::Event::Release = event {
+            busy.store(false, Ordering::Relaxed);
+        }
+    }
+}
 
 impl Dispatch<WlOutput, u32> for App {
     fn event(

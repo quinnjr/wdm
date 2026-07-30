@@ -6,9 +6,10 @@
 //! rather than in the greeter.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::output::Output;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
@@ -57,8 +58,11 @@ enum Phase {
     Authenticating,
     /// Authenticated; `start_session` is allowed.
     Authenticated,
-    /// A failure is being reported after its backoff delay. `create_session` is
-    /// refused until the delay elapses, which is the rate limit.
+    /// A failure is being reported after its backoff delay.
+    ///
+    /// Note this is not itself the rate limit — a greeter can leave this phase
+    /// by destroying and rebinding the global. The limit is `cooldown_until`,
+    /// which survives reset.
     Cooldown,
     /// A session is being launched; the greeter is about to be torn down.
     Launching,
@@ -110,7 +114,22 @@ pub struct Login {
     /// The prompt the greeter is expected to answer.
     pending_prompt: Option<u32>,
     /// Consecutive failures, indexing into [`BACKOFF_SECS`].
+    ///
+    /// Deliberately *not* cleared by [`Login::reset`]: a greeter that destroys
+    /// its object, or dies and is respawned, must not get a fresh budget.
     failures: usize,
+    /// No attempt may start before this instant.
+    ///
+    /// The real rate limit. Phase alone is not enough, because `destroy`
+    /// followed by a rebind resets the phase, and a greeter that kills itself
+    /// gets a brand new object either way. Survives reset for the same reason.
+    cooldown_until: Option<Instant>,
+    /// Incremented for every attempt, so a timer armed for one attempt cannot
+    /// act on a later one.
+    generation: u64,
+    /// The pending deferred failure report, so it can be replaced rather than
+    /// stacked.
+    failure_timer: Option<smithay::reexports::calloop::RegistrationToken>,
     /// Session chosen by `start_session`, held until PAM reports the session
     /// environment.
     chosen: Option<(Session, Vec<(String, String)>)>,
@@ -142,6 +161,9 @@ impl Login {
             auth: None,
             pending_prompt: None,
             failures: 0,
+            cooldown_until: None,
+            generation: 0,
+            failure_timer: None,
             chosen: None,
             events,
             loop_handle,
@@ -159,13 +181,27 @@ impl Login {
     }
 
     /// Reset conversation state, used when the greeter is restarted.
+    ///
+    /// Deliberately preserves `failures` and `cooldown_until`. Everything a
+    /// greeter can do to reach this path — destroying its object, exiting so it
+    /// gets respawned — would otherwise clear the rate limit, which is the one
+    /// thing an untrusted greeter must not be able to do. Bumping the generation
+    /// makes any timer armed for the abandoned attempt a no-op.
     pub fn reset(&mut self) {
-        self.bound.clear();
         self.phase = Phase::Idle;
+        self.generation = self.generation.wrapping_add(1);
         // Dropping the handle cancels any conversation in flight.
         self.auth = None;
         self.pending_prompt = None;
         self.chosen = None;
+    }
+
+    /// Forget every bound object, used when the greeter process is gone.
+    ///
+    /// Separate from [`Login::reset`] because destroying one object must not
+    /// silence another that is still alive.
+    pub fn clear_bindings(&mut self) {
+        self.bound.clear();
     }
 
     /// Refresh the users list, picking up new accounts and session history.
@@ -179,6 +215,29 @@ impl Login {
         self.ranked_outputs = outputs.to_vec();
         for greeter in self.bound.clone() {
             self.send_output_ranks(&greeter);
+        }
+    }
+
+    /// Send the rank of one output to whichever greeter owns `wl_output`.
+    ///
+    /// Called from `OutputHandler::output_bound`, because a client has no
+    /// `wl_output` resource until it binds the global — and the reference
+    /// greeter binds `wdm_greeter_v1` first, so at enumerate time there is
+    /// nothing to address the rank to. Without this the greeter never learns any
+    /// rank and the contract's "contiguous from 0" guarantee is vacuous.
+    pub fn send_rank_for(&self, output: &Output, wl_output: &WlOutput) {
+        let Some(rank) = self.ranked_outputs.iter().position(|o| o == output) else {
+            // Disabled or not yet ranked; it will be re-sent by set_output_ranks.
+            return;
+        };
+
+        let Some(target) = wl_output.client() else {
+            return;
+        };
+        for greeter in &self.bound {
+            if greeter.client().is_some_and(|c| c.id() == target.id()) {
+                greeter.output_rank(wl_output, rank as u32);
+            }
         }
     }
 
@@ -224,10 +283,12 @@ impl Login {
 
         self.send_output_ranks(greeter);
 
-        // Sent once: the next greeter should not be told about an error the user
-        // has already seen.
-        if let Some(error) = self.last_error.take() {
-            greeter.last_error(error);
+        // Cloned rather than taken. Taking it on first bind means a greeter that
+        // binds twice, or a second connection that arrives first, consumes the
+        // error and the real greeter shows the silent bounce this event exists
+        // to prevent. It is cleared when the user starts a new attempt instead.
+        if let Some(error) = &self.last_error {
+            greeter.last_error(error.clone());
         }
 
         greeter.done();
@@ -243,6 +304,15 @@ impl Login {
     pub fn handle_auth_event(&mut self, event: AuthEvent) -> Action {
         match event {
             AuthEvent::Prompt { id, text, style } => {
+                // Same guard as the Ok arm below. The PAM thread holds a clone
+                // of the sender, so a prompt emitted just before cancel is still
+                // in the channel; forwarding it makes the greeter ask a question
+                // whose answer wdm then kills it for (no_auth).
+                if self.auth.is_none() {
+                    log::debug!("discarding a prompt for an abandoned attempt");
+                    return Action::None;
+                }
+
                 self.pending_prompt = if style.expects_response() {
                     Some(id)
                 } else {
@@ -255,9 +325,17 @@ impl Login {
             }
 
             AuthEvent::Ok => {
+                // A result for an attempt that was cancelled must not revive it:
+                // the handle is gone, so start_session would have nothing to
+                // drive and the greeter would hang waiting for a launch.
+                if self.auth.is_none() {
+                    log::debug!("discarding auth_ok for an abandoned attempt");
+                    return Action::None;
+                }
                 self.phase = Phase::Authenticated;
                 self.pending_prompt = None;
                 self.failures = 0;
+                self.cooldown_until = None;
                 self.broadcast(|g| g.auth_ok());
                 Action::None
             }
@@ -265,35 +343,23 @@ impl Login {
             AuthEvent::Failed(reason) => {
                 self.auth = None;
                 self.pending_prompt = None;
-                self.phase = Phase::Cooldown;
 
                 let delay = self.next_backoff();
                 self.failures = self.failures.saturating_add(1);
+                // The deadline, not the phase, is what actually rate limits:
+                // it survives destroy, rebind and greeter respawn.
+                self.cooldown_until = Some(Instant::now() + delay);
 
-                // Reporting the failure late is the rate limit: the greeter
-                // cannot start another attempt until it hears about this one.
-                let timer = Timer::from_duration(delay);
-                let result = self.loop_handle.insert_source(timer, move |_, _, data| {
-                    data.state.login.phase = Phase::Idle;
-                    data.state.login.broadcast(|g| g.auth_failed(reason.clone()));
-                    TimeoutAction::Drop
-                });
-
-                if let Err(e) = result {
-                    // Without a timer the failure would never be reported and the
-                    // greeter would hang, so report it immediately instead.
-                    log::error!("arming backoff timer: {e}");
-                    self.phase = Phase::Idle;
-                    self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
-                }
-
+                self.report_failure_after(reason, delay);
                 Action::None
             }
 
             AuthEvent::SessionOpened { env } => {
                 let Some(auth) = &self.auth else {
                     log::error!("PAM session opened with no attempt in flight");
-                    return Action::RestartGreeter { error: None };
+                    return Action::RestartGreeter {
+                        error: Some("the login attempt was cancelled".to_owned()),
+                    };
                 };
                 let Some((session, extra_env)) = self.chosen.take() else {
                     log::error!("PAM session opened with no session chosen");
@@ -315,6 +381,74 @@ impl Login {
                 Action::RestartGreeter {
                     error: Some(reason),
                 }
+            }
+        }
+    }
+
+    /// How long an attempt must wait, if the rate limit is still in force.
+    ///
+    /// Extracted so the limit can be tested without standing up a compositor —
+    /// it is the one thing an untrusted greeter must not be able to escape, and
+    /// it previously had no test at all.
+    pub fn rate_limited(&self) -> Option<Duration> {
+        self.cooldown_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+    }
+
+    /// Note that a new attempt is starting.
+    ///
+    /// Bumps the generation so anything armed for the previous attempt becomes a
+    /// no-op, and clears the stale launch error the user has moved on from.
+    pub fn begin_attempt(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.last_error = None;
+    }
+
+    /// Report a failure once `delay` has elapsed.
+    ///
+    /// Reporting late *is* the rate limit: a greeter cannot start another
+    /// attempt until it hears how the last one went, so the delay is what slows
+    /// a brute force down. Answering immediately would leave a greeter that
+    /// retries on failure — which is the natural thing to write — spinning at
+    /// full speed for the whole cooldown.
+    fn report_failure_after(&mut self, reason: String, delay: Duration) {
+        self.phase = Phase::Cooldown;
+
+        // One pending report at a time. Stacking timers would deliver several
+        // auth_failed events for one conversation, and the greeter would treat
+        // each as a fresh failure.
+        if let Some(token) = self.failure_timer.take() {
+            self.loop_handle.remove(token);
+        }
+
+        // Tagged with the current attempt so a timer armed here cannot fire into
+        // a later, possibly successful, one and force it back to Idle with a
+        // spurious auth_failed.
+        let generation = self.generation;
+        let timer = Timer::from_duration(delay);
+
+        let result = self.loop_handle.insert_source(timer, move |_, _, data| {
+            let login = &mut data.state.login;
+            login.failure_timer = None;
+            if login.generation == generation && login.phase == Phase::Cooldown {
+                login.phase = Phase::Idle;
+                login.broadcast(|g| g.auth_failed(reason.clone()));
+            } else {
+                log::debug!("dropping a backoff timer from an abandoned attempt");
+            }
+            TimeoutAction::Drop
+        });
+
+        match result {
+            Ok(token) => self.failure_timer = Some(token),
+            Err(e) => {
+                // Without a timer the failure would never be reported and the
+                // greeter would hang, so report it immediately instead. The
+                // cooldown deadline still applies, so this degrades to a busy
+                // greeter, not an open door.
+                log::error!("arming backoff timer: {e}");
+                self.phase = Phase::Idle;
+                self.broadcast(|g| g.auth_failed("authentication failed".to_owned()));
             }
         }
     }
@@ -359,6 +493,18 @@ impl GlobalDispatch<WdmGreeterV1, ()> for Wdm {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let greeter = data_init.init(resource, ());
+
+        // One conversation, one driver. A second object could otherwise cancel
+        // the first's conversation simply by destroying itself, and nothing
+        // limits how many times a client may bind.
+        if !state.login.bound.is_empty() {
+            greeter.post_error(
+                wdm_greeter_v1::Error::AuthInProgress,
+                "wdm_greeter_v1 is already bound",
+            );
+            return;
+        }
+
         state.login.bound.push(greeter.clone());
         state.login.send_initial_state(&greeter);
     }
@@ -381,29 +527,20 @@ impl Dispatch<WdmGreeterV1, ()> for Wdm {
             wdm_greeter_v1::Request::Respond { id, response } => {
                 state.respond(resource, id, response)
             }
-            wdm_greeter_v1::Request::Cancel => {
-                state.login.auth = None;
-                state.login.pending_prompt = None;
-                // Cooldown must survive a cancel, or a greeter could cancel its
-                // way out of the rate limit.
-                if state.login.phase == Phase::Authenticating
-                    || state.login.phase == Phase::Authenticated
-                {
-                    state.login.phase = Phase::Idle;
-                }
-                Action::None
-            }
+            wdm_greeter_v1::Request::Cancel => state.cancel(),
             wdm_greeter_v1::Request::StartSession { session_id, env } => {
                 state.start_session(resource, session_id, env)
             }
             wdm_greeter_v1::Request::Destroy => {
-                state.login.reset();
-                Action::None
+                // Cancels the conversation, per the protocol. Bindings are left
+                // to destroyed(): silencing every other bound object because one
+                // was destroyed would be a bug, not a cancellation.
+                state.cancel()
             }
             _ => Action::None,
         };
 
-        state.pending_action = action;
+        state.queue_action(action);
     }
 
     fn destroyed(state: &mut Self, _client: ClientId, resource: &WdmGreeterV1, _data: &()) {
@@ -414,16 +551,60 @@ impl Dispatch<WdmGreeterV1, ()> for Wdm {
 use smithay::reexports::wayland_server::backend::ClientId;
 
 impl Wdm {
-    fn create_session(&mut self, resource: &WdmGreeterV1, username: String) -> Action {
-        match self.login.phase {
-            Phase::Idle => {}
-            Phase::Cooldown => {
-                // Not a protocol error: the greeter is allowed to try again, just
-                // not yet. Telling it so keeps it from hanging.
-                resource.auth_failed("too many attempts, try again shortly".to_owned());
-                return Action::None;
+    /// Abandon the conversation without reporting a result.
+    ///
+    /// Shared by `cancel` and `destroy`. Bumping the generation through
+    /// [`Login::reset`] disarms any backoff timer, so a cancel during Cooldown
+    /// does not later emit the `auth_failed` the protocol says will not follow.
+    fn cancel(&mut self) -> Action {
+        // Launching means PAM has been told to open a session and the reply is
+        // in flight. Dropping the handle there would strand the greeter in a
+        // phase that accepts nothing, so the greeter is restarted instead.
+        let was_launching = self.login.phase == Phase::Launching;
+        self.login.reset();
+
+        if was_launching {
+            Action::RestartGreeter {
+                error: Some("the login was cancelled while starting the session".to_owned()),
             }
-            _ => {
+        } else {
+            Action::None
+        }
+    }
+
+    fn create_session(&mut self, resource: &WdmGreeterV1, username: String) -> Action {
+        // Checked before the phase, because the phase is the part a greeter can
+        // reset at will and this is the part it cannot.
+        if let Some(remaining) = self.login.rate_limited() {
+            // Not a protocol error: the greeter may try again, just not yet. The
+            // refusal is delayed until the limit expires rather than sent now,
+            // because a greeter that retries on failure would otherwise spin for
+            // the whole cooldown. Answering late makes its retry land exactly
+            // when it is allowed to.
+            log::debug!("deferring create_session for {remaining:?}");
+            // Armed unconditionally, and disarming any existing timer first, so
+            // every accepted create_session gets exactly one terminal event. The
+            // previous guard skipped arming while already in Cooldown, which
+            // silently dropped the request and hung a greeter that waits for a
+            // reply per request.
+            self.login
+                .report_failure_after("too many attempts".to_owned(), remaining);
+            return Action::None;
+        }
+
+        match self.login.phase {
+            Phase::Idle | Phase::Cooldown => {}
+
+            // The conversation is over — auth_ok was already delivered — so this
+            // is a greeter backing out to pick a different account. The XML never
+            // says cancel is required after auth_ok, so killing it here would
+            // punish a conforming client. Treated as an implicit cancel.
+            Phase::Authenticated => {
+                log::debug!("create_session after auth_ok, restarting the conversation");
+                self.login.reset();
+            }
+
+            Phase::Authenticating | Phase::Launching => {
                 resource.post_error(
                     wdm_greeter_v1::Error::AuthInProgress,
                     "a conversation is already in progress",
@@ -440,7 +621,25 @@ impl Wdm {
         }
 
         let tty = format!("/dev/tty{}", self.login.vt);
-        match AuthHandle::start(&username, &tty, self.login.events.clone()) {
+        self.login.begin_attempt();
+
+        // The session type is not known until start_session, so the seat facts
+        // that are known now are supplied and the type defaults to wayland —
+        // the overwhelmingly common case, and better than pam_systemd's own
+        // fallback of "tty".
+        let description = crate::auth::SessionDescription {
+            seat: "seat0".to_owned(),
+            vtnr: self.login.vt,
+            session_type: "wayland".to_owned(),
+            desktop: String::new(),
+        };
+
+        match AuthHandle::start(
+            &username,
+            &tty,
+            description,
+            self.login.events.clone(),
+        ) {
             Ok(handle) => {
                 self.login.auth = Some(handle);
                 self.login.phase = Phase::Authenticating;
@@ -472,10 +671,18 @@ impl Wdm {
         }
 
         self.login.pending_prompt = None;
-        if let Some(auth) = &self.login.auth {
-            auth.respond(id, response);
-        }
 
+        let Some(auth) = &self.login.auth else {
+            // Phase said Authenticating but the handle is gone. Swallowing the
+            // answer would leave the greeter waiting for a reply that can never
+            // come, so the attempt is failed explicitly.
+            log::error!("respond with no auth handle; failing the attempt");
+            self.login.phase = Phase::Idle;
+            resource.auth_failed("the login attempt was interrupted".to_owned());
+            return Action::None;
+        };
+
+        auth.respond(id, response);
         Action::None
     }
 
@@ -515,14 +722,23 @@ impl Wdm {
             }
         };
 
-        self.login.chosen = Some((session, extra_env));
-        self.login.phase = Phase::Launching;
+        let Some(auth) = &self.login.auth else {
+            // Authenticated with no handle: the attempt was cancelled between
+            // auth_ok and this request. Restarting the greeter is the only way
+            // to get back to a state it can act in.
+            log::error!("start_session with no auth handle");
+            self.login.reset();
+            return Action::RestartGreeter {
+                error: Some("the login attempt expired, please try again".to_owned()),
+            };
+        };
 
         // The PAM thread opens the session and reports its environment; the
         // launch happens when that arrives.
-        if let Some(auth) = &self.login.auth {
-            auth.start_session();
-        }
+        auth.start_session();
+
+        self.login.chosen = Some((session, extra_env));
+        self.login.phase = Phase::Launching;
 
         Action::None
     }
@@ -548,6 +764,79 @@ mod tests {
         assert_eq!(wire_prompt_style(Visible) as u32, 1);
         assert_eq!(wire_prompt_style(Info) as u32, 2);
         assert_eq!(wire_prompt_style(Error) as u32, 3);
+    }
+
+    /// A `Login` with no compositor behind it.
+    ///
+    /// The event loop is never dispatched, so no `LoopData` is ever needed —
+    /// which is what makes the state machine testable in isolation.
+    fn login() -> Login {
+        let (events, _rx) = smithay::reexports::calloop::channel::channel();
+        let event_loop: smithay::reexports::calloop::EventLoop<'static, LoopData> =
+            smithay::reexports::calloop::EventLoop::try_new().unwrap();
+
+        Login::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            PathBuf::from("/nonexistent/wdm-test"),
+            7,
+            events,
+            event_loop.handle(),
+        )
+    }
+
+    #[test]
+    fn a_fresh_login_is_not_rate_limited() {
+        assert!(login().rate_limited().is_none());
+    }
+
+    #[test]
+    fn the_rate_limit_survives_reset() {
+        // reset() is reachable by the greeter: destroying its object, or simply
+        // exiting so it gets respawned. If either cleared the limit, an
+        // untrusted greeter could retry without bound.
+        let mut login = login();
+        login.cooldown_until = Some(Instant::now() + Duration::from_secs(30));
+        login.failures = 3;
+
+        login.reset();
+
+        assert!(
+            login.rate_limited().is_some(),
+            "destroying the object escaped the rate limit"
+        );
+        assert_eq!(login.failures, 3, "reset refilled the failure budget");
+    }
+
+    #[test]
+    fn an_elapsed_cooldown_stops_limiting() {
+        let mut login = login();
+        login.cooldown_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(login.rate_limited().is_none());
+    }
+
+    #[test]
+    fn reset_invalidates_a_timer_armed_for_the_previous_attempt() {
+        // The generation is what stops a backoff timer from an abandoned attempt
+        // firing into a later, successful one and forcing a spurious
+        // auth_failed.
+        let mut login = login();
+        let armed = login.generation;
+
+        login.reset();
+        assert_ne!(login.generation, armed);
+
+        login.begin_attempt();
+        assert_ne!(login.generation, armed);
+    }
+
+    #[test]
+    fn starting_an_attempt_clears_the_previous_launch_error() {
+        let mut login = login();
+        login.set_last_error(Some("session died".to_owned()));
+        login.begin_attempt();
+        assert!(login.last_error.is_none());
     }
 
     #[test]

@@ -53,23 +53,34 @@ pub enum Handled {
     HandOff(Launch),
 }
 
-/// Act on whatever the greeter's last request or the PAM thread asked for.
+/// Act on everything the greeter's requests and the PAM thread queued.
+///
+/// Drains the whole queue: handling only one per pass would let a burst of
+/// requests strand an action until the next event wakes the loop.
 pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) -> Handled {
-    let action = std::mem::replace(&mut data.state.pending_action, Action::None);
+    while let Some(action) = data.state.pending_actions.pop_front() {
+        match action {
+            Action::None => {}
 
-    match action {
-        Action::None => Handled::Continue,
+            Action::Launch(request) => {
+                if let Some(launch) = prepare(data, request) {
+                    // Anything still queued is moot: the display is about to
+                    // change hands and the greeter is about to be killed. A
+                    // pending respawn is moot too, and would otherwise fire in
+                    // the next login generation.
+                    data.state.pending_actions.clear();
+                    disarm_respawn(data, loop_handle);
+                    return Handled::HandOff(launch);
+                }
+            }
 
-        Action::Launch(request) => match prepare(data, request) {
-            Some(launch) => Handled::HandOff(launch),
-            None => Handled::Continue,
-        },
-
-        Action::RestartGreeter { error } => {
-            restart_greeter(data, loop_handle, error, Duration::ZERO);
-            Handled::Continue
+            Action::RestartGreeter { error } => {
+                restart_greeter(data, loop_handle, error, Duration::ZERO);
+            }
         }
     }
+
+    Handled::Continue
 }
 
 /// Resolve a launch request while still privileged.
@@ -98,9 +109,9 @@ fn prepare(data: &mut LoopData, request: LaunchRequest) -> Option<Launch> {
         }
         Err(e) => {
             log::error!("preparing session {session_id}: {e}");
-            data.state.pending_action = Action::RestartGreeter {
+            data.state.queue_action(Action::RestartGreeter {
                 error: Some(e.to_string()),
-            };
+            });
             None
         }
     }
@@ -119,10 +130,14 @@ pub fn restart_greeter(
 ) {
     data.state.greeter.kill();
     data.state.login.reset();
+    // The old greeter's objects belong to a connection that is gone.
+    data.state.login.clear_bindings();
     data.state.login.set_last_error(error);
     // Surfaces belonging to the dead greeter must go, or they keep being
     // rendered over the new one.
     data.state.layers.clear();
+    // Focus was on a surface that no longer exists.
+    data.state.update_focus();
 
     if data.state.greeter.gave_up() {
         return;
@@ -135,26 +150,87 @@ pub fn restart_greeter(
         .refresh_users(crate::users::UidRange::from_system());
 
     if delay.is_zero() {
-        spawn_greeter(data);
-        return;
-    }
-
-    let timer = Timer::from_duration(delay);
-    if let Err(e) = loop_handle.insert_source(timer, |_, _, data| {
-        spawn_greeter(data);
-        TimeoutAction::Drop
-    }) {
-        // Without the timer nothing would ever restart the greeter, so start it
-        // immediately instead of leaving a blank screen.
-        log::error!("arming greeter restart timer: {e}");
-        spawn_greeter(data);
+        spawn_greeter(data, loop_handle);
+    } else {
+        arm_respawn(data, loop_handle, delay);
     }
 }
 
-fn spawn_greeter(data: &mut LoopData) {
-    if let Err(e) = data.state.greeter.spawn() {
-        log::error!("spawning greeter: {e}");
+/// Start the greeter, applying the restart policy if it will not start.
+///
+/// Deliberately does not route a failure back through [`restart_greeter`]: that
+/// would close a call cycle, and a policy that ever returned a zero delay would
+/// turn it into unbounded recursion. Respawning is scheduled directly instead.
+pub fn spawn_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
+    // This attempt is happening now, so any timer scheduling another one is
+    // stale. Without disarming it a timer armed before a login can fire in the
+    // next generation and start a second greeter alongside the first.
+    disarm_respawn(data, loop_handle);
+
+    match data.state.greeter.spawn() {
+        Ok(()) => {}
+
+        // Not failures of this attempt: the policy has already spoken, or a
+        // greeter is already up. Re-running the failure accounting would count
+        // a success against the budget.
+        Err(e @ (crate::supervise::GreeterError::GaveUp
+            | crate::supervise::GreeterError::AlreadyRunning)) => {
+            log::debug!("not starting a greeter: {e}");
+        }
+
+        Err(e) => {
+            log::error!("spawning greeter: {e}");
+            match data.state.greeter.note_spawn_failure(&e.to_string()) {
+                Disposition::Restart(delay) => arm_respawn(data, loop_handle, delay),
+                Disposition::GaveUp { reason } => give_up(data, reason),
+            }
+        }
     }
+}
+
+/// Cancel a pending respawn, if one is scheduled.
+pub fn disarm_respawn(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
+    if let Some(token) = data.state.respawn_token.take() {
+        loop_handle.remove(token);
+    }
+}
+
+/// Schedule another attempt at starting the greeter.
+fn arm_respawn(
+    data: &mut LoopData,
+    loop_handle: &LoopHandle<'static, LoopData>,
+    delay: Duration,
+) {
+    disarm_respawn(data, loop_handle);
+
+    let handle = loop_handle.clone();
+    let timer = Timer::from_duration(delay);
+
+    match loop_handle.insert_source(timer, move |_, _, data| {
+        data.state.respawn_token = None;
+        spawn_greeter(data, &handle);
+        TimeoutAction::Drop
+    }) {
+        Ok(token) => data.state.respawn_token = Some(token),
+        Err(e) => {
+            // Without the timer nothing would ever restart the greeter. Giving
+            // up is better than a blank screen, because it puts the reason on
+            // the display.
+            log::error!("arming greeter restart timer: {e}");
+            give_up(data, format!("cannot schedule a greeter restart: {e}"));
+        }
+    }
+}
+
+/// Stop trying, and put the reason on screen.
+///
+/// tty1 is the way back in, which is why the message says so.
+fn give_up(data: &mut LoopData, reason: String) {
+    log::error!("{reason}");
+    data.state.layers.clear();
+    data.state.login.clear_bindings();
+    data.state.update_focus();
+    data.state.give_up_reason = Some(reason);
 }
 
 /// Reap the greeter if it exited and apply its restart policy.
@@ -168,12 +244,6 @@ pub fn poll_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopD
             log::info!("restarting greeter in {delay:?}");
             restart_greeter(data, loop_handle, None, delay);
         }
-        Disposition::GaveUp { reason } => {
-            // Nothing more will be started. The backend draws this on screen;
-            // tty1 is the way back in.
-            log::error!("{reason}");
-            data.state.layers.clear();
-            data.state.give_up_reason = Some(reason);
-        }
+        Disposition::GaveUp { reason } => give_up(data, reason),
     }
 }
