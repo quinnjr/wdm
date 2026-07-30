@@ -3,6 +3,21 @@
 Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 [Semantic Versioning].
 
+## [0.1.1] — 2026-07-30
+
+### Fixed
+
+- **The GTK greeter no longer retries past PAM's explanation.** `pam_faillock`
+  reports a locked account as a text-info message and then fails the attempt.
+  The greeter restarted the conversation on any failure, which cleared that
+  message, reset the form, and left the user with a bare "Authentication
+  failure" and no way to learn why — and on a faillock stack the extra attempts
+  fed the lock. Info and error messages are now sticky and suppress the
+  automatic retry; the form says "Press Enter to try again" and waits. A plain
+  wrong password still retries immediately.
+- **The GTK greeter opened two conversations at startup**, so every launch made
+  PAM authenticate twice and spent two of the rate limiter's attempts.
+
 ## [0.1.0] — 2026-07-30
 
 First release. wdm is a Wayland display manager that is its own compositor: it
@@ -52,4 +67,5 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[0.1.1]: https://github.com/quinnjr/wdm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/quinnjr/wdm/releases/tag/v0.1.0

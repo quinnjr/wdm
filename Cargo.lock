@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "wdm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "calloop 0.14.4",
  "env_logger",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-greeter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "fontdue",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-gtk-greeter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "gdk4-wayland",
@@ -2835,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "wayland-backend",
  "wayland-client",
