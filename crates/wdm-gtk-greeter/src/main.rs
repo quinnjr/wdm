@@ -15,10 +15,11 @@ mod proto;
 mod ui;
 
 // gtk4-layer-shell works by interposing a handful of libwayland-client symbols,
-// which only takes effect if it is loaded first. Declaring the link here rather
-// than in build.rs is what puts it ahead of libwayland-client in DT_NEEDED:
+// which only takes effect if it is loaded first. Declaring the link *here*, in
+// the crate root, is what puts it ahead of libwayland-client in DT_NEEDED:
 // rustc emits the root crate's native libraries before its dependencies', while
-// build-script link args land at the very end of the link line.
+// build-script link args land at the very end of the link line and are therefore
+// too late — verified with `readelf -d`.
 //
 // Get this wrong and the library silently does nothing, every window comes up as
 // an ordinary toplevel, and against wdm — which exposes no xdg_toplevel — the
