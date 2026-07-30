@@ -24,6 +24,14 @@ window { background: #12131a; }
 .title { font-size: 22pt; font-weight: 700; color: #e8e8ef; margin-bottom: 8px; }
 .hint { color: #8b8fa3; font-size: 10pt; }
 .error { color: #ff7b72; font-size: 10pt; }
+.notice {
+    color: #e8e8ef;
+    font-size: 10pt;
+    background: rgba(255, 123, 114, 0.12);
+    border-left: 3px solid #ff7b72;
+    padding: 8px 10px;
+    border-radius: 4px;
+}
 .card entry {
     min-height: 38px;
     background: #0d0e13;
@@ -54,7 +62,8 @@ pub struct Ui {
     prompt: Label,
     entry: Entry,
     error: Label,
-    info: Label,
+    /// PAM's explanation of the account's state. Sticky, unlike `error`.
+    notice: Label,
     submit: Button,
 
     model: Shared,
@@ -121,10 +130,11 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
             .wrap(true)
             .css_classes(["error"])
             .build(),
-        info: Label::builder()
+        notice: Label::builder()
             .halign(Align::Start)
             .wrap(true)
-            .css_classes(["hint"])
+            .xalign(0.0)
+            .css_classes(["notice"])
             .build(),
         submit: Button::with_label("Log in"),
         model,
@@ -140,13 +150,6 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
     // Populate from the enumerate phase that Link::connect already collected.
     ui.reload_lists();
     ui.begin_auth();
-
-    if std::env::var_os("WDM_GREETER_OPEN_SESSIONS").is_some() {
-        let sessions = ui.sessions.clone();
-        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
-            sessions.activate();
-        });
-    }
 
     (window, ui)
 }
@@ -171,7 +174,7 @@ fn layout(ui: &Ui) -> GtkBox {
     card.append(&ui.prompt);
     card.append(&ui.entry);
     card.append(&ui.error);
-    card.append(&ui.info);
+    card.append(&ui.notice);
     card.append(&labelled("Session", &ui.sessions));
 
     ui.submit.set_halign(Align::End);
@@ -214,11 +217,13 @@ fn connect(ui: &Rc<Ui>) {
     });
 
     // Switching user restarts the conversation: PAM's is per user, and a
-    // half-answered one for someone else is not reusable.
+    // half-answered one for someone else is not reusable. This is a deliberate
+    // restart, so the in-flight guard is cleared before asking.
     ui.users.connect_selected_notify({
         let ui = ui.clone();
         move |_| {
             ui.select_preferred_session();
+            ui.attempting.set(false);
             ui.begin_auth();
         }
     });
@@ -287,6 +292,15 @@ impl Ui {
         if self.launched.get() {
             return;
         }
+        // Idempotent while an attempt is in flight. `reload_lists` emits
+        // notify::selected, whose handler starts a conversation, and build()
+        // then asks for one itself — without this the greeter opens two before
+        // the user has touched anything, burning a rate-limit slot and making
+        // PAM do every attempt twice. The paths that restart deliberately
+        // (user switch, auto-retry) clear the flag first.
+        if self.attempting.get() {
+            return;
+        }
 
         // Cancel first: the compositor rejects create_session while another
         // conversation is live, and switching user is exactly that case.
@@ -296,14 +310,16 @@ impl Ui {
 
         drop(model);
 
-        // The previous attempt's verdict no longer applies to this one.
-        {
-            let mut model = self.model.borrow_mut();
-            model.conversation_over = false;
-            model.error = None;
-        }
+        // The user chose to try again, so the previous attempt's verdict and
+        // any explanation of it have been read. Safe to take a mutable borrow
+        // here: reload_lists releases its own before touching any widget, so
+        // nothing re-enters with the model still borrowed.
+        self.model.borrow_mut().begin_attempt();
+
         self.entry.set_text("");
         self.prompt.set_label("Waiting…");
+        self.error.set_visible(false);
+        self.notice.set_visible(false);
     }
 
     /// Answer the pending prompt, or start an attempt if there is none.
@@ -357,21 +373,24 @@ impl Ui {
             self.reload_lists();
         }
 
-        let (prompt, error, info, authenticated, conversation_over) = {
+        let (prompt, error, notice, authenticated, auto_retry) = {
             let model = self.model.borrow();
             (
                 model.prompt.clone(),
                 model.error.clone(),
-                model.info.clone(),
+                model.notice.clone(),
                 model.authenticated,
-                model.conversation_over,
+                model.should_auto_retry(),
             )
         };
 
         self.error.set_label(error.as_deref().unwrap_or(""));
         self.error.set_visible(error.is_some());
-        self.info.set_label(info.as_deref().unwrap_or(""));
-        self.info.set_visible(info.is_some());
+
+        // The notice is what PAM said about the account rather than about the
+        // password, so it stays on screen until the user acts on it.
+        self.notice.set_label(notice.as_deref().unwrap_or(""));
+        self.notice.set_visible(notice.is_some());
 
         if let Some(prompt) = &prompt {
             self.attempting.set(true);
@@ -392,18 +411,19 @@ impl Ui {
             return;
         }
 
-        // Only auth_failed ends a conversation. Keying off `error` instead would
-        // also fire on last_error and on PAM's own error-style messages — which
-        // arrive *during* a live conversation — cancelling it and throwing away
-        // an answer the user already gave.
-        //
         // Restarting is safe: the compositor defers its refusal until the rate
-        // limit expires, so this waits rather than spinning.
-        if conversation_over && prompt.is_none() && !authenticated {
+        // limit expires, so this waits rather than spinning. It is suppressed
+        // when PAM explained itself — see Model::should_auto_retry.
+        if auto_retry {
             self.attempting.set(false);
             self.prompt.set_label("");
             self.begin_auth();
             self.flush();
+        } else if notice.is_some() && !authenticated {
+            // Waiting on the user instead. Say so, or the form looks stuck.
+            self.attempting.set(false);
+            self.prompt.set_label("Press Enter to try again");
+            self.entry.set_text("");
         }
     }
 

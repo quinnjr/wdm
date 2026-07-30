@@ -63,7 +63,13 @@ pub struct Model {
     pub sessions: Vec<Session>,
     pub prompt: Option<Prompt>,
     pub error: Option<String>,
-    pub info: Option<String>,
+    /// The last `info` or `error` style message PAM sent.
+    ///
+    /// Sticky: it survives the end of a conversation and is cleared only when
+    /// the user deliberately starts another attempt. This is where a lockout
+    /// notice arrives ("the account is locked, 10 minutes left"), and it is
+    /// precisely the text that must not scroll past.
+    pub notice: Option<String>,
     /// Set by `auth_ok`; the UI launches a session in response.
     pub authenticated: bool,
     /// Set only by `auth_failed`, and cleared when a new attempt starts.
@@ -73,12 +79,49 @@ pub struct Model {
     /// those cancelled a live conversation and discarded an answer the user had
     /// already given.
     pub conversation_over: bool,
+    /// Set when PAM sent a notice during this conversation, which suppresses
+    /// auto-retry.
+    pub blocked: bool,
     pub revision: u64,
 }
 
 impl Model {
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Whether the greeter should start another attempt without being asked.
+    ///
+    /// Retrying immediately is right for a mistyped password: the user wants to
+    /// type it again, not click first. It is wrong when PAM has explained
+    /// itself — a locked account, an expired password — because the retry
+    /// scrolls the explanation away, resets the form under the user, and on a
+    /// faillock stack each attempt can extend the lock.
+    pub fn should_auto_retry(&self) -> bool {
+        self.conversation_over && self.prompt.is_none() && !self.authenticated && !self.blocked
+    }
+
+    /// Record one of PAM's explanations.
+    ///
+    /// PAM often splits a single explanation over two messages ("locked due to
+    /// 3 failed logins" then "10 minutes left"), so they are joined rather than
+    /// the second replacing the first.
+    pub fn push_notice(&mut self, text: String) {
+        self.notice = Some(match self.notice.take() {
+            Some(prior) => format!("{prior} {text}"),
+            None => text,
+        });
+        self.blocked = true;
+    }
+
+    /// Clear everything belonging to the previous attempt.
+    pub fn begin_attempt(&mut self) {
+        self.conversation_over = false;
+        self.blocked = false;
+        self.error = None;
+        self.notice = None;
+        self.prompt = None;
+        self.touch();
     }
 
     pub fn session_id(&self, index: usize) -> Option<&str> {
@@ -233,8 +276,9 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
             wdm_greeter_v1::Event::Prompt { id, text, style } => {
                 use wdm_greeter_v1::PromptStyle;
                 match style.into_result() {
-                    Ok(PromptStyle::Info) => state.info = Some(text),
-                    Ok(PromptStyle::Error) => state.error = Some(text),
+                    // Neither expects an answer. Both are PAM explaining
+                    // itself, so both stick and both stop the auto-retry.
+                    Ok(PromptStyle::Info | PromptStyle::Error) => state.push_notice(text),
                     Ok(style) => {
                         state.prompt = Some(Prompt {
                             id,
@@ -250,8 +294,10 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
             wdm_greeter_v1::Event::AuthOk => {
                 state.authenticated = true;
                 state.conversation_over = false;
+                state.blocked = false;
                 state.prompt = None;
                 state.error = None;
+                state.notice = None;
                 state.touch();
             }
 
@@ -265,5 +311,100 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
 
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed() -> Model {
+        Model {
+            conversation_over: true,
+            ..Model::default()
+        }
+    }
+
+    #[test]
+    fn retries_a_plain_failure() {
+        // A mistyped password: the user wants to type again, not click first.
+        assert!(failed().should_auto_retry());
+    }
+
+    #[test]
+    fn does_not_retry_when_pam_explained_itself() {
+        // The defect this guards: with a faillock-locked account, PAM sends
+        // "the account is locked, 10 minutes left" and the greeter used to
+        // retry straight past it — scrolling the reason away, resetting the
+        // form under the user, and feeding the lock.
+        let model = Model {
+            blocked: true,
+            notice: Some("The account is locked due to 3 failed logins.".to_owned()),
+            ..failed()
+        };
+        assert!(!model.should_auto_retry());
+    }
+
+    #[test]
+    fn does_not_retry_mid_conversation() {
+        let model = Model {
+            conversation_over: false,
+            ..Model::default()
+        };
+        assert!(!model.should_auto_retry());
+
+        // Nor while a question is still pending.
+        let model = Model {
+            prompt: Some(Prompt {
+                id: 0,
+                text: "Password:".to_owned(),
+                secret: true,
+            }),
+            ..failed()
+        };
+        assert!(!model.should_auto_retry());
+    }
+
+    #[test]
+    fn does_not_retry_once_authenticated() {
+        let model = Model {
+            authenticated: true,
+            ..failed()
+        };
+        assert!(!model.should_auto_retry());
+    }
+
+    #[test]
+    fn a_deliberate_attempt_clears_the_previous_one() {
+        let mut model = Model {
+            blocked: true,
+            notice: Some("locked".to_owned()),
+            error: Some("Authentication failure".to_owned()),
+            ..failed()
+        };
+
+        model.begin_attempt();
+
+        // The user chose to try again, so the explanation has been read.
+        assert!(model.notice.is_none());
+        assert!(model.error.is_none());
+        assert!(!model.blocked);
+        assert!(!model.conversation_over);
+    }
+
+    #[test]
+    fn consecutive_notices_are_joined() {
+        // PAM splits a lockout across two messages; keeping only the last one
+        // loses the half that says why.
+        let mut model = Model::default();
+        model.push_notice("The account is locked.".to_owned());
+        model.push_notice("(10 minutes left to unlock)".to_owned());
+
+        let notice = model.notice.as_deref().unwrap();
+        assert!(notice.contains("locked"), "{notice}");
+        assert!(notice.contains("10 minutes"), "{notice}");
+        // And a notice always suppresses the retry that would scroll it away.
+        model.conversation_over = true;
+        assert!(!model.should_auto_retry());
     }
 }
