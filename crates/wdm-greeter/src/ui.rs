@@ -314,8 +314,8 @@ mod tests {
 
     fn view() -> View<'static> {
         View {
-            username: "joseph",
-            display_name: "Joseph Quinn",
+            username: "testuser",
+            display_name: "Test User",
             sessions: &[],
             session_index: 0,
             menu_open: false,

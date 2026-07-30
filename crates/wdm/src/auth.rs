@@ -618,7 +618,7 @@ mod tests {
         responses
             .send(PromptResponse {
                 id: first_id,
-                secret: "joseph".to_owned(),
+                secret: "testuser".to_owned(),
             })
             .unwrap();
 
@@ -633,7 +633,7 @@ mod tests {
             .unwrap();
 
         let (username, password) = worker.join().unwrap().unwrap();
-        assert_eq!(username.to_str().unwrap(), "joseph");
+        assert_eq!(username.to_str().unwrap(), "testuser");
         assert_eq!(password.to_str().unwrap(), "hunter2");
     }
 

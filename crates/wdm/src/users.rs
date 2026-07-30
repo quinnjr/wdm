@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn takes_first_gecos_field() {
-        assert_eq!(display_name_from_gecos("Joseph Quinn,,,"), "Joseph Quinn");
+        assert_eq!(display_name_from_gecos("Test User,,,"), "Test User");
         assert_eq!(display_name_from_gecos(""), "");
         assert_eq!(display_name_from_gecos("  Spaced  ,x"), "Spaced");
     }
@@ -388,11 +388,11 @@ mod tests {
     #[test]
     fn last_sessions_round_trip() {
         let mut store = LastSessions::default();
-        store.set("joseph", "hyprland.desktop");
+        store.set("testuser", "hyprland.desktop");
         store.set("ada", "sway.desktop");
 
         let reloaded = LastSessions::parse(&store.to_text());
-        assert_eq!(reloaded.get("joseph"), Some("hyprland.desktop"));
+        assert_eq!(reloaded.get("testuser"), Some("hyprland.desktop"));
         assert_eq!(reloaded.get("ada"), Some("sway.desktop"));
         assert_eq!(reloaded.get("nobody"), None);
     }
@@ -400,8 +400,8 @@ mod tests {
     #[test]
     fn last_sessions_skips_malformed_lines() {
         // One bad line must not lose the other users' preferences.
-        let store = LastSessions::parse("joseph\thyprland.desktop\ngarbage\n\tno-user\nada\t\n");
-        assert_eq!(store.get("joseph"), Some("hyprland.desktop"));
+        let store = LastSessions::parse("testuser\thyprland.desktop\ngarbage\n\tno-user\nada\t\n");
+        assert_eq!(store.get("testuser"), Some("hyprland.desktop"));
         assert_eq!(store.get("ada"), None);
     }
 
@@ -425,11 +425,11 @@ mod tests {
         let path = dir.path().join("state").join("last-session");
 
         let mut store = LastSessions::default();
-        store.set("joseph", "hyprland.desktop");
+        store.set("testuser", "hyprland.desktop");
         store.save(&path).unwrap();
 
         assert_eq!(
-            LastSessions::load(&path).get("joseph"),
+            LastSessions::load(&path).get("testuser"),
             Some("hyprland.desktop")
         );
         // The temporary file must not be left behind.
