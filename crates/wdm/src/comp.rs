@@ -13,13 +13,15 @@
 
 use std::sync::Arc;
 
-use smithay::backend::renderer::element::surface::{
-    render_elements_from_surface_tree, WaylandSurfaceRenderElement,
-};
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::allocator::Format as DrmFormat;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::keyboard::{KeyboardHandle, XkbConfig};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -28,6 +30,7 @@ use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surfac
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
 use smithay::utils::{Logical, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
     with_surface_tree_downward,
@@ -55,12 +58,17 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_fractional_scale,
     delegate_input_method_manager, delegate_layer_shell, delegate_output, delegate_presentation,
-    delegate_seat, delegate_shm, delegate_text_input_manager, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_dmabuf, delegate_seat, delegate_shm, delegate_text_input_manager,
+    delegate_viewporter, delegate_xdg_shell,
+};
+
+use smithay::desktop::{
+    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
 };
 
 use crate::config::Config;
 use crate::login::{Action, Login};
+use crate::render::WdmElement;
 use crate::supervise::Greeter;
 
 /// Per-client state; the greeter is the only client wdm ever accepts.
@@ -99,6 +107,13 @@ pub struct Wdm {
     pub layer_shell_state: WlrLayerShellState,
     pub data_device_state: DataDeviceState,
 
+    /// Created once the backend has a renderer, since its advertised formats
+    /// come from that renderer. `None` until then.
+    pub dmabuf_state: Option<DmabufState>,
+
+    /// What the pointer should look like right now.
+    pub cursor: CursorImageStatus,
+
     // Held only so the globals they created stay advertised for the greeter's
     // lifetime; nothing reads them back. Dropping any of them would withdraw the
     // corresponding protocol.
@@ -121,6 +136,8 @@ pub struct Wdm {
     /// Connected outputs in rank order; index 0 is the primary.
     pub outputs: Vec<Output>,
     pub layers: Vec<MappedLayer>,
+    /// Popups parented to a layer surface. `xdg_wm_base` exists for these.
+    pub popups: PopupManager,
 
     /// Users, sessions, the PAM conversation, and what the greeter may do next.
     pub login: Login,
@@ -131,10 +148,14 @@ pub struct Wdm {
     /// The running user session, once one has been launched.
     pub session: Option<std::process::Child>,
 
-    /// Set by a greeter request that the event loop must act on once dispatch
-    /// returns. Requests are handled inside Wayland dispatch, which is not a
-    /// place to tear down the display and fork.
-    pub pending_action: Action,
+    /// Actions queued by greeter requests and auth events for the event loop to
+    /// act on once dispatch returns. Requests are handled inside Wayland
+    /// dispatch, which is not a place to tear down the display and fork.
+    ///
+    /// A queue rather than one slot: several requests and auth events can be
+    /// handled in a single dispatch batch, and overwriting would silently drop a
+    /// Launch or a RestartGreeter, leaving the login screen hung with no event.
+    pub pending_actions: std::collections::VecDeque<Action>,
 
     /// Requests queued by event sources for the backend to drain.
     pub requests: Vec<crate::backend::Request>,
@@ -203,6 +224,8 @@ impl Wdm {
             layer_shell_state: WlrLayerShellState::new::<Self>(display),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(display),
             data_device_state: DataDeviceState::new::<Self>(display),
+            dmabuf_state: None,
+            cursor: CursorImageStatus::default_named(),
             viewporter_state: ViewporterState::new::<Self>(display),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(display),
             presentation_state: PresentationState::new::<Self>(
@@ -217,10 +240,11 @@ impl Wdm {
             config,
             outputs: Vec::new(),
             layers: Vec::new(),
+            popups: PopupManager::default(),
             login,
             greeter,
             session: None,
-            pending_action: Action::None,
+            pending_actions: std::collections::VecDeque::new(),
             requests: Vec::new(),
             started: std::time::Instant::now(),
             give_up_reason: None,
@@ -239,6 +263,28 @@ impl Wdm {
     /// Queue a request for the backend.
     pub fn request(&mut self, request: crate::backend::Request) {
         self.requests.push(request);
+    }
+
+    /// Queue an action for the event loop.
+    pub fn queue_action(&mut self, action: Action) {
+        if !matches!(action, Action::None) {
+            self.pending_actions.push_back(action);
+        }
+    }
+
+    /// Advertise `zwp_linux_dmabuf_v1` with the renderer's formats.
+    ///
+    /// Called by the backend once a renderer exists. Without this a greeter
+    /// built on GTK4, Qt or wgpu cannot attach a GPU buffer and must fall back
+    /// to `wl_shm` or fail to start — which would make "any toolkit" untrue for
+    /// exactly the third-party greeters wdm exists to host.
+    pub fn init_dmabuf(&mut self, display: &DisplayHandle, formats: Vec<DrmFormat>) {
+        if self.dmabuf_state.is_some() {
+            return;
+        }
+        let mut state = DmabufState::new();
+        state.create_global::<Self>(display, formats);
+        self.dmabuf_state = Some(state);
     }
 
     /// The primary output, if anything is connected.
@@ -278,6 +324,10 @@ impl Wdm {
 
         self.login.set_output_ranks(&self.outputs);
         self.configure_layers();
+        // The primary output may have changed, which changes which surface
+        // should hold the keyboard. Without this the caret and the input target
+        // can end up on different screens after a hotplug.
+        self.update_focus();
     }
 
     /// Size every layer surface to its output.
@@ -322,27 +372,128 @@ impl Wdm {
     }
 
     /// Render elements for one output, back to front.
+    ///
+    /// Popups are emitted before their parent layer surface so they land on top,
+    /// and at the offset the popup manager resolved for them — an `xdg_popup` is
+    /// its own surface, not a subsurface, so walking the parent's tree does not
+    /// reach it.
     pub fn elements(
         &self,
         renderer: &mut GlesRenderer,
         output: &Output,
-    ) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
+    ) -> Vec<WdmElement<GlesRenderer>> {
         let scale = output.current_scale().fractional_scale();
+        let mut elements: Vec<WdmElement<GlesRenderer>> = Vec::new();
 
-        self.layers
+        for layer in self
+            .layers
             .iter()
             .filter(|l| l.output.as_ref() == Some(output))
-            .flat_map(|l| {
+        {
+            let parent = layer.surface.wl_surface();
+
+            for (popup, offset) in PopupManager::popups_for_surface(parent) {
+                elements.extend(
+                    render_elements_from_surface_tree(
+                        renderer,
+                        popup.wl_surface(),
+                        (offset.x, offset.y),
+                        scale,
+                        1.0,
+                        Kind::Unspecified,
+                    )
+                    .into_iter()
+                    .map(WdmElement::Surface),
+                );
+            }
+
+            elements.extend(
                 render_elements_from_surface_tree(
                     renderer,
-                    l.surface.wl_surface(),
+                    parent,
                     (0, 0),
                     scale,
                     1.0,
                     Kind::Unspecified,
                 )
-            })
-            .collect()
+                .into_iter()
+                .map(WdmElement::Surface),
+            );
+        }
+
+        elements.splice(0..0, self.cursor_elements(renderer, output));
+        elements
+    }
+
+    /// Render elements for the pointer, if it should be visible.
+    ///
+    /// A client-set cursor surface is drawn as-is. `Named` and `Default` fall
+    /// back to a small built-in arrow rather than nothing, because a compositor
+    /// that offers a pointer and never draws one is worse than one that offers
+    /// no pointer at all.
+    fn cursor_elements(
+        &self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+    ) -> Vec<WdmElement<GlesRenderer>> {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return Vec::new();
+        };
+        // Only on the output the pointer is actually over. With one fullscreen
+        // surface per output, that is the primary.
+        if self.outputs.first() != Some(output) {
+            return Vec::new();
+        }
+
+        let scale = output.current_scale().fractional_scale();
+        let location = pointer.current_location();
+        let position = (location.x.round() as i32, location.y.round() as i32);
+
+        match &self.cursor {
+            CursorImageStatus::Hidden => Vec::new(),
+
+            CursorImageStatus::Surface(surface) => {
+                // The hotspot is where the client says the click point is.
+                let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<std::sync::Mutex<smithay::input::pointer::CursorImageAttributes>>()
+                        .map(|a| a.lock().expect("not poisoned").hotspot)
+                        .unwrap_or_default()
+                });
+
+                render_elements_from_surface_tree(
+                    renderer,
+                    surface,
+                    (position.0 - hotspot.x, position.1 - hotspot.y),
+                    scale,
+                    1.0,
+                    Kind::Cursor,
+                )
+                .into_iter()
+                .map(WdmElement::Surface)
+                .collect()
+            }
+
+            CursorImageStatus::Named(_) => {
+                let buffer = crate::render::pointer_buffer();
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    (f64::from(position.0), f64::from(position.1)),
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    Ok(element) => vec![WdmElement::Image(element)],
+                    Err(e) => {
+                        log::debug!("drawing the pointer: {e}");
+                        Vec::new()
+                    }
+                }
+            }
+        }
     }
 
     /// Release frame callbacks so the greeter draws its next frame.
@@ -391,6 +542,10 @@ impl CompositorHandler for Wdm {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // Tracks popup geometry and sends the initial configure a popup needs
+        // before it may attach a buffer.
+        self.popups.commit(surface);
 
         // A layer surface may not commit content until it has been configured,
         // and the client's initial state is not known until its first commit —
@@ -464,11 +619,11 @@ impl SeatHandler for Wdm {
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
 
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // Recorded so the render path can draw it. Ignoring this leaves the
+        // pointer invisible, which makes clamp_to_output's job pointless and a
+        // mouse unusable on the login screen.
+        self.cursor = image;
     }
 }
 
@@ -537,23 +692,120 @@ impl XdgShellHandler for Wdm {
         surface.send_close();
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        // Popups are children of a layer surface and are rendered as part of its
-        // surface tree, so there is nothing to track here.
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // A popup must be configured before it may attach a buffer, so failing
+        // to do this leaves any greeter that opens a menu stalled forever.
+        self.unconstrain_popup(&surface);
+        if let Err(e) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            log::warn!("tracking popup: {e}");
+        }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            return;
+        };
+        let popup = PopupKind::Xdg(surface);
+
+        // Without a grab a popup can never take the keyboard and never be
+        // dismissed by clicking away from it, which is the whole point of one.
+        if let Ok(mut grab) = self.popups.grab_popup(
+            self.keyboard
+                .current_focus()
+                .unwrap_or_else(|| popup.wl_surface().clone()),
+            popup,
+            &seat,
+            serial,
+        ) {
+            if let Some(keyboard) = seat.get_keyboard()
+                && keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || grab.previous_serial().is_some_and(|s| keyboard.has_grab(s)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+
+            if let Some(keyboard) = seat.get_keyboard() {
+                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+            }
+            if let Some(pointer) = seat.get_pointer() {
+                pointer.set_grab(
+                    self,
+                    PopupPointerGrab::new(&grab),
+                    serial,
+                    smithay::input::pointer::Focus::Keep,
+                );
+            }
+        }
+    }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        // Silently ignoring this hangs a client that is waiting for the
+        // `repositioned` event before it draws again.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        surface.send_repositioned(token);
     }
 }
 
-impl OutputHandler for Wdm {}
+impl Wdm {
+    /// Keep a popup inside its output.
+    ///
+    /// A popup positioned past the edge of the screen is invisible and
+    /// unreachable; the positioner's own rules say what to do about it.
+    fn unconstrain_popup(&self, surface: &PopupSurface) {
+        let Some(output) = self.primary_output() else {
+            return;
+        };
+        let Some((w, h)) = logical_size(output) else {
+            return;
+        };
+
+        // The parent is a fullscreen layer surface at the output origin, so the
+        // available area is simply the output.
+        let target = Rectangle::from_size((w, h).into());
+        surface.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+}
+
+impl DmabufHandler for Wdm {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        self.dmabuf_state
+            .as_mut()
+            .expect("dmabuf requests cannot arrive before the global is created")
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, _dmabuf: Dmabuf, notifier: ImportNotifier) {
+        // ponytail: accepted without a trial import, because the renderer lives
+        // in the backend and is not reachable from here. The advertised formats
+        // come from that same renderer, so a client using one of them will
+        // import at render time; one that does not gets a failed frame rather
+        // than a protocol error. Wire the renderer through if that proves too
+        // loose.
+        let _ = notifier.successful::<Self>();
+    }
+}
+
+impl OutputHandler for Wdm {
+    fn output_bound(&mut self, output: Output, wl_output: WlOutput) {
+        // A client cannot be told an output's rank before it has a resource for
+        // that output, so the rank is delivered here as well as from
+        // set_output_ranks. This is what makes ranks reach a greeter that binds
+        // wdm_greeter_v1 before wl_output, which is the normal order.
+        self.login.send_rank_for(&output, &wl_output);
+    }
+}
 
 impl FractionalScaleHandler for Wdm {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
@@ -573,12 +825,20 @@ impl FractionalScaleHandler for Wdm {
 }
 
 impl InputMethodHandler for Wdm {
-    // An input method popup (a candidate window for an on-screen keyboard) is a
-    // child of the greeter's surface and is rendered as part of its tree, so
-    // there is no separate mapping to track.
-    fn new_popup(&mut self, _surface: ImePopupSurface) {}
+    // An on-screen keyboard's candidate window. Tracked through the same popup
+    // manager as xdg popups so it is actually rendered — it is a separate
+    // surface, not part of the greeter's tree.
+    fn new_popup(&mut self, surface: ImePopupSurface) {
+        if let Err(e) = self.popups.track_popup(PopupKind::InputMethod(surface)) {
+            log::warn!("tracking input method popup: {e}");
+        }
+    }
 
-    fn dismiss_popup(&mut self, _surface: ImePopupSurface) {}
+    fn dismiss_popup(&mut self, surface: ImePopupSurface) {
+        if let Some(parent) = surface.get_parent().map(|p| p.surface.clone()) {
+            let _ = PopupManager::dismiss_popup(&parent, &PopupKind::InputMethod(surface));
+        }
+    }
 
     fn popup_repositioned(&mut self, _surface: ImePopupSurface) {}
 
@@ -593,6 +853,7 @@ impl InputMethodHandler for Wdm {
     }
 }
 
+delegate_dmabuf!(Wdm);
 delegate_compositor!(Wdm);
 delegate_shm!(Wdm);
 delegate_seat!(Wdm);

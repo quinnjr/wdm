@@ -23,7 +23,10 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -37,6 +40,7 @@ use smithay::reexports::wayland_server::Display;
 use smithay::utils::DeviceFd;
 
 use crate::comp::{LoopData, Wdm};
+use crate::render::WdmElement;
 use crate::config::{self, Config};
 
 use super::{Handled, Request, handle_action, poll_greeter};
@@ -68,6 +72,10 @@ struct Device {
     renderer: GlesRenderer,
     /// One entry per active CRTC.
     outputs: HashMap<crtc::Handle, Head>,
+    /// The give-up screen, rasterised once and reused. It never changes, and
+    /// rebuilding a full-screen image every frame on the one path that runs when
+    /// everything else has failed would be gratuitous.
+    error_screen: Option<(String, MemoryRenderBuffer)>,
     /// Wayland output globals, dropped with the device so clients see the
     /// outputs go away.
     drm_token: RegistrationToken,
@@ -113,7 +121,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut udev = Udev::new(&loop_handle, &mut data, vt)?;
 
-        super::setup::start(&mut data, &socket_name)?;
+        super::setup::start(&mut data, &loop_handle, &socket_name);
 
         let launch = pump(&mut event_loop, &mut data, &mut udev, &loop_handle)?;
 
@@ -342,6 +350,10 @@ impl Udev {
             .copied()
             .collect::<Vec<_>>();
 
+        // Advertised now that a renderer exists to name the formats.
+        data.state
+            .init_dmabuf(&data.state.display.clone(), render_formats.clone());
+
         let allocator = GbmAllocator::new(
             gbm.clone(),
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -369,6 +381,7 @@ impl Udev {
             output_manager,
             renderer,
             outputs: HashMap::new(),
+            error_screen: None,
             drm_token,
             device_id: node.dev_id(),
         });
@@ -396,7 +409,18 @@ impl Udev {
         let connected: Vec<connector::Info> = resources
             .connectors()
             .iter()
-            .filter_map(|handle| device.output_manager.device().get_connector(*handle, true).ok())
+            // force_probe only where the kernel does not already know: a forced
+            // probe is a blocking DDC/EDID round trip of roughly 100ms per
+            // connector, and doing it for all of them stalls the event loop
+            // every time a cable moves.
+            .filter_map(|handle| {
+                let device = device.output_manager.device();
+                let known = device
+                    .get_connector(*handle, false)
+                    .ok()
+                    .filter(|info| info.state() != connector::State::Unknown);
+                known.or_else(|| device.get_connector(*handle, true).ok())
+            })
             .filter(|info| info.state() == connector::State::Connected)
             .collect();
 
@@ -488,10 +512,8 @@ impl Udev {
         );
         output.set_preferred(wl_mode);
 
-        let elements: DrmOutputRenderElements<
-            GlesRenderer,
-            WaylandSurfaceRenderElement<GlesRenderer>,
-        > = DrmOutputRenderElements::default();
+        let elements: DrmOutputRenderElements<GlesRenderer, WdmElement<GlesRenderer>> =
+            DrmOutputRenderElements::default();
 
         let compositor = device.output_manager.initialize_output(
             crtc,
@@ -517,6 +539,12 @@ impl Udev {
 
     /// Act on everything the event sources queued.
     fn drain_requests(&mut self, data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>) {
+        // udev emits Changed in bursts while a cable settles, and each rescan
+        // force-probes every connector — a blocking DDC round trip per
+        // connector, on the thread that also serves input and the greeter.
+        // Coalescing keeps one burst to one probe.
+        let mut rescan = false;
+
         for request in std::mem::take(&mut data.state.requests) {
             match request {
                 Request::SwitchVt(vt) => {
@@ -531,14 +559,21 @@ impl Udev {
                     if active {
                         log::info!("seat activated");
                         self.libinput.resume().ok();
-                        // The screen is stale after another VT had it, so every
-                        // surface is reconfigured and the next frame is a full
-                        // redraw.
-                        if let Some(device) = &mut self.device
-                            && let Err(e) = device.output_manager.activate(false)
-                        {
-                            log::error!("reactivating the drm device: {e}");
+
+                        if let Some(device) = &mut self.device {
+                            if let Err(e) = device.output_manager.activate(false) {
+                                log::error!("reactivating the drm device: {e}");
+                            }
+                            // Whatever had the VT drew over the framebuffers, so
+                            // damage tracking from before the switch describes a
+                            // screen that no longer exists. Resetting the buffers
+                            // forces the next frame to be a full redraw instead of
+                            // an incremental one against someone else's pixels.
+                            for head in device.outputs.values() {
+                                head.compositor.reset_buffers();
+                            }
                         }
+
                         data.state.configure_layers();
                     } else {
                         log::info!("seat paused");
@@ -549,7 +584,7 @@ impl Udev {
                     }
                 }
 
-                Request::RescanConnectors => self.scan_connectors(data),
+                Request::RescanConnectors => rescan = true,
 
                 Request::DeviceAdded(path) => {
                     if self.device.is_none() {
@@ -587,6 +622,10 @@ impl Udev {
                 }
             }
         }
+
+        if rescan {
+            self.scan_connectors(data);
+        }
     }
 
     /// Draw every output that needs it.
@@ -595,8 +634,9 @@ impl Udev {
             return;
         };
 
-        let give_up = data.state.give_up_reason.clone();
+        let give_up = data.state.give_up_reason.as_deref();
         let crtcs: Vec<crtc::Handle> = device.outputs.keys().copied().collect();
+        let mut drew = false;
 
         for crtc in crtcs {
             let Some(head) = device.outputs.get_mut(&crtc) else {
@@ -604,12 +644,43 @@ impl Udev {
             };
             let output = head.output.clone();
 
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = match &give_up {
+            let elements: Vec<WdmElement<GlesRenderer>> = match give_up {
                 // Once wdm has given up there is no greeter to draw, so the
-                // error screen is composited instead. It is uploaded per frame,
-                // which is wasteful but only happens when nothing else is
-                // drawing.
-                Some(_) => Vec::new(),
+                // error screen is composited instead. Drawing nothing here would
+                // leave a flat colour with no explanation, which is exactly the
+                // failure the give-up path exists to avoid.
+                Some(reason) => {
+                    let size = output
+                        .current_mode()
+                        .map(|m| m.size)
+                        .unwrap_or_else(|| (640, 480).into());
+
+                    if device
+                        .error_screen
+                        .as_ref()
+                        .is_none_or(|(cached, _)| cached != reason)
+                    {
+                        device.error_screen =
+                            Some((reason.to_owned(), crate::render::error_buffer(reason, size)));
+                    }
+
+                    let (_, buffer) = device.error_screen.as_ref().expect("just populated");
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        &mut device.renderer,
+                        (0.0, 0.0),
+                        buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        Ok(element) => vec![WdmElement::Image(element)],
+                        Err(e) => {
+                            log::error!("building the error screen: {e}");
+                            Vec::new()
+                        }
+                    }
+                }
                 None => data.state.elements(&mut device.renderer, &output),
             };
 
@@ -621,6 +692,7 @@ impl Udev {
                     if frame.is_empty {
                         continue;
                     }
+                    drew = true;
                     if let Err(e) = head.compositor.queue_frame(()) {
                         log::error!("queueing frame on {}: {e}", output.name());
                     }
@@ -629,8 +701,14 @@ impl Udev {
             }
         }
 
-        data.state
-            .send_frames(data.state.uptime().as_millis() as u32);
+        // Only when something was actually committed: releasing frame callbacks
+        // for a frame that was not drawn asks the greeter to render again
+        // immediately, which on an idle login screen is a busy loop between two
+        // processes.
+        if drew {
+            data.state
+                .send_frames(data.state.uptime().as_millis() as u32);
+        }
     }
 
 

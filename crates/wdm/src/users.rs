@@ -92,6 +92,11 @@ impl UidRange {
             }
         }
 
+        // Root is never a login target, whatever local policy says. A
+        // `UID_MIN 0` in login.defs would otherwise enumerate root to the
+        // untrusted greeter.
+        range.min = range.min.max(1);
+
         if range.min > range.max {
             log::warn!(
                 "{LOGIN_DEFS}: UID_MIN {} exceeds UID_MAX {}, using defaults",
@@ -253,7 +258,18 @@ impl LastSessions {
         }
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.to_text())?;
+
+        // Written through a File and synced before the rename: `fs::write` plus
+        // `rename` is atomic against a process crash, but after a power cut the
+        // filesystem can expose a zero-length file at the target, which loses
+        // every user's preference rather than one.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(self.to_text().as_bytes())?;
+            file.sync_all()?;
+        }
+
         std::fs::rename(&tmp, path)
     }
 }
@@ -283,6 +299,14 @@ mod tests {
     fn login_defs_ignores_trailing_comments() {
         let range = UidRange::parse_login_defs("UID_MIN 2000 # start here\n");
         assert_eq!(range.min, 2000);
+    }
+
+    #[test]
+    fn root_is_never_inside_the_range() {
+        // Local policy does not get to make root loginable from a display
+        // manager documented as never offering it.
+        assert!(!UidRange::parse_login_defs("UID_MIN 0\n").contains(0));
+        assert!(!UidRange::default().contains(0));
     }
 
     #[test]

@@ -69,7 +69,8 @@ pub fn build(
     let (events_tx, events_rx) = smithay::reexports::calloop::channel::channel();
     loop_handle.insert_source(events_rx, |event, _, data| {
         if let smithay::reexports::calloop::channel::Event::Msg(event) = event {
-            data.state.pending_action = data.state.login.handle_auth_event(event);
+            let action = data.state.login.handle_auth_event(event);
+            data.state.queue_action(action);
         }
     })?;
 
@@ -111,8 +112,15 @@ pub fn build(
 }
 
 /// Launch the greeter, once outputs exist.
-pub fn start(data: &mut LoopData, socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// A greeter that will not start is not fatal: it goes through the same backoff
+/// and give-up policy as one that crashes, so a misconfigured `greeter.command`
+/// ends with an explanation on screen rather than wdm exiting.
+pub fn start(
+    data: &mut LoopData,
+    loop_handle: &LoopHandle<'static, LoopData>,
+    socket_name: &str,
+) {
     log::info!("greeter socket is {socket_name}");
-    data.state.greeter.spawn()?;
-    Ok(())
+    crate::backend::spawn_greeter(data, loop_handle);
 }

@@ -24,7 +24,12 @@ const RAPID_FAILURE: Duration = Duration::from_secs(10);
 const MAX_RAPID_FAILURES: u32 = 3;
 
 /// Delay before each restart, in seconds, indexed by consecutive failures.
-const BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
+///
+/// Only two entries because wdm gives up on the third rapid failure, so a third
+/// delay is never reached. A longer ramp would need a larger
+/// [`MAX_RAPID_FAILURES`], which is a different trade: more patience with a
+/// broken greeter, longer before the user is told what is wrong.
+const BACKOFF_SECS: &[u64] = &[1, 2];
 
 /// Runtime directory for the greeter, and the home of the Wayland socket.
 ///
@@ -43,7 +48,9 @@ pub enum GreeterError {
     Groups(String, #[source] std::io::Error),
     #[error("preparing {0}: {1}")]
     RuntimeDir(PathBuf, #[source] std::io::Error),
-    #[error("spawning greeter: {0}")]
+    // No "spawning greeter:" prefix here: callers add their own context, and
+    // the give-up screen shows this text verbatim.
+    #[error("{0}")]
     Spawn(#[source] std::io::Error),
 }
 
@@ -258,6 +265,27 @@ impl Greeter {
         let ran_for = self.started.take().map(|t| t.elapsed());
         let rapid = ran_for.is_none_or(|d| d < RAPID_FAILURE);
 
+        log::warn!(
+            "greeter exited ({}) after {:?}",
+            describe_exit(status),
+            ran_for.unwrap_or_default()
+        );
+
+        self.record_failure(rapid, describe_exit(status))
+    }
+
+    /// Record a greeter that could not be started at all.
+    ///
+    /// A misconfigured `greeter.command` must land in the same backoff and
+    /// give-up policy as one that starts and crashes. Treating it as fatal
+    /// instead would exit wdm on the first try, so the user gets no login
+    /// prompt *and* no explanation — the give-up screen exists for exactly this.
+    pub fn note_spawn_failure(&mut self, error: &str) -> Disposition {
+        self.started = None;
+        self.record_failure(true, format!("could not be started: {error}"))
+    }
+
+    fn record_failure(&mut self, rapid: bool, reason: String) -> Disposition {
         if rapid {
             self.rapid_failures += 1;
         } else {
@@ -267,12 +295,7 @@ impl Greeter {
             self.rapid_failures = 1;
         }
 
-        let reason = describe_exit(status);
-        log::warn!(
-            "greeter exited ({reason}) after {:?}, failure {}/{MAX_RAPID_FAILURES}",
-            ran_for.unwrap_or_default(),
-            self.rapid_failures
-        );
+        log::warn!("greeter failure {}/{MAX_RAPID_FAILURES}", self.rapid_failures);
 
         if self.rapid_failures >= MAX_RAPID_FAILURES {
             self.gave_up = true;
@@ -285,6 +308,12 @@ impl Greeter {
         Disposition::Restart(Duration::from_secs(
             BACKOFF_SECS[index.min(BACKOFF_SECS.len() - 1)],
         ))
+    }
+
+    /// The delays this policy can actually produce, longest first.
+    #[cfg(test)]
+    fn possible_delays() -> Vec<Duration> {
+        BACKOFF_SECS.iter().map(|s| Duration::from_secs(*s)).collect()
     }
 
     /// Stop the greeter, used before handing the display to a session.
@@ -366,6 +395,18 @@ mod tests {
     }
 
     #[test]
+    fn every_backoff_entry_is_reachable() {
+        // A table with entries the policy can never reach is a table that lies
+        // about the behaviour.
+        let mut g = greeter("/bin/true");
+        let mut seen = Vec::new();
+        while let Disposition::Restart(delay) = g.note_exit(ExitStatus::from_raw(0)) {
+            seen.push(delay);
+        }
+        assert_eq!(seen, Greeter::possible_delays());
+    }
+
+    #[test]
     fn backoff_grows_then_gives_up() {
         let mut g = greeter("/bin/true");
         // Never started, so every exit counts as rapid.
@@ -413,6 +454,30 @@ mod tests {
         // The user is looking at a broken screen; the message must say what to do.
         assert!(reason.contains("tty1"), "{reason}");
         assert!(reason.contains("signal 11"), "{reason}");
+    }
+
+    #[test]
+    fn a_greeter_that_cannot_start_still_gives_up() {
+        // A bad greeter.command must not be fatal on the first try: it goes
+        // through the same policy, so the user ends up looking at the error
+        // screen rather than at nothing.
+        let mut g = Greeter::new("/nonexistent/greeter", "nobody", "wayland-test", false).unwrap();
+
+        assert!(g.spawn().is_err());
+        assert_eq!(
+            g.note_spawn_failure("no such file"),
+            Disposition::Restart(Duration::from_secs(1))
+        );
+        assert_eq!(
+            g.note_spawn_failure("no such file"),
+            Disposition::Restart(Duration::from_secs(2))
+        );
+
+        let Disposition::GaveUp { reason } = g.note_spawn_failure("no such file") else {
+            panic!("expected give-up");
+        };
+        assert!(reason.contains("could not be started"), "{reason}");
+        assert!(reason.contains("tty1"), "{reason}");
     }
 
     #[test]

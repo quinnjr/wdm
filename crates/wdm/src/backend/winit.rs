@@ -9,6 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
@@ -20,6 +22,7 @@ use smithay::utils::{Rectangle, Transform};
 
 use crate::comp::{LoopData, Wdm};
 use crate::config::Config;
+use crate::render::WdmElement;
 
 use super::{Handled, handle_action, poll_greeter};
 
@@ -64,8 +67,17 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     output.set_preferred(mode);
     state.set_outputs(vec![output.clone()]);
 
+    let formats = backend
+        .renderer()
+        .egl_context()
+        .dmabuf_render_formats()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    state.init_dmabuf(&handle, formats);
+
     let mut data = LoopData { state, display };
-    super::setup::start(&mut data, &socket_name)?;
+    super::setup::start(&mut data, &loop_handle, &socket_name);
 
     let start = Instant::now();
 
@@ -147,30 +159,34 @@ fn render(
     {
         let (renderer, mut framebuffer) = backend.bind()?;
 
-        // The error screen is an image, not a client surface, so it is built and
-        // uploaded per frame. Wasteful, but it only happens once wdm has stopped
-        // trying to run a greeter and nothing else is competing for the GPU.
-        let error_texture = match &give_up {
-            Some(reason) => Some(crate::render::error_texture(renderer, reason, size)?),
-            None => None,
-        };
-
-        let elements = match &error_texture {
-            Some(_) => Vec::new(),
+        let elements: Vec<WdmElement<GlesRenderer>> = match &give_up {
+            // Same element path as the DRM backend, so the give-up screen is
+            // exercised by whichever backend is in use rather than only here.
+            Some(reason) => {
+                let buffer = crate::render::error_buffer(reason, size);
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    (0.0, 0.0),
+                    &buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ) {
+                    Ok(element) => vec![WdmElement::Image(element)],
+                    Err(e) => {
+                        log::error!("building the error screen: {e}");
+                        Vec::new()
+                    }
+                }
+            }
             None => data.state.elements(renderer, output),
         };
 
         // Flipped180 because winit's framebuffer origin is the opposite of ours.
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.05, 0.05, 0.07, 1.0), &damage)?;
-
-        if let Some(texture) = &error_texture {
-            crate::render::draw_fullscreen(&mut frame, texture, size, &damage)?;
-        } else {
-            smithay::backend::renderer::utils::draw_render_elements(
-                &mut frame, 1.0, &elements, &damage,
-            )?;
-        }
+        smithay::backend::renderer::utils::draw_render_elements(&mut frame, 1.0, &elements, &damage)?;
 
         // The nested compositor synchronises for us, so the fence needs no wait.
         let _sync = frame.finish()?;

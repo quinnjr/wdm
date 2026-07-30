@@ -27,6 +27,8 @@ pub enum LaunchError {
     NoSuchUser(String),
     #[error("user {0} has no valid login shell")]
     NoShell(String),
+    #[error("user {0} is outside the loginable uid range")]
+    NotLoginable(String),
     #[error("session command for {0} is empty")]
     EmptyCommand(String),
     #[error("resolving groups for {0}: {1}")]
@@ -65,10 +67,12 @@ impl Launch {
     ///
     /// `pam_env` is the environment `pam_open_session` produced, which is where
     /// `XDG_RUNTIME_DIR` comes from — wdm must not invent that itself, because
-    /// pam_systemd owns the directory's lifecycle. `extra_env` is what the
-    /// greeter asked for, and is applied last so a greeter can override
-    /// presentation variables like `LANG` but is subject to the same validation
-    /// as everything else.
+    /// pam_systemd owns the directory's lifecycle.
+    ///
+    /// `extra_env` is what the greeter asked for. It is filtered through
+    /// [`greeter_may_set`] and applied *before* wdm's own session variables, so
+    /// a greeter can localise the session but can neither influence how it loads
+    /// code nor contradict a fact about the seat.
     pub fn prepare(
         session: &Session,
         username: &str,
@@ -79,6 +83,17 @@ impl Launch {
         let user = uzers::get_user_by_name(username)
             .ok_or_else(|| LaunchError::NoSuchUser(username.to_owned()))?;
 
+        // The uid range is re-checked here, not just when enumerating users.
+        // create_session deliberately accepts usernames that were never
+        // advertised, so that the greeter cannot be used to enumerate accounts —
+        // which means an unadvertised name reaches this point with a valid
+        // password behind it. Without this check, `create_session("root")` plus
+        // the root password launches a root graphical session from a display
+        // manager documented as never offering root.
+        let range = crate::users::UidRange::from_system();
+        if !range.contains(user.uid()) {
+            return Err(LaunchError::NotLoginable(username.to_owned()));
+        }
         if !crate::users::is_login_shell(user.shell()) {
             return Err(LaunchError::NoShell(username.to_owned()));
         }
@@ -190,17 +205,30 @@ impl Launch {
                 // Exec'ing a user session with root credentials would be a
                 // total compromise, and setuid can fail in ways that do not
                 // set errno on every libc.
+                //
+                // from_raw_os_error rather than Error::other: the latter boxes
+                // a message, which allocates, and this closure runs in a child
+                // forked from a process with live PAM threads. If one of them
+                // held the allocator lock at fork time, allocating here would
+                // deadlock the child at exactly the moment it is trying to
+                // abort a failed privilege drop.
                 if libc::getuid() != uid || libc::geteuid() != uid {
-                    return Err(std::io::Error::other("uid did not change"));
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                 }
                 if libc::getgid() != gid || libc::getegid() != gid {
-                    return Err(std::io::Error::other("gid did not change"));
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                 }
 
                 // current_dir already chdir'd, but it runs before this closure
                 // and while still root; redo it so a home directory only
-                // readable by the user is entered as the user.
-                libc::chdir(home.as_ptr());
+                // readable by the user is entered as the user. A failure here
+                // is fatal for the same reason the checks above are: the
+                // session would start somewhere the user cannot read, and the
+                // surrounding code has already committed to refusing rather
+                // than continuing in a half-dropped state.
+                if libc::chdir(home.as_ptr()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
 
                 Ok(())
             });
@@ -283,6 +311,16 @@ fn build_env(
         set(&key, value);
     }
 
+    // Applied before wdm's own facts, and filtered, so a greeter can localise a
+    // session but cannot influence how it loads code or who it runs as.
+    for (key, value) in extra_env {
+        if greeter_may_set(&key) {
+            set(&key, value);
+        } else {
+            log::warn!("ignoring environment variable {key} requested by the greeter");
+        }
+    }
+
     set("HOME", home.to_string_lossy().into_owned());
     set("PWD", home.to_string_lossy().into_owned());
     set("SHELL", shell.to_string_lossy().into_owned());
@@ -302,11 +340,23 @@ fn build_env(
     // Desktops key their own configuration off this.
     set("XDG_SESSION_DESKTOP", session.id.trim_end_matches(".desktop").to_owned());
 
-    for (key, value) in extra_env {
-        set(&key, value);
-    }
-
     env
+}
+
+/// Environment variables the greeter is allowed to contribute.
+///
+/// An allowlist, not a denylist. The greeter is unprivileged, untrusted code,
+/// and the session it is populating runs as the authenticated user through a
+/// login shell — so a variable it controls is a variable it can use to run code
+/// as that user. `LD_PRELOAD` and `LD_LIBRARY_PATH` are the obvious ones, but
+/// `PATH`, `SHELL`, `IFS`, `BASH_ENV` and `ENV` are equally good, and enumerating
+/// them is a game one eventually loses. Only presentation variables are allowed
+/// through, which is all a greeter has any business setting.
+fn greeter_may_set(key: &str) -> bool {
+    const ALLOWED: &[&str] = &["LANG", "LANGUAGE"];
+    const ALLOWED_PREFIXES: &[&str] = &["LC_", "XKB_"];
+
+    ALLOWED.contains(&key) || ALLOWED_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 #[cfg(test)]
@@ -401,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn greeter_env_is_applied_last() {
+    fn greeter_may_localise_the_session() {
         let env = build_env(
             &session(SessionType::Wayland),
             "joseph",
@@ -409,9 +459,80 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
+            vec![
+                ("LANG".to_owned(), "de_DE.UTF-8".to_owned()),
+                ("LC_TIME".to_owned(), "en_GB.UTF-8".to_owned()),
+                ("XKB_DEFAULT_LAYOUT".to_owned(), "de".to_owned()),
+            ],
         );
         assert_eq!(env_of(&env, "LANG").as_deref(), Some("de_DE.UTF-8"));
+        assert_eq!(env_of(&env, "LC_TIME").as_deref(), Some("en_GB.UTF-8"));
+        assert_eq!(env_of(&env, "XKB_DEFAULT_LAYOUT").as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn greeter_cannot_inject_code_into_the_session() {
+        // The greeter is unprivileged and untrusted, but the session runs as the
+        // authenticated user through a login shell. Any of these would be
+        // arbitrary code execution as that user.
+        let dangerous = [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "PATH",
+            "SHELL",
+            "HOME",
+            "IFS",
+            "BASH_ENV",
+            "ENV",
+            "XDG_RUNTIME_DIR",
+            "XDG_VTNR",
+            "XDG_SEAT",
+            "PYTHONPATH",
+            "PERL5LIB",
+            "GIO_MODULE_DIR",
+        ];
+
+        for key in dangerous {
+            assert!(!greeter_may_set(key), "{key} must not be greeter-settable");
+        }
+
+        let env = build_env(
+            &session(SessionType::Wayland),
+            "joseph",
+            Path::new("/home/joseph"),
+            Path::new("/bin/sh"),
+            7,
+            Vec::new(),
+            dangerous
+                .iter()
+                .map(|k| ((*k).to_owned(), "/tmp/evil".to_owned()))
+                .collect(),
+        );
+
+        assert!(env_of(&env, "LD_PRELOAD").is_none());
+        assert!(env_of(&env, "LD_LIBRARY_PATH").is_none());
+        // The ones wdm sets itself must hold wdm's values, not the greeter's.
+        assert_eq!(env_of(&env, "HOME").as_deref(), Some("/home/joseph"));
+        assert_eq!(env_of(&env, "SHELL").as_deref(), Some("/bin/sh"));
+        assert_eq!(env_of(&env, "XDG_VTNR").as_deref(), Some("7"));
+        assert_ne!(env_of(&env, "PATH").as_deref(), Some("/tmp/evil"));
+    }
+
+    #[test]
+    fn wdm_facts_win_over_the_greeter() {
+        // Applied after the greeter's contribution, so even an allowlisted key
+        // cannot displace a fact about the seat.
+        let env = build_env(
+            &session(SessionType::Wayland),
+            "joseph",
+            Path::new("/home/joseph"),
+            Path::new("/bin/sh"),
+            7,
+            Vec::new(),
+            vec![("XDG_SESSION_TYPE".to_owned(), "x11".to_owned())],
+        );
+        assert_eq!(env_of(&env, "XDG_SESSION_TYPE").as_deref(), Some("wayland"));
     }
 
     #[test]
@@ -423,11 +544,33 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             vec![("PATH".to_owned(), "/pam".to_owned())],
-            vec![("PATH".to_owned(), "/greeter".to_owned())],
+            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
         );
-        let paths: Vec<_> = env.iter().filter(|(k, _)| k == "PATH").collect();
-        assert_eq!(paths.len(), 1, "duplicate keys make the winner undefined");
-        assert_eq!(paths[0].1, "/greeter");
+
+        for key in ["PATH", "LANG", "HOME"] {
+            let hits = env.iter().filter(|(k, _)| k == key).count();
+            assert!(hits <= 1, "duplicate {key} makes the winner undefined");
+        }
+        // PAM's PATH survives, since wdm only supplies a fallback.
+        assert_eq!(env_of(&env, "PATH").as_deref(), Some("/pam"));
+    }
+
+    #[test]
+    fn rejects_a_user_outside_the_login_range() {
+        // root authenticates fine if someone knows the password; the uid range
+        // is what stops it becoming a graphical root session.
+        let err = Launch::prepare(
+            &session(SessionType::Wayland),
+            "root",
+            7,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LaunchError::NotLoginable(_) | LaunchError::NoShell(_)),
+            "root was not rejected: {err:?}"
+        );
     }
 
     #[test]
