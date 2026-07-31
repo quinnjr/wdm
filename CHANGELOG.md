@@ -3,6 +3,35 @@
 Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 [Semantic Versioning].
 
+## [0.1.3] — 2026-07-31
+
+### Fixed
+
+- **The greeter could not connect on a real machine.** It exited immediately
+  with "Failed to open display", three times, until wdm gave up and switched to
+  tty1 — a boot ending at a text console with no login screen. The Wayland
+  socket was created by wdm, which is root, and chmodded to `0600`; but `0600`
+  describes the *owner*, and `connect(2)` needs write permission, so the kernel
+  refused the unprivileged greeter before it could send a byte. The socket is
+  now chowned to the greeter account, and the runtime directory is prepared
+  before the socket is created rather than after. Development never saw this,
+  because there wdm and the greeter are the same user.
+- **wdm never claimed its VT, and every frame failed** with "Page flip commit
+  failed (Permission denied)". seatd binds a client's session to whichever VT is
+  foreground when the seat is opened rather than allocating one, so wdm — which
+  opened the seat on tty1 and then asked to switch to VT 7 — left its own
+  session behind on a VT that was no longer in front. An inactive session holds
+  no DRM master. The switch now happens with `VT_ACTIVATE` and `VT_WAITACTIVE`
+  before the seat is opened. **Not yet verified on hardware.**
+
+### Added
+
+- **Debian and Fedora packages**, built from metadata in the crate manifests
+  with `cargo-deb` and `cargo-generate-rpm`. Both produce one package per
+  greeter, as the Arch packaging does, and neither enables `wdm.service` on
+  install.
+- **`wdm(1)`**, the man page `wdm.service` has advertised since it was written.
+
 ## [0.1.2] — 2026-07-30
 
 ### Added
@@ -92,6 +121,7 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
 [0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2
 [0.1.1]: https://github.com/quinnjr/wdm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/quinnjr/wdm/releases/tag/v0.1.0
