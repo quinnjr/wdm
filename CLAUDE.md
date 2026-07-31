@@ -20,7 +20,16 @@ cargo test --workspace            # all in-file #[cfg(test)] modules
 cargo test -p wdm login::         # one module
 cargo test -p wdm the_test_name   # one test
 cargo clippy --workspace --all-targets   # must be clean; CI does not exist yet
+
+cargo deb -p wdm --no-build              # target/debian/*.deb
+cargo generate-rpm -p crates/wdm         # target/generate-rpm/*.rpm
 ```
+
+Packaging for all three distributions installs the same files from
+`packaging/`. The deb and rpm metadata lives in each crate's `Cargo.toml`
+rather than in a `debian/` directory and a `.spec`, because neither
+`dpkg-buildpackage` nor `rpmbuild` runs on Arch, and packaging that cannot be
+built here is packaging that never gets checked.
 
 Running it for real needs root and a spare VT. For development, use the nested
 backend — it runs wdm as an ordinary window inside your existing session:

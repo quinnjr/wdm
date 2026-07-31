@@ -72,16 +72,10 @@ package_wdm() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
 
-  # The greeter runs unprivileged. systemd-sysusers creates the account rather
-  # than a post-install script, so it is declarative and removable.
-  install -Dm644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/wdm.conf" <<-EOF
-	u wdm - "wdm greeter" /var/lib/wdm /usr/bin/nologin
-	EOF
-
-  # State directory for the per-user last-session record.
-  install -Dm644 /dev/stdin "$pkgdir/usr/lib/tmpfiles.d/wdm.conf" <<-EOF
-	d /var/lib/wdm 0755 wdm wdm -
-	EOF
+  # Shared with the deb and rpm packaging rather than written inline here, so
+  # the three cannot drift apart on who the greeter account is.
+  install -Dm644 packaging/wdm.sysusers "$pkgdir/usr/lib/sysusers.d/wdm.conf"
+  install -Dm644 packaging/wdm.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/wdm.conf"
 }
 
 package_wdm-greeter() {

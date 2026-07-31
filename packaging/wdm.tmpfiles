@@ -1,0 +1,3 @@
+# State directory for the per-user last-session record. Owned by the greeter
+# account, which is the only thing that writes it.
+d /var/lib/wdm 0755 wdm wdm -

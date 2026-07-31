@@ -20,7 +20,48 @@ cargo build --release
 `xdg_toplevel` at all, so a window that is not a layer surface is closed as soon
 as it is created.
 
-## Install
+## Packages
+
+### Arch
+
+The AUR packaging in `aur/` is a split package producing `wdm` and one package
+per greeter. `wdm` depends on the virtual `wdm-greeter-implementation`, which
+each greeter provides, so pacman asks which one to install.
+
+```bash
+cd aur && makepkg -si
+```
+
+### Debian and Fedora
+
+Both are built from metadata in the crate manifests, with no `debian/`
+directory and no `.spec` file, and neither needs `dpkg-buildpackage` or
+`rpmbuild` — they can be produced on any machine with a Rust toolchain.
+
+```bash
+cargo install cargo-deb cargo-generate-rpm
+cargo build --release --workspace
+
+for p in wdm wdm-greeter wdm-gtk-greeter wdm-webkit-greeter; do
+  cargo deb -p $p --no-build            # target/debian/*.deb
+  cargo generate-rpm -p crates/$p       # target/generate-rpm/*.rpm
+done
+```
+
+Both put the greeters in `/usr/lib/wdm` rather than `/usr/libexec`, matching
+Arch. `greeter.command` defaults to `/usr/lib/wdm/wdm-greeter`, and a
+per-distribution default would be a configuration file that is wrong on two
+distributions out of three.
+
+Neither enables `wdm.service` on install. A machine being installed onto
+usually has a display manager already, and enabling a second one that claims
+`display-manager.service` is how a boot ends with no login screen at all.
+
+On Debian the greeter account and `/var/lib/wdm` are created from `postinst`,
+because Debian has no file triggers for `sysusers.d` and `tmpfiles.d`; Fedora's
+systemd runs both automatically.
+
+## Install by hand
 
 | From | To |
 | --- | --- |
@@ -30,10 +71,14 @@ as it is created.
 | `packaging/wdm.service` | `/etc/systemd/system/wdm.service` |
 | `packaging/wdm.toml.example` | `/etc/wdm/wdm.toml` (optional) |
 
-Create the unprivileged account the greeter runs as:
+Create the unprivileged account the greeter runs as. The packages do this
+declaratively with `packaging/wdm.sysusers`, which is what the equivalent
+`useradd` looks like:
 
 ```bash
-useradd --system --shell /usr/sbin/nologin --no-create-home wdm
+useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/wdm \
+        --no-create-home wdm
+install -d -o wdm -g wdm -m 0755 /var/lib/wdm
 ```
 
 Then `systemctl enable wdm.service`. The unit aliases itself to
