@@ -65,6 +65,10 @@ package_wdm() {
   # config rather than as documentation.
   install -Dm644 packaging/wdm.toml.example "$pkgdir/etc/wdm/wdm.toml"
 
+  # wdm.service's Documentation= already points at man:wdm(1), so shipping the
+  # page is what makes `systemctl help wdm` resolve to something.
+  install -Dm644 packaging/wdm.1 "$pkgdir/usr/share/man/man1/wdm.1"
+
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
 
