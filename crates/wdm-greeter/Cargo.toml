@@ -13,3 +13,30 @@ wayland-client.workspace = true
 wayland-protocols-wlr = { workspace = true, features = ["client"] }
 wdm-protocol = { workspace = true, features = ["client"] }
 xkbcommon = "0.9.0"
+
+# See crates/wdm/Cargo.toml for why the packaging lives in the manifests.
+# The greeters deliberately do not depend on wdm: wdm depends on one of them,
+# and naming wdm here would make the pair circular.
+[package.metadata.deb]
+name = "wdm-greeter"
+maintainer = "Joseph R. Quinn <quinn.josephr@protonmail.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = "Reference greeter for wdm. Software-rendered into wl_shm with no toolkit, which keeps the shipped default dependency-free."
+section = "x11"
+priority = "optional"
+depends = "libc6, libxkbcommon0"
+provides = "wdm-greeter-implementation"
+assets = [["../../target/release/wdm-greeter", "usr/lib/wdm/wdm-greeter", "755"]]
+
+[package.metadata.generate-rpm]
+name = "wdm-greeter"
+summary = "Reference greeter for wdm, software-rendered with no toolkit"
+license = "MIT"
+provides = { wdm-greeter-implementation = "*" }
+assets = [
+    { source = "target/release/wdm-greeter", dest = "/usr/lib/wdm/wdm-greeter", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/wdm-greeter/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"

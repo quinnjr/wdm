@@ -17,3 +17,35 @@ webkit6 = "0.6"
 # from PAM and from the account database, so escaping them by hand is a code
 # injection waiting to happen.
 serde_json = "1"
+
+# See crates/wdm/Cargo.toml. The default theme is data, not documentation: the
+# greeter refuses to start without the theme it was pointed at.
+[package.metadata.deb]
+name = "wdm-webkit-greeter"
+maintainer = "Joseph R. Quinn <quinn.josephr@protonmail.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = "WebKitGTK greeter for wdm, with themes written in HTML, CSS and JavaScript."
+section = "x11"
+priority = "optional"
+depends = "libc6, libgtk-4-1, libgtk4-layer-shell0, libwebkitgtk-6.0-4"
+provides = "wdm-greeter-implementation"
+assets = [
+    ["../../target/release/wdm-webkit-greeter", "usr/lib/wdm/wdm-webkit-greeter", "755"],
+    ["themes/default/*", "usr/share/wdm/webkit-greeter/themes/default/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "wdm-webkit-greeter"
+summary = "WebKitGTK greeter for wdm, themed in HTML, CSS and JavaScript"
+license = "MIT"
+provides = { wdm-greeter-implementation = "*" }
+assets = [
+    { source = "target/release/wdm-webkit-greeter", dest = "/usr/lib/wdm/wdm-webkit-greeter", mode = "755" },
+    { source = "crates/wdm-webkit-greeter/themes/default/*", dest = "/usr/share/wdm/webkit-greeter/themes/default/", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/wdm-webkit-greeter/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+gtk4 = "*"
+gtk4-layer-shell = "*"
+"webkitgtk6.0" = "*"

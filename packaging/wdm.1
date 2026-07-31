@@ -1,0 +1,265 @@
+.\" wdm(1) -- Wayland display manager that is its own compositor
+.\" Written for wdm 0.1.3. Section 1 rather than 8 because wdm.service's
+.\" Documentation= already points at man:wdm(1).
+.TH WDM 1 "2026-07-31" "wdm 0.1.3" "User Commands"
+.SH NAME
+wdm \- Wayland display manager that is its own compositor
+.SH SYNOPSIS
+.B wdm
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-backend
+.IR NAME ]
+.br
+.B wdm
+.RB [ \-h | \-\-help ]
+.RB [ \-V | \-\-version ]
+.SH DESCRIPTION
+.B wdm
+is a display manager for Wayland that is itself the compositor. Every other
+Wayland display manager spawns a separate kiosk compositor \(en cage,
+weston\-kiosk, gamescope \(en purely to host the greeter window.
+.B wdm
+binds DRM/KMS directly through libseat, hosts the greeter as an ordinary
+Wayland client, and hands the display to the user's session at login. There is
+no nesting and no X server.
+.PP
+The greeter is a separate, unprivileged process. It speaks
+.BR wdm_greeter_v1 ,
+a Wayland protocol, and never sees the shadow database:
+.B wdm
+runs PAM itself and forwards each question the stack asks. Three greeters are
+available \(en a software\-rendered reference greeter, a GTK4 greeter, and a
+WebKitGTK greeter themed in HTML and CSS \(en and any Wayland client that
+implements the protocol may replace them.
+.PP
+At login
+.B wdm
+does not fork a child compositor. It drops everything holding the display \(en
+the DRM device, the renderer, libinput, and the libseat session \(en and only
+then execs the user's session, which acquires real DRM master on the same VT.
+.SH OPTIONS
+.TP
+.BI \-\-config " PATH"
+Read configuration from
+.IR PATH .
+Default:
+.IR /etc/wdm/wdm.toml .
+A missing file is not an error and the built\-in defaults are used; a malformed
+one is fatal, because continuing would silently ignore a deliberate choice of
+VT or greeter.
+.TP
+.BI \-\-backend " NAME"
+Either
+.B udev
+(real hardware: DRM/KMS, libinput, libseat) or
+.B winit
+(nested inside an existing Wayland session, as a window). Defaults to
+.B udev
+when running as root and
+.B winit
+otherwise. The
+.B winit
+backend is for development: it cannot exercise DRM, the seat, VT switching, or
+the handoff to a session.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH CONFIGURATION
+The configuration file is TOML. Unknown keys are rejected rather than ignored,
+so a typo is reported instead of silently doing nothing.
+.SS Top level
+.TP
+.B vt
+Virtual terminal to run on. Default:
+.BR 7 ,
+which is free on a default systemd install \(en
+.B getty@tty1.service
+is the unit enabled by default and logind autospawns a getty on tty2 through
+tty6 on demand. Running there means
+.B wdm
+needs no
+.B Conflicts=
+against a getty, and tty1 remains a working text console, which is the recovery
+path when a greeter wedges. Must be at least 1.
+.TP
+.B default_session
+Session id offered to a user with no recorded last session.
+.B wdm
+never preselects a session itself; this is advertised to the greeter as a
+fallback, and acting on it is the greeter's policy.
+.SS [greeter]
+.TP
+.B command
+Command line for the greeter, split on whitespace and executed directly.
+.B It is not run through a shell,
+so a configuration file cannot inject shell into a root process. Default:
+.IR /usr/lib/wdm/wdm-greeter .
+.TP
+.B user
+Unprivileged account the greeter runs as. Default:
+.BR wdm .
+Must not be
+.BR root :
+the greeter is untrusted code hosted by the process that owns DRM master, and
+running it as root defeats the privilege split entirely.
+.SS [keyboard]
+xkb configuration for the login screen. It has to be set here because there is
+no user whose preferences could be consulted yet, and someone who cannot type
+their password on their own layout cannot log in.
+.TP
+.B layout
+xkb layout. Default:
+.BR us .
+An empty string is not equivalent \(en xkb would fall back to its own build\-time
+default, which need not be
+.BR us .
+.TP
+.BR rules ", " model ", " variant ", " options
+The remaining xkb fields, empty by default. For example
+.B options
+=
+.IR ctrl:nocaps .
+.SS [[output]]
+An array of tables, one per connector, in
+.B priority order.
+Array position is the rank: the first entry is rank 0, the primary, and that is
+where a greeter puts its login form. Connectors not listed rank after every
+listed one, sorted by name, so the primary does not move between boots. Ranks
+are recomputed on hotplug, so unplugging the primary promotes the next entry.
+.TP
+.B connector
+Connector name as the kernel reports it, for example
+.I DP-1
+or
+.IR eDP-1 .
+Required. Listing the same connector twice is an error.
+.TP
+.B mode
+.IR WIDTH x HEIGHT
+or
+.IR WIDTH x HEIGHT @ REFRESH .
+Defaults to the connector's preferred mode.
+.TP
+.B scale
+Output scale. Fractional values are permitted. Must be positive.
+.TP
+.B transform
+One of
+.BR normal ", " 90 ", " 180 ", " 270 ", " flipped ", " flipped-90 ", "
+.BR flipped-180 ", " flipped-270 .
+Default:
+.BR normal .
+.TP
+.B enable
+When
+.BR false ,
+the output is left unprogrammed and given no rank, so no password prompt can
+appear on it. It is not actively blanked: whatever was on it before
+.B wdm
+started remains until the mode times out. Default:
+.BR true .
+.SH ENVIRONMENT
+.TP
+.B WDM_LOG
+Log filter, in the syntax of the Rust
+.B env_logger
+crate \(en for example
+.BR debug ,
+or
+.BR wdm::login=debug .
+Named
+.B WDM_LOG
+rather than
+.B RUST_LOG
+so that a user session's own
+.B RUST_LOG
+cannot reconfigure the display manager's logging.
+.TP
+.B WDM_LOG_STYLE
+Whether log output is coloured:
+.BR auto ", " always ", " never .
+.TP
+.B WDM_GREETER_LOG
+Read by the greeters shipped with
+.BR wdm ,
+not by
+.B wdm
+itself.
+.PP
+.B wdm
+clears the environment before executing the greeter, so nothing else is
+inherited. To trace a greeter's protocol traffic, point
+.B greeter.command
+at a wrapper script that exports
+.BR WAYLAND_DEBUG=1 .
+.SH FILES
+.TP
+.I /etc/wdm/wdm.toml
+Configuration.
+.TP
+.I /etc/pam.d/wdm
+PAM stack.
+.B Authentication fails until this exists;
+an "Authentication failure" on the greeter with no PAM file installed is
+expected and is not a bug.
+.TP
+.I /var/lib/wdm/last-session
+Per\-user record of the last session launched, reported to the greeter so it can
+preselect one.
+.TP
+.I /run/wdm
+Runtime directory, owned by the greeter account and mode 0700. The Wayland
+socket the greeter connects to lives here, mode 0600 and owned by the same
+account; every connection's peer uid is checked against it as well.
+.TP
+.I /usr/lib/wdm/
+Greeter executables.
+.TP
+.I /usr/share/wdm/webkit-greeter/themes/
+Themes for the WebKitGTK greeter.
+.SH EXIT STATUS
+.TP
+.B 0
+Shut down cleanly, having been asked to by
+.B SIGTERM
+or
+.BR SIGINT .
+.TP
+.B 1
+Startup failed \(en no GPU on the seat, an unusable greeter account, a socket
+that could not be secured, or a fatal error while running.
+.TP
+.B 2
+Invalid command line.
+.SH NOTES
+.B wdm
+must run as root. It owns DRM master, reads the shadow database through PAM,
+and drops privileges itself when launching the greeter and the user's session.
+.PP
+The VT is switched to before the seat is opened, because seatd binds a client's
+session to whichever VT is foreground at that moment rather than allocating
+one. A session registered against a VT that is no longer in front is inactive,
+holds no DRM master, and cannot commit a frame.
+.PP
+Ctrl+Alt+F\fIn\fR is handled by
+.B wdm
+before the greeter sees it, so a wedged greeter can always be escaped from.
+.SH SEE ALSO
+.BR seatd (1),
+.BR systemd (1),
+.BR pam (8),
+.BR loginctl (1)
+.PP
+Project documentation, including the
+.B wdm_greeter_v1
+protocol and the greeter and theme APIs:
+.UR https://quinnjr.github.io/wdm/
+.UE
+.SH BUGS
+The DRM path has had little exposure to real hardware. Report issues at
+.UR https://github.com/quinnjr/wdm/issues
+.UE

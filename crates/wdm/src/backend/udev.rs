@@ -233,6 +233,70 @@ fn pump(
     Ok(None)
 }
 
+/// Make `vt` the foreground VT.
+///
+/// Runs before the seat is opened, because seatd binds a client's session to
+/// whichever VT is foreground at that moment (`client->session = seat->cur_vt`)
+/// rather than allocating one. A client that opens the seat on tty1 and then
+/// asks to switch to tty7 does not move its session — it leaves it behind on a
+/// VT that is no longer in front, which deactivates it. An inactive session
+/// holds no DRM master, so every commit fails with EACCES and nothing is ever
+/// drawn. Doing it in this order means seatd registers wdm against the VT the
+/// greeter will actually appear on.
+///
+/// Deliberately not fatal. A machine where the switch fails still gets a
+/// greeter if it happens to be on the right VT already, and a display manager
+/// that refuses to start because of a VT ioctl is worse than one that tries.
+fn activate_vt(vt: u32) {
+    // ponytail: ioctls by hand rather than a VT crate — three constants and two
+    // calls, and the only alternative worth adding a dependency for would be
+    // one that also handled VT_PROCESS signal handshakes, which wdm leaves to
+    // libseat.
+    const VT_ACTIVATE: libc::c_ulong = 0x5606;
+    const VT_WAITACTIVE: libc::c_ulong = 0x5607;
+
+    // /dev/tty0 is the *current* VT whoever opens it, which is what makes it
+    // usable from a service with no controlling terminal of its own.
+    let console = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")
+    {
+        Ok(console) => console,
+        Err(e) => {
+            log::warn!("cannot open /dev/tty0 to switch to vt {vt}: {e}");
+            return;
+        }
+    };
+
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&console);
+
+    // SAFETY: both ioctls take an integer by value on a file descriptor this
+    // function owns, and neither reads or writes user memory.
+    unsafe {
+        if libc::ioctl(fd, VT_ACTIVATE, vt as libc::c_int) < 0 {
+            log::warn!(
+                "switching to vt {vt}: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Waiting matters: VT_ACTIVATE only queues the switch, and opening the
+        // seat before it completes would register the session against the VT
+        // being left rather than the one being entered.
+        if libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
+            log::warn!(
+                "waiting for vt {vt}: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+    }
+
+    log::info!("vt {vt} is foreground");
+}
+
 impl Udev {
     /// Take the seat, open the GPU, and register every event source.
     ///
@@ -244,6 +308,11 @@ impl Udev {
         data: &mut LoopData,
         vt: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Before the seat, not after. seatd hands a new client whatever VT is
+        // *currently* foreground — `client->session = seat->cur_vt` — so the
+        // only way to end up on wdm's own VT is to be standing on it already.
+        activate_vt(vt);
+
         let deadline = Instant::now() + SEAT_RETRY_TIMEOUT;
         let (session, notifier) = loop {
             match LibSeatSession::new() {
@@ -328,12 +397,13 @@ impl Udev {
 
         udev.open_device(&chosen, loop_handle, data)?;
 
-        // wdm's own VT. Requested after the device is up so the first thing the
-        // VT shows is the greeter, not a half-initialised screen.
-        if let Err(e) = udev.session.change_vt(vt as i32) {
-            // Not fatal: logind normally has us on the right VT already.
-            log::warn!("switching to vt {vt}: {e}");
-        }
+        // Deliberately no change_vt here. It used to run at this point, and it
+        // was the reason nothing ever appeared: seatd registers a session
+        // against the VT that was foreground when the seat was opened, so
+        // asking it to switch to a *different* VT switches away from the only
+        // VT wdm has a session on. The session goes inactive, every page flip
+        // fails with EACCES, and the screen stays black on a VT nobody claimed.
+        // The switch happens in `activate_vt`, before the seat exists.
 
         Ok(udev)
     }

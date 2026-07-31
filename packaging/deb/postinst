@@ -1,0 +1,15 @@
+#!/bin/sh
+# Debian has no file triggers for sysusers.d or tmpfiles.d — Fedora's systemd
+# package runs both automatically on install, Debian's does not — so the
+# greeter account and its state directory are created here instead.
+set -e
+
+if [ "$1" = configure ]; then
+    systemd-sysusers /usr/lib/sysusers.d/wdm.conf >/dev/null 2>&1 || true
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf >/dev/null 2>&1 || true
+
+    # Deliberately not enabling wdm.service. A machine being installed onto
+    # already has a display manager, and enabling a second one that claims
+    # display-manager.service is how a boot ends with no login screen at all.
+    :
+fi
