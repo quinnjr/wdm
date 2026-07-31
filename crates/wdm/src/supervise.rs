@@ -86,6 +86,34 @@ struct Credentials {
     home: PathBuf,
 }
 
+/// Create the runtime directory the greeter and the socket live in.
+///
+/// Owned by the greeter user and `0700`, so no other unprivileged process can
+/// reach the Wayland socket. The socket's own permissions are the trust
+/// boundary for authentication, and this is the outer half of it.
+///
+/// A free function rather than a method because it has to run *before* the
+/// socket is created, which is before the socket has a name to build a
+/// [`Greeter`] with.
+pub fn prepare_runtime_dir(owner: Option<(libc::uid_t, libc::gid_t)>) -> Result<(), GreeterError> {
+    // Unprivileged: the existing XDG_RUNTIME_DIR is already the user's.
+    let Some((uid, gid)) = owner else {
+        return Ok(());
+    };
+
+    let dir = Path::new(RUNTIME_DIR);
+    let wrap = |e: std::io::Error| GreeterError::RuntimeDir(dir.to_owned(), e);
+
+    std::fs::create_dir_all(dir).map_err(wrap)?;
+
+    let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o700);
+    std::fs::set_permissions(dir, permissions).map_err(wrap)?;
+
+    std::os::unix::fs::chown(dir, Some(uid), Some(gid)).map_err(wrap)?;
+
+    Ok(())
+}
+
 impl Greeter {
     /// Resolve the greeter's account and command.
     ///
@@ -132,31 +160,6 @@ impl Greeter {
             rapid_failures: 0,
             gave_up: false,
         })
-    }
-
-    /// Create the runtime directory the greeter and socket live in.
-    ///
-    /// Owned by the greeter user and `0700`, so no other unprivileged process
-    /// can reach the Wayland socket. The socket's own permissions are the
-    /// trust boundary for authentication, and this is the outer half of it.
-    pub fn prepare_runtime_dir(&self) -> Result<(), GreeterError> {
-        let Some(credentials) = &self.credentials else {
-            // Unprivileged: the existing XDG_RUNTIME_DIR is already the user's.
-            return Ok(());
-        };
-
-        let dir = Path::new(RUNTIME_DIR);
-        let wrap = |e: std::io::Error| GreeterError::RuntimeDir(dir.to_owned(), e);
-
-        std::fs::create_dir_all(dir).map_err(wrap)?;
-
-        let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o700);
-        std::fs::set_permissions(dir, permissions).map_err(wrap)?;
-
-        std::os::unix::fs::chown(dir, Some(credentials.uid), Some(credentials.gid))
-            .map_err(wrap)?;
-
-        Ok(())
     }
 
     /// Whether wdm has stopped trying to run a greeter.

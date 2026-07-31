@@ -42,33 +42,38 @@ pub fn build(
 
     let handle = display.handle();
 
+    // The greeter account, resolved before the socket exists because the socket
+    // has to belong to it.
+    let greeter_credentials = if privileged {
+        let user = uzers::get_user_by_name(&greeter_user)
+            .ok_or_else(|| format!("greeter user {greeter_user} does not exist"))?;
+        Some((user.uid(), user.primary_group_id()))
+    } else {
+        None
+    };
+
+    // The directory has to exist and be the greeter's before the socket is
+    // created in it, not after: the socket inherits nothing from a chown that
+    // happens later.
+    crate::supervise::prepare_runtime_dir(greeter_credentials)?;
+
     let socket = ListeningSocketSource::new_auto()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
 
     // The uid allowed to connect. Everything on this socket is trusted to the
     // extent that it can drive a PAM conversation, so the greeter account is the
     // only thing that may speak on it.
-    let expected_uid = if privileged {
-        uzers::get_user_by_name(&greeter_user)
-            .map(|u| u.uid())
-            .ok_or_else(|| format!("greeter user {greeter_user} does not exist"))?
-    } else {
+    let expected_uid = match greeter_credentials {
+        Some((uid, _)) => uid,
         // SAFETY: getuid cannot fail and touches no memory.
-        unsafe { libc::getuid() }
+        None => unsafe { libc::getuid() },
     };
 
-    // Mode 0600 on the socket itself, not just 0700 on the directory holding it.
-    // Two independent controls rather than one: a directory mode is a property
-    // of the path, and anything that can already reach the path — a bind mount,
-    // a stray chmod, a process that inherited a directory fd — is then
-    // unrestricted.
     let socket_path = std::path::Path::new(&runtime_dir).join(&socket_name);
-    if let Err(e) = std::fs::set_permissions(
-        &socket_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    ) {
-        // Fatal: continuing would leave the socket world-accessible while the
-        // spec promises otherwise, which is worse than refusing to start.
+    if let Err(e) = secure_socket(&socket_path, greeter_credentials) {
+        // Fatal both ways. Loose permissions would leave the socket reachable
+        // while the spec promises otherwise; the wrong owner leaves the greeter
+        // unable to connect at all.
         return Err(format!("securing {}: {e}", socket_path.display()).into());
     }
 
@@ -147,7 +152,6 @@ pub fn build(
     );
 
     let greeter = Greeter::new(&greeter_command, &greeter_user, &socket_name, privileged)?;
-    greeter.prepare_runtime_dir()?;
 
     let state = Wdm::new(&handle, config, login, greeter)?;
     Login::create_global(&handle);
@@ -203,9 +207,83 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
     Ok(cred.uid)
 }
 
+
+
+/// Lock the socket to the greeter account.
+///
+/// Two independent controls rather than one: `0700` on the directory is a
+/// property of the path, and anything that can already reach the path — a bind
+/// mount, a stray chmod, a process that inherited a directory fd — is then
+/// unrestricted.
+///
+/// The owner is the half that is easy to forget, and forgetting it does not
+/// weaken the socket, it breaks it: `0600` describes the *owner*, wdm is root,
+/// and `connect(2)` needs write permission, so an unprivileged greeter is
+/// refused by the kernel before it can say anything. It only happens once
+/// privileges are actually split — in development wdm and the greeter are the
+/// same user — so it first appears on a real machine at boot, as a greeter that
+/// exits immediately with "Failed to open display".
+fn secure_socket(
+    path: &std::path::Path,
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn a_secured_socket_belongs_to_the_greeter() {
+        let dir = std::env::temp_dir().join(format!("wdm-socket-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        // Chowning to who we already are: the call still has to happen and
+        // still has to name the socket rather than the directory, which is what
+        // this pins down. Running the test as root would not make it stricter.
+        // SAFETY: neither call can fail nor touch memory.
+        let owner = unsafe { (libc::getuid(), libc::getgid()) };
+        secure_socket(&path, Some(owner)).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600, "socket is not 0600");
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            owner,
+            "socket does not belong to the greeter account"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unprivileged_leaves_ownership_alone() {
+        // Development: wdm already runs as the greeter user, and a chown to
+        // anyone would need privileges it does not have.
+        let dir = std::env::temp_dir().join(format!("wdm-socket-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        secure_socket(&path, None).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 
     #[test]
     fn peer_uid_reports_the_connecting_process() {
