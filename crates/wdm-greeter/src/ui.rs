@@ -116,10 +116,11 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     };
 
     let text_y = y + (field_height as f32 - BODY_SIZE) / 2.0 - 2.0;
-    text::draw(canvas, left + 8.0, text_y, BODY_SIZE, TEXT, &shown);
+    let shown = text::Shaped::new(&shown, BODY_SIZE);
+    shown.draw(canvas, left + 8.0, text_y, TEXT);
 
     // Caret, so an empty field still looks focused.
-    let caret_x = left + 8.0 + text::width(&shown, BODY_SIZE) + 1.0;
+    let caret_x = left + 8.0 + shown.width() + 1.0;
     canvas.rect(caret_x as i32, text_y as i32, 2, BODY_SIZE as i32, ACCENT);
 
     y += field_height as f32 + BODY_SIZE * 1.4;
@@ -144,11 +145,11 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     // The marker is what tells the user this is a control and not a label. Drawn
     // geometrically rather than as U+25BE, because the fonts wdm falls back to
     // are not guaranteed to have that glyph and a tofu box is worse than none.
-    let session_label = format!("Session: {current} ");
-    text::draw(canvas, left, footer_y, SMALL_SIZE, DIM, &session_label);
+    let session_label = text::Shaped::new(&format!("Session: {current} "), SMALL_SIZE);
+    session_label.draw(canvas, left, footer_y, DIM);
     triangle(
         canvas,
-        (left + text::width(&session_label, SMALL_SIZE)) as i32,
+        (left + session_label.width()) as i32,
         footer_y as i32 + (SMALL_SIZE / 2.0) as i32,
         7,
         DIM,
@@ -162,9 +163,9 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
         hints.push("F1 user");
     }
     hints.push("Esc clear");
-    let hint = hints.join("   ");
-    let hint_x = (panel_x + PANEL_WIDTH - PADDING) as f32 - text::width(&hint, SMALL_SIZE);
-    text::draw(canvas, hint_x, footer_y, SMALL_SIZE, DIM, &hint);
+    let hint = text::Shaped::new(&hints.join("   "), SMALL_SIZE);
+    let hint_x = (panel_x + PANEL_WIDTH - PADDING) as f32 - hint.width();
+    hint.draw(canvas, hint_x, footer_y, DIM);
 
     // Drawn last so it sits over everything, and outside the panel bounds so a
     // long list is not clipped by the panel.
@@ -210,8 +211,9 @@ pub fn menu_origin(anchor_y: i32, menu_height: i32, canvas_height: i32, row_heig
 
 /// Which slice of the session list to show.
 ///
-/// Keeps the selected row inside the visible window, scrolling only when the
-/// selection would fall outside it, so short lists never move.
+/// A list that fits is shown whole and never moves. A longer one keeps the
+/// selection centred, clamped at either end, so there is always as much
+/// context visible around the selected row as the list allows.
 pub fn menu_window(len: usize, selected: usize, rows: usize) -> std::ops::Range<usize> {
     if len <= rows {
         return 0..len;
@@ -265,16 +267,12 @@ fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>) 
     // A hint that there is more above or below, so a scrolled list does not look
     // like the whole list.
     if scrolls {
-        let more = format!("{}/{}", view.session_index + 1, view.sessions.len());
-        let more_x = (x + width) as f32 - text::width(&more, SMALL_SIZE) - 8.0;
-        text::draw(
-            canvas,
-            more_x,
-            (y + height) as f32 - SMALL_SIZE - 2.0,
+        let more = text::Shaped::new(
+            &format!("{}/{}", view.session_index + 1, view.sessions.len()),
             SMALL_SIZE,
-            DIM,
-            &more,
         );
+        let more_x = (x + width) as f32 - more.width() - 8.0;
+        more.draw(canvas, more_x, (y + height) as f32 - SMALL_SIZE - 2.0, DIM);
     }
 }
 

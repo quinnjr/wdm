@@ -54,7 +54,15 @@ Either
 .B udev
 (real hardware: DRM/KMS, libinput, libseat) or
 .B winit
-(nested inside an existing Wayland session, as a window). Defaults to
+(nested inside an existing Wayland session, as a window).
+.B drm
+and
+.B nested
+are accepted as aliases for
+.B udev
+and
+.B winit
+respectively. Defaults to
 .B udev
 when running as root and
 .B winit

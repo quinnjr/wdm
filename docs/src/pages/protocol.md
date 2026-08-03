@@ -19,14 +19,32 @@ wdm pushes state on bind. The greeter issues no requests.
 
 | Event | Meaning |
 | --- | --- |
-| `user(name, display_name, avatar_path, last_session)` | A loginable account. Filtered to `uid >= UID_MIN` from `/etc/login.defs`, with a shell not in the nologin set. `display_name` comes from GECOS. |
-| `session(id, name, exec, type)` | `type` is `wayland` or `x11`. Scanned from `wayland-sessions` and `xsessions` under `/usr/local/share` then `/usr/share`. |
+| `user(name, display_name, avatar_path, last_session)` | A loginable account. Filtered to `uid >= UID_MIN` from `/etc/login.defs`, with a shell not in the nologin set. `display_name` comes from GECOS. `last_session` is the session id from this user's last successful login — on version 2 it is that history and nothing else, empty for a first-time user. |
+| `session(id, name, exec, type)` | `type` is `wayland` or `x11`. Scanned from `wayland-sessions` and `xsessions` under `/usr/local/share` then `/usr/share`. Ids are unique across both types — `start_session` looks up by id alone — so a Wayland session shadows an X11 session with the same id, and a local entry shadows the distribution's. |
+| `default_session(id)` | **Since version 2.** The session id the configuration names as the machine-wide default, empty when none is set. The fallback a greeter may preselect for a user with no `last_session`; preselection is the greeter's policy. |
 | `output_rank(wl_output, rank)` | Rank 0 is primary. |
 | `last_error(text)` | Only when the previous launch attempt failed. |
 | `done` | Initial state complete. |
 
 `last_error` exists so a user whose session failed to start is told why, instead
 of being bounced back to a login prompt with no explanation.
+
+## Versions
+
+The interface is at **version 2**. Version 2 added `default_session` and with it
+split two things version 1 conflated: `last_session` is now the user's own
+history alone, where in version 1 it carried the configured default when the
+user had no history.
+
+A greeter bound at version 1 gets the version 1 meaning — wdm substitutes the
+configured default into `last_session` for it, because it has no other way to
+learn one — and never receives `default_session`. Bind
+`min(2, advertised_version)`.
+
+`default_session` is listed **last** in the XML, after `auth_failed`, rather
+than in the position it is documented in above. Version negotiation is what
+actually protects an older peer; the ordering is belt and braces, so that every
+event a version 1 greeter knows keeps the opcode it was compiled against.
 
 ## Authenticate
 
@@ -77,11 +95,12 @@ that user.
 
 | Error | Raised when |
 | --- | --- |
-| `auth_in_progress` | `create_session` while a conversation is live, or a second bind of the global. |
+| `auth_in_progress` | `create_session` while a conversation is live. |
 | `no_auth` | `respond` or `start_session` outside an authenticated state. |
 | `stale_prompt` | `respond` carried an id that is not the pending prompt. |
 | `invalid_session` | `start_session` named a session that was never advertised. |
 | `invalid_env` | The `env` array is malformed. |
+| `already_bound` | A second `wdm_greeter_v1` object was bound while one is still alive. |
 
 ## Output ranking
 

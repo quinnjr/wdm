@@ -26,7 +26,9 @@ cargo generate-rpm -p crates/wdm         # target/generate-rpm/*.rpm
 ```
 
 Packaging for all three distributions installs the same files from
-`packaging/`. The deb and rpm metadata lives in each crate's `Cargo.toml`
+`packaging/`, except the PAM stack, which is per-distribution: `pam.d-wdm`
+(Arch), `pam.d-wdm.debian`, and `pam.d-wdm.fedora`, because each distro spells
+its common PAM stack differently. The deb and rpm metadata lives in each crate's `Cargo.toml`
 rather than in a `debian/` directory and a `.spec`, because neither
 `dpkg-buildpackage` nor `rpmbuild` runs on Arch, and packaging that cannot be
 built here is packaging that never gets checked.

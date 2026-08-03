@@ -1,8 +1,11 @@
 # The greeter runs unprivileged. Declaring the account here rather than in a
-# post-install script means it is created the same way on every distribution
-# and removed when the package is.
+# post-install script means it is created the same way on every distribution.
+#
+# The home is /var/empty, not /var/lib/wdm: that directory is root-owned state
+# written by wdm itself (see wdm.tmpfiles), and an account's home should not be
+# a directory root writes into. The greeter never needs a writable home.
 #
 # The shell field is "-" rather than a path: nologin lives in /usr/bin on Arch
 # and /usr/sbin on Debian and Fedora, and systemd substitutes its own build-time
 # default, which is right on each.
-u wdm - "wdm greeter" /var/lib/wdm -
+u wdm - "wdm greeter" /var/empty -

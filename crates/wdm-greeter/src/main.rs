@@ -6,7 +6,8 @@
 //! makes it a readable example of the protocol.
 //!
 //! Policy this greeter chooses, which the protocol deliberately leaves open: it
-//! draws only on the rank 0 output, and preselects each user's last session.
+//! draws only on the rank 0 output, and preselects each user's last session,
+//! falling back to the machine default for a user with no history.
 
 mod text;
 mod ui;
@@ -36,6 +37,13 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use wdm_protocol::client::wdm_greeter_v1::{self, WdmGreeterV1};
 
 use text::Canvas;
+
+/// The highest `wdm_greeter_v1` version this greeter understands.
+///
+/// Version 2 is where `default_session` appears. Binding lower would leave the
+/// machine-default fallback in [`App::select_last_session`] unreachable, because
+/// the compositor never sends an event a resource is not bound high enough for.
+const GREETER_VERSION: u32 = 2;
 
 /// A user advertised by the enumerate phase.
 struct User {
@@ -172,6 +180,12 @@ struct App {
 
     users: Vec<User>,
     sessions: Vec<Session>,
+    /// Session names in `sessions` order, built once when `done` arrives; the
+    /// list is immutable after the enumerate phase, so `draw` borrows it
+    /// rather than rebuilding it every frame.
+    session_names: Vec<String>,
+    /// The machine default session id, empty when the machine has none.
+    default_session: String,
     /// The rank 0 output, once wdm has said which it is.
     primary: Option<WlOutput>,
     ready: bool,
@@ -187,7 +201,15 @@ struct App {
     launching: bool,
     /// True while a `create_session` is outstanding.
     authenticating: bool,
+    /// True once PAM explained itself mid-conversation (an Info or Error
+    /// prompt, such as faillock's lockout notice). Suppresses the automatic
+    /// retry on `auth_failed`, which would scroll the explanation away.
+    blocked: bool,
 
+    /// The frame's pixels, reused across frames and rebuilt only on resize.
+    /// `ui::paint` overwrites every pixel, so it needs no clearing between
+    /// frames.
+    canvas: Option<Canvas>,
     xkb: Option<xkbcommon::xkb::State>,
 
     exit: bool,
@@ -210,6 +232,8 @@ impl App {
             configured: false,
             users: Vec::new(),
             sessions: Vec::new(),
+            session_names: Vec::new(),
+            default_session: String::new(),
             primary: None,
             ready: false,
             user_index: 0,
@@ -221,15 +245,21 @@ impl App {
             info: None,
             launching: false,
             authenticating: false,
+            blocked: false,
+            canvas: None,
             xkb: None,
             exit: false,
             needs_redraw: true,
         }
     }
 
-    /// Preselect the session this user last used, falling back to the first.
+    /// Preselect a session for the current user: their history first, the
+    /// machine default when they have none, the first session otherwise.
     ///
-    /// wdm reports `last_session`; applying it is the greeter's choice.
+    /// wdm reports `last_session` and `default_session`; applying them is the
+    /// greeter's choice. `last_session` is honestly empty for a user who has
+    /// never logged in, so the machine default is a fallback this greeter
+    /// applies itself rather than something wdm folds into the user's history.
     fn select_last_session(&mut self) {
         let Some(user) = self.users.get(self.user_index) else {
             return;
@@ -238,6 +268,11 @@ impl App {
             .sessions
             .iter()
             .position(|s| s.id == user.last_session)
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|s| s.id == self.default_session)
+            })
             .unwrap_or(0);
     }
 
@@ -253,6 +288,9 @@ impl App {
         self.answer.clear();
         self.prompt = None;
         self.info = None;
+        // A new attempt is underway, so whatever PAM said about the last one
+        // no longer blocks anything.
+        self.blocked = false;
         self.authenticating = true;
         greeter.create_session(user.name.clone());
         self.needs_redraw = true;
@@ -357,6 +395,74 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Record a message from the conversation.
+    fn pam_prompt(&mut self, id: u32, text: String, style: wdm_greeter_v1::PromptStyle) {
+        use wdm_greeter_v1::PromptStyle;
+        match style {
+            // Neither expects an answer. Both are PAM explaining itself —
+            // faillock's lockout notice arrives this way — so both suppress
+            // the automatic retry that would scroll the explanation away.
+            PromptStyle::Info => {
+                self.info = Some(text);
+                self.blocked = true;
+            }
+            PromptStyle::Error => {
+                self.error = Some(text);
+                self.blocked = true;
+            }
+            style => {
+                self.prompt = Some(Prompt {
+                    id,
+                    text,
+                    secret: style == PromptStyle::Secret,
+                });
+                self.answer.clear();
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Whether a failed conversation should be restarted without a keypress.
+    ///
+    /// Auto-retry is a convenience for the mistyped-password case. When PAM
+    /// explained the failure — an account locked with minutes left on the
+    /// clock — restarting would clear that explanation from the screen and
+    /// reset the form under the user, so the failure is left standing and
+    /// Enter starts the next attempt deliberately.
+    fn should_auto_retry(&self) -> bool {
+        !self.blocked
+    }
+
+    /// React to `auth_failed`: show the reason, and say whether the caller
+    /// should start the next attempt.
+    ///
+    /// The decision is returned rather than acted on here so that it is
+    /// observable: a test can assert the retry without a compositor to talk to,
+    /// which a self-contained `begin_auth()` call could not offer.
+    #[must_use]
+    fn auth_failed(&mut self, reason: String) -> bool {
+        self.authenticating = false;
+        self.prompt = None;
+        self.answer.clear();
+        // A conversation that already explained itself keeps its explanation:
+        // `pam_prompt` routed PAM's own error text here, and "Authentication
+        // failure" is strictly less informative than "account locked, 10
+        // minutes left".
+        if !self.blocked {
+            self.error = Some(reason);
+        }
+        self.needs_redraw = true;
+        // Retrying asks again so the user can have another go without pressing
+        // anything.
+        //
+        // wdm delays each failure response, and the delay grows, so this
+        // converges rather than spinning — but the first failure of a
+        // conversation is reported with no delay at all, so a PAM stack
+        // that denies instantly does produce one uncontrolled round trip
+        // before the backoff engages.
+        self.should_auto_retry()
+    }
+
     /// Launch the selected session; valid only after `auth_ok`.
     fn start_session(&mut self) {
         let (Some(greeter), Some(session)) = (&self.greeter, self.sessions.get(self.session_index))
@@ -415,7 +521,7 @@ impl App {
         self.layer_surface = Some(layer_surface);
     }
 
-    /// Draw a frame into a fresh shm buffer and attach it.
+    /// Paint the frame and attach it from a free slot of the shm pool.
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         if !self.configured || self.width <= 0 || self.height <= 0 {
             return;
@@ -424,25 +530,32 @@ impl App {
             return;
         };
 
-        let mut canvas = Canvas::new(self.width, self.height);
+        // Reused across frames: a fresh canvas per frame meant a full-screen
+        // allocation and memset per keystroke, ~8MB of each at 4K.
+        if self
+            .canvas
+            .as_ref()
+            .is_none_or(|c| (c.width, c.height) != (self.width, self.height))
+        {
+            self.canvas = Some(Canvas::new(self.width, self.height));
+        }
+        let canvas = self.canvas.as_mut().expect("just ensured above");
 
         if !self.ready {
-            ui::paint_message(&mut canvas, "Connecting…", false);
+            ui::paint_message(canvas, "Connecting…", false);
         } else if self.users.is_empty() {
-            ui::paint_message(&mut canvas, "No users available to log in", true);
+            ui::paint_message(canvas, "No users available to log in", true);
         } else if self.sessions.is_empty() {
-            ui::paint_message(&mut canvas, "No sessions installed", true);
+            ui::paint_message(canvas, "No sessions installed", true);
         } else {
             let user = &self.users[self.user_index];
-            let session_names: Vec<String> =
-                self.sessions.iter().map(|s| s.name.clone()).collect();
 
             ui::paint(
-                &mut canvas,
+                canvas,
                 &ui::View {
                     username: &user.name,
                     display_name: &user.display_name,
-                    sessions: &session_names,
+                    sessions: &self.session_names,
                     session_index: self.session_index,
                     menu_open: self.menu_open,
                     prompt: self.prompt.as_ref().map(|p| p.text.as_str()),
@@ -493,10 +606,11 @@ impl App {
         slot.busy.store(true, Ordering::Relaxed);
         surface.attach(Some(&slot.buffer), 0, 0);
         // ponytail: whole-surface damage and a whole-surface repaint. The
-        // allocation and fd churn are gone and glyphs are cached, so what
-        // remains is one memset plus a redraw of a mostly-static form per
-        // keystroke. Track a dirty rect for the answer field if that ever shows
-        // up in a profile.
+        // allocation and fd churn are gone — the canvas persists across frames
+        // and glyphs are cached — so what remains per keystroke is a redraw of
+        // a mostly-static form plus one full-frame copy into the pool. Track a
+        // dirty rect for the answer field, or mmap the pool and paint into the
+        // slot directly, if either ever shows up in a profile.
         surface.damage_buffer(0, 0, self.width, self.height);
         surface.commit();
 
@@ -576,7 +690,10 @@ impl Dispatch<WlRegistry, ()> for App {
                 "zwlr_layer_shell_v1" => {
                     state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
                 }
-                "wdm_greeter_v1" => state.greeter = Some(registry.bind(name, 1, qh, ())),
+                "wdm_greeter_v1" => {
+                    state.greeter =
+                        Some(registry.bind(name, version.min(GREETER_VERSION), qh, ()));
+                }
                 "wl_seat" => {
                     registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ());
                 }
@@ -622,6 +739,10 @@ impl Dispatch<WdmGreeterV1, ()> for App {
                 state.sessions.push(Session { id, name });
             }
 
+            wdm_greeter_v1::Event::DefaultSession { id } => {
+                state.default_session = id;
+            }
+
             wdm_greeter_v1::Event::OutputRank { output, rank } => {
                 if rank != 0 || state.primary.as_ref() == Some(&output) {
                     return;
@@ -652,27 +773,17 @@ impl Dispatch<WdmGreeterV1, ()> for App {
 
             wdm_greeter_v1::Event::Done => {
                 state.ready = true;
+                // The session list is final now, so the names the frame needs
+                // are built once here rather than cloned every repaint.
+                state.session_names = state.sessions.iter().map(|s| s.name.clone()).collect();
                 state.select_last_session();
                 state.begin_auth();
             }
 
-            wdm_greeter_v1::Event::Prompt { id, text, style } => {
-                use wdm_greeter_v1::PromptStyle;
-                match style.into_result() {
-                    Ok(PromptStyle::Info) => state.info = Some(text),
-                    Ok(PromptStyle::Error) => state.error = Some(text),
-                    Ok(style) => {
-                        state.prompt = Some(Prompt {
-                            id,
-                            text,
-                            secret: style == PromptStyle::Secret,
-                        });
-                        state.answer.clear();
-                    }
-                    Err(e) => log::warn!("unknown prompt style: {e}"),
-                }
-                state.needs_redraw = true;
-            }
+            wdm_greeter_v1::Event::Prompt { id, text, style } => match style.into_result() {
+                Ok(style) => state.pam_prompt(id, text, style),
+                Err(e) => log::warn!("unknown prompt style: {e}"),
+            },
 
             wdm_greeter_v1::Event::AuthOk => {
                 state.authenticating = false;
@@ -681,19 +792,9 @@ impl Dispatch<WdmGreeterV1, ()> for App {
             }
 
             wdm_greeter_v1::Event::AuthFailed { reason } => {
-                state.authenticating = false;
-                state.prompt = None;
-                state.answer.clear();
-                state.error = Some(reason);
-                state.needs_redraw = true;
-                // Ask again so the user can retry without pressing anything.
-                //
-                // wdm delays each failure response, and the delay grows, so this
-                // converges rather than spinning — but the first failure of a
-                // conversation is reported with no delay at all, so a PAM stack
-                // that denies instantly does produce one uncontrolled round trip
-                // before the backoff engages.
-                state.begin_auth();
+                if state.auth_failed(reason) {
+                    state.begin_auth();
+                }
             }
 
             _ => {}
@@ -916,4 +1017,180 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wdm_greeter_v1::PromptStyle;
+    use xkbcommon::xkb::{Keysym, keysyms};
+
+    /// An `App` with no Wayland connection: every protocol object is `None`,
+    /// so the pure selection and conversation logic runs and anything that
+    /// would talk to the compositor returns early.
+    fn app() -> App {
+        let mut app = App::new();
+        app.sessions = ["sway", "gnome", "plasma"]
+            .iter()
+            .map(|id| Session {
+                id: (*id).to_owned(),
+                name: id.to_uppercase(),
+            })
+            .collect();
+        app.users = vec![User {
+            name: "alice".to_owned(),
+            display_name: String::new(),
+            last_session: "gnome".to_owned(),
+        }];
+        app
+    }
+
+    #[test]
+    fn selection_wraps_at_both_ends() {
+        let mut app = app();
+        app.session_index = 0;
+        app.move_selection(-1);
+        assert_eq!(app.session_index, 2);
+        app.move_selection(1);
+        assert_eq!(app.session_index, 0);
+        app.move_selection(1);
+        assert_eq!(app.session_index, 1);
+    }
+
+    #[test]
+    fn history_wins_when_the_session_is_known() {
+        let mut app = app();
+        app.default_session = "plasma".to_owned();
+        app.select_last_session();
+        assert_eq!(app.session_index, 1);
+    }
+
+    #[test]
+    fn empty_history_falls_back_to_the_machine_default() {
+        // Since the protocol stopped folding the machine default into
+        // `last_session`, a user with no history reports it honestly empty; the
+        // fallback to `default_session` is what preserves the old preselection.
+        let mut app = app();
+        app.users[0].last_session = String::new();
+        app.default_session = "plasma".to_owned();
+        app.select_last_session();
+        assert_eq!(app.session_index, 2);
+    }
+
+    #[test]
+    fn no_history_and_no_default_selects_the_first() {
+        let mut app = app();
+        app.users[0].last_session = "not-installed".to_owned();
+        app.session_index = 2;
+        app.select_last_session();
+        assert_eq!(app.session_index, 0);
+
+        // An unset default behaves the same as an unknown one.
+        app.default_session = "also-not-installed".to_owned();
+        app.session_index = 2;
+        app.select_last_session();
+        assert_eq!(app.session_index, 0);
+    }
+
+    #[test]
+    fn the_menu_consumes_enter_and_escape_and_nothing_printable() {
+        let mut app = app();
+        app.menu_open = true;
+        assert!(app.menu_key(Keysym::new(keysyms::KEY_Return)));
+        assert!(!app.menu_open, "Enter must close the menu");
+
+        app.menu_open = true;
+        assert!(app.menu_key(Keysym::new(keysyms::KEY_Escape)));
+        assert!(!app.menu_open, "Escape must close the menu");
+
+        // A printable key is not the menu's: it falls through to the answer
+        // field even while the menu is open.
+        app.menu_open = true;
+        assert!(!app.menu_key(Keysym::new(keysyms::KEY_a)));
+    }
+
+    #[test]
+    fn cycling_users_wraps_and_reselects_their_session() {
+        let mut app = app();
+        app.users.push(User {
+            name: "bob".to_owned(),
+            display_name: String::new(),
+            last_session: "plasma".to_owned(),
+        });
+
+        app.select_last_session();
+        assert_eq!(app.session_index, 1);
+
+        app.cycle_user();
+        assert_eq!(app.user_index, 1);
+        assert_eq!(app.session_index, 2, "bob's history must be applied");
+
+        app.cycle_user();
+        assert_eq!(app.user_index, 0, "cycling past the last user wraps");
+        assert_eq!(app.session_index, 1);
+    }
+
+    #[test]
+    fn a_pam_explanation_suppresses_the_auto_retry() {
+        // The defect this guards: with a faillock-locked account, PAM sends
+        // "the account is locked, 10 minutes left" and an unconditional retry
+        // would clear it from the screen while feeding the lock.
+        let mut app = app();
+        app.pam_prompt(
+            0,
+            "Account locked, 10 minutes left".to_owned(),
+            PromptStyle::Info,
+        );
+        assert!(!app.should_auto_retry());
+
+        assert!(
+            !app.auth_failed("Authentication failure".to_owned()),
+            "the retry must not be requested"
+        );
+        assert_eq!(
+            app.info.as_deref(),
+            Some("Account locked, 10 minutes left"),
+            "the explanation must stay on screen"
+        );
+    }
+
+    #[test]
+    fn an_unexplained_failure_still_retries() {
+        let mut app = app();
+        app.pam_prompt(0, "Password:".to_owned(), PromptStyle::Secret);
+        assert!(app.should_auto_retry(), "a question is not an explanation");
+        assert!(
+            app.auth_failed("Authentication failure".to_owned()),
+            "a bare failure is the mistyped-password case, so it retries"
+        );
+        assert_eq!(app.error.as_deref(), Some("Authentication failure"));
+    }
+
+    #[test]
+    fn error_style_prompts_also_block() {
+        let mut app = app();
+        app.pam_prompt(0, "Permission denied".to_owned(), PromptStyle::Error);
+        assert!(!app.should_auto_retry());
+        assert!(!app.auth_failed("Authentication failure".to_owned()));
+        assert_eq!(app.error.as_deref(), Some("Permission denied"));
+    }
+
+    #[test]
+    fn an_error_prompts_text_survives_the_generic_reason() {
+        // pam_faillock reports the lockout as a PAM_ERROR_MSG and the stack
+        // then fails with a generic reason. Overwriting `error` there would
+        // replace the only text that says why, leaving "Authentication
+        // failure" and no retry — worse than either alone.
+        let mut app = app();
+        app.pam_prompt(
+            0,
+            "Account locked due to 3 failed logins".to_owned(),
+            PromptStyle::Error,
+        );
+        assert!(!app.auth_failed("Authentication failure".to_owned()));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Account locked due to 3 failed logins")
+        );
+    }
 }

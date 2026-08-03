@@ -18,7 +18,10 @@ command = "/usr/lib/wdm/wdm-webkit-greeter --theme default"
 if it contains a `/`. A theme that cannot be found is a startup failure, not a
 fallback to the default: a misspelled name that silently shows something else is
 a configuration bug nobody notices until they are looking at the wrong login
-screen.
+screen. For the same reason a trailing `--theme` with no value, and `--theme`
+given twice, are errors as well: falling back to the default, or quietly taking
+the later of two values, shows a login screen other than the one that was asked
+for.
 
 The default theme is installed at
 `/usr/share/wdm/webkit-greeter/themes/default` and is the worked example of
@@ -34,6 +37,7 @@ works and there is no ready callback to wait for.
 |---|---|
 | `wdm.users` | `[{ name, display_name, last_session }]` |
 | `wdm.sessions` | `[{ id, name }]` |
+| `wdm.default_session` | the machine's configured default session id, `""` when unset |
 | `wdm.authentication_user` | who the current conversation is for, or `null` |
 | `wdm.is_authenticated` | whether the last conversation succeeded |
 | `wdm.in_authentication` | whether one is in progress |
@@ -69,8 +73,14 @@ The greeter has no policy of its own. It does not preselect a session, does not
 retry, and does not decide what a failure looks like — a greeter that decided
 those would be fighting every theme that disagreed. So a theme must:
 
-- **Preselect a session.** `user.last_session` is what wdm recorded; the default
-  theme selects it when the user changes.
+- **Preselect a session.** wdm reports facts, not a choice: `user.last_session`
+  is what that user logged into last and nothing else — empty for somebody who
+  has never logged in, and never silently filled in with the machine's default —
+  while `wdm.default_session` is what the configuration names for everyone. The
+  default theme walks the chain history → `wdm.default_session` → first entry,
+  and assigns only an id it has found in `wdm.sessions`: a recorded id can name
+  a session that has since been uninstalled, and setting a `<select>` to a value
+  no `<option>` carries leaves the dropdown showing nothing at all.
 - **Restart the conversation when the user changes.** PAM's is per user, and a
   half-answered one for somebody else cannot be reused.
 - **Keep `show_message` on screen past `authentication_complete`.** This is

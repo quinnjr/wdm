@@ -10,7 +10,7 @@ use gtk4::{
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell, KeyboardMode};
 
-use wdm_greeter_client::{Shared, SharedLink};
+use wdm_greeter_client::{Model, Shared, SharedLink};
 
 const STYLE: &str = "
 window { background: #12131a; }
@@ -78,6 +78,15 @@ pub struct Ui {
     /// Guards the automatic retry, so a user switch mid-flight does not stack
     /// conversations.
     attempting: Cell<bool>,
+    /// The user and session lists arrive exactly once, in the enumerate phase
+    /// Link::connect already waited for, so loading them is a latch. Asking the
+    /// DropDown whether its model was empty instead was permanently true on a
+    /// machine with zero users, so every revision change rebuilt both lists and
+    /// re-entered `begin_auth` through `notify::selected`.
+    lists_loaded: Cell<bool>,
+    /// Nesting depth of `flush`, which reaches `refresh`, which can flush again.
+    /// See [`Ui::flush`].
+    depth: Cell<u32>,
 }
 
 /// Build the window and wire it up.
@@ -142,14 +151,38 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
         applied: Cell::new(u64::MAX),
         launched: Cell::new(false),
         attempting: Cell::new(false),
+        lists_loaded: Cell::new(false),
+        depth: Cell::new(0),
     });
 
     window.set_child(Some(&layout(&ui)));
     connect(&ui);
 
+    // The enumerate phase can carry `last_error` — the compositor's account of
+    // why the previous session ended, e.g. a session that crashed straight back
+    // to the greeter. Both `begin_auth` below and the notify::selected handler
+    // that `reload_lists` fires call `begin_attempt`, which clears `error` for
+    // a fresh conversation — wiping the one message the user most needs before
+    // it is ever painted. Snapshot it now and put it back afterwards.
+    //
+    // These four statements — snapshot, reload_lists, begin_auth, restore — are
+    // what `an_enumerate_phase_error_survives_the_automatic_first_attempt`
+    // stands in for; it cannot drive them directly because reload_lists and
+    // begin_auth need a display. Change the order here and change it there.
+    let enumerate_error = ui.model.borrow().error.clone();
+
     // Populate from the enumerate phase that Link::connect already collected.
     ui.reload_lists();
     ui.begin_auth();
+
+    restore_enumerate_error(&mut ui.model.borrow_mut(), enumerate_error.clone());
+    if let Some(text) = &enumerate_error {
+        // First paint shows the failure while the password prompt is ready;
+        // refresh() keeps it up because the model holds it again, until the
+        // user deliberately starts another attempt.
+        ui.error.set_label(text);
+        ui.error.set_visible(true);
+    }
 
     (window, ui)
 }
@@ -232,6 +265,13 @@ fn connect(ui: &Rc<Ui>) {
 impl Ui {
     /// Rebuild the user and session lists from the model.
     fn reload_lists(&self) {
+        // The latch is set *before* the first widget call, not after: `set_model`
+        // and `set_selected` below emit notify::selected synchronously, and that
+        // handler reaches begin_auth -> begin_attempt -> flush -> refresh, which
+        // would read a still-false latch and rebuild both lists a second time,
+        // discarding the selection this pass had just established.
+        self.lists_loaded.set(true);
+
         // Everything is read out first and the borrow released before any widget
         // is touched. `set_model` emits `notify::selected` *synchronously*, and
         // that handler re-enters this type and borrows the model again — holding
@@ -355,9 +395,38 @@ impl Ui {
     /// Push queued requests to the compositor.
     ///
     /// GTK's main loop does not know about our queue, so nothing else would.
+    /// When the pump also delivered events, the model has changed and waiting
+    /// for the next 16ms tick to show it is a needless frame of staleness — so
+    /// refresh here, after every borrow is released.
+    ///
+    /// That makes flush -> refresh -> flush a cycle: refresh's auto-retry branch
+    /// calls begin_auth and flushes again. The revision guard does *not* bound
+    /// it — begin_auth ends in begin_attempt, which bumps the revision, so the
+    /// guard never fires on the nested call. In practice it stops because a
+    /// request flushed a microsecond ago has no reply to dispatch yet and `pump`
+    /// returns false, which is a property of the Wayland round-trip rather than
+    /// anything this code enforces. `depth` enforces it: past a handful of
+    /// nested entries the retry is abandoned and the timer in main.rs picks the
+    /// model up on its next tick, 16ms later.
     fn flush(&self) {
-        let mut model = self.model.borrow_mut();
-        self.link.borrow_mut().pump(&mut model);
+        const MAX_DEPTH: u32 = 4;
+
+        let depth = self.depth.get();
+        if depth >= MAX_DEPTH {
+            log::error!("flush recursion bounded at {MAX_DEPTH}; deferring to the pump timer");
+            return;
+        }
+        self.depth.set(depth + 1);
+
+        let changed = {
+            let mut model = self.model.borrow_mut();
+            self.link.borrow_mut().pump(&mut model)
+        };
+        if changed {
+            self.refresh();
+        }
+
+        self.depth.set(depth);
     }
 
     /// Apply the model to the widgets.
@@ -368,18 +437,27 @@ impl Ui {
         }
         self.applied.set(revision);
 
-        // Lists only arrive once, on the enumerate phase.
-        if self.users.model().is_none_or(|m| m.n_items() == 0) {
+        // The lists arrive exactly once, in the enumerate phase Link::connect
+        // already waited for, so this is a latch rather than a comparison
+        // against what the DropDowns currently hold.
+        if !self.lists_loaded.get() {
             self.reload_lists();
         }
 
-        let (prompt, error, notice, authenticated, auto_retry) = {
+        // `conversation_over` matters as much as `notice`: refresh() must not
+        // relabel the form as waiting while PAM is mid-conversation. PAM can
+        // send an explanatory `info`/`error` prompt *during* a live attempt —
+        // that is what becomes `notice` — while the secret it is waiting on is
+        // still pending. The "wait for the user" branch below would otherwise
+        // clear the half-typed answer and pretend the attempt had ended.
+        let (prompt, error, notice, authenticated, conversation_over, auto_retry) = {
             let model = self.model.borrow();
             (
                 model.prompt.clone(),
                 model.error.clone(),
                 model.notice.clone(),
                 model.authenticated,
+                model.conversation_over,
                 model.should_auto_retry(),
             )
         };
@@ -419,12 +497,27 @@ impl Ui {
             self.prompt.set_label("");
             self.begin_auth();
             self.flush();
-        } else if notice.is_some() && !authenticated {
+        } else if conversation_over && notice.is_some() && !authenticated {
             // Waiting on the user instead. Say so, or the form looks stuck.
-            self.attempting.set(false);
-            self.prompt.set_label("Press Enter to try again");
-            self.entry.set_text("");
+            self.wait_for_user();
         }
+    }
+
+    /// Drop the form back to "your move": no attempt in flight, the entry live
+    /// again, and a prompt that says what to do next.
+    ///
+    /// Shared by the two places that end an attempt without starting another —
+    /// `refresh()`'s "PAM explained itself" branch and `launch()`'s no-session
+    /// fallback — so the state they leave behind cannot drift apart.
+    ///
+    /// Sensitivity is deliberately not touched: only `reload_lists` turns the
+    /// form off, and it does so because there is nothing on this machine to log
+    /// into. Re-enabling here would hand the user an entry that cannot lead
+    /// anywhere — which is exactly the state the no-session fallback is in.
+    fn wait_for_user(&self) {
+        self.attempting.set(false);
+        self.prompt.set_label("Press Enter to try again");
+        self.entry.set_text("");
     }
 
     fn launch(&self) {
@@ -433,7 +526,26 @@ impl Ui {
             return;
         };
         let Some(session) = model.session_id(self.sessions.selected() as usize) else {
+            // No request to send, and nothing will change on the next pump —
+            // leaving `authenticated` true would make refresh() re-enter this
+            // forever. Say why instead of pretending the attempt is still in
+            // flight, and drop back to the form.
+            //
+            // The message goes into the *model*, not straight onto the label:
+            // refresh() re-derives that label from `model.error` on every
+            // revision change, so a widget-only message is wiped by the next
+            // event and the user's correct password looks ignored. Wording
+            // matches wdm-greeter and the default webkit theme.
+            drop(model);
             log::error!("authenticated but no session is selected");
+            {
+                let mut m = self.model.borrow_mut();
+                m.error = Some("No sessions installed".to_owned());
+                m.authenticated = false;
+            }
+            self.error.set_label("No sessions installed");
+            self.error.set_visible(true);
+            self.wait_for_user();
             return;
         };
 
@@ -453,4 +565,68 @@ impl Ui {
 
 fn refs(items: &[String]) -> Vec<&str> {
     items.iter().map(String::as_str).collect()
+}
+
+/// Put the enumerate-phase `last_error` back after the first attempt cleared it.
+///
+/// `begin_attempt` rightly wipes `error` when the *user* starts over — they
+/// have read the message and chosen to move on. The attempt `build()` opens is
+/// automatic, though: nobody has read anything yet, so the compositor's account
+/// of why the last session ended must survive it. A message the model has since
+/// replaced wins over the snapshot, because it is newer.
+fn restore_enumerate_error(model: &mut Model, snapshot: Option<String>) {
+    if model.error.is_none() {
+        model.error = snapshot;
+    }
+}
+
+// What can be tested without a display is the decision logic above; the
+// widget-bound half — that the label is painted, that notify::selected
+// re-enters begin_auth — needs a GTK display and is exercised only by running
+// the greeter against wdm's winit backend.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_enumerate_phase_error_survives_the_automatic_first_attempt() {
+        // The defect this guards: build() ran reload_lists() and begin_auth(),
+        // and begin_auth ends in begin_attempt(), which sets error = None — so
+        // a user whose session crashed was bounced back to the prompt with no
+        // explanation of why.
+        //
+        // This replays build()'s snapshot -> begin_attempt -> restore sequence
+        // by hand, because reload_lists and begin_auth need a display and so
+        // build() itself cannot run here. What it pins is that begin_attempt
+        // still clears `error` (the reason the snapshot exists at all) and that
+        // restore_enumerate_error puts it back; the ordering in build() is
+        // pinned only by the comment there.
+        let mut model = Model::default();
+        model.error = Some("session ended: sway exited with status 1".to_owned());
+
+        let snapshot = model.error.clone();
+        // What begin_auth does on the way to the first conversation.
+        model.begin_attempt();
+        assert!(model.error.is_none(), "begin_attempt no longer clears error");
+
+        restore_enumerate_error(&mut model, snapshot);
+
+        // First paint must have visible text, not None.
+        assert_eq!(
+            model.error.as_deref(),
+            Some("session ended: sway exited with status 1")
+        );
+    }
+
+    #[test]
+    fn a_fresher_failure_is_not_overwritten_by_the_snapshot() {
+        // If a conversation already failed between the snapshot and the
+        // restore, its verdict is newer than the enumerate phase's and wins.
+        let mut model = Model::default();
+        model.error = Some("Authentication failure".to_owned());
+
+        restore_enumerate_error(&mut model, Some("session ended: crashed".to_owned()));
+
+        assert_eq!(model.error.as_deref(), Some("Authentication failure"));
+    }
 }

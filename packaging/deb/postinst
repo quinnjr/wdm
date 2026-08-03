@@ -8,6 +8,21 @@ if [ "$1" = configure ]; then
     systemd-sysusers /usr/lib/sysusers.d/wdm.conf >/dev/null 2>&1 || true
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf >/dev/null 2>&1 || true
 
+    # Make the freshly installed unit visible to systemd, so that a
+    # `systemctl enable wdm` typed right after install works. This reloads
+    # only; enabling stays the administrator's decision, per below.
+    #
+    # Guarded on /run/systemd/system rather than on the exit status: in a
+    # chroot or a container there is no PID 1 to talk to and the failure means
+    # nothing, but a malformed unit or a D-Bus failure on a real system is
+    # exactly what the administrator needs to hear about, and swallowing it
+    # leaves them with an `systemctl enable wdm` that fails for no visible
+    # reason. Non-fatal either way — an install must not abort over it.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload \
+            || echo "wdm: systemctl daemon-reload failed; run it before enabling wdm.service" >&2
+    fi
+
     # Deliberately not enabling wdm.service. A machine being installed onto
     # already has a display manager, and enabling a second one that claims
     # display-manager.service is how a boot ends with no login screen at all.

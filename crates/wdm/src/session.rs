@@ -18,7 +18,9 @@ use std::process::{Child, Command};
 
 use uzers::os::unix::UserExt;
 
-use crate::sessions::{Session, SessionType};
+// `SessionType` is no longer named here: the XDG_SESSION_* mapping lives on
+// `Session` so this module and auth.rs cannot drift apart on it.
+use crate::sessions::Session;
 
 /// Failure to prepare or launch a session.
 #[derive(Debug, thiserror::Error)]
@@ -330,15 +332,9 @@ fn build_env(
     set("XDG_SEAT", "seat0".to_owned());
     set("XDG_VTNR", vt.to_string());
     set("XDG_SESSION_CLASS", "user".to_owned());
-    set(
-        "XDG_SESSION_TYPE",
-        match session.session_type {
-            SessionType::Wayland => "wayland".to_owned(),
-            SessionType::X11 => "x11".to_owned(),
-        },
-    );
+    set("XDG_SESSION_TYPE", session.xdg_session_type().to_owned());
     // Desktops key their own configuration off this.
-    set("XDG_SESSION_DESKTOP", session.id.trim_end_matches(".desktop").to_owned());
+    set("XDG_SESSION_DESKTOP", session.xdg_session_desktop().to_owned());
 
     env
 }
@@ -377,6 +373,7 @@ fn greeter_may_set(key: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::SessionType;
     use std::path::Path;
 
     fn session(session_type: SessionType) -> Session {

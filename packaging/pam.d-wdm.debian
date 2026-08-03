@@ -1,0 +1,37 @@
+# PAM configuration for wdm — Debian and derivatives.
+#
+# Install as /etc/pam.d/wdm. The deb package does this; the Arch and Fedora
+# stacks live in pam.d-wdm and pam.d-wdm.fedora.
+#
+# Same shape as the Arch stack, but Debian has no system-login: the common
+# stack is split across the pam-auth-update managed common-* fragments, pulled
+# in with @include as the other Debian display managers do. common-session is
+# what brings in pam_systemd, which creates the logind session and
+# XDG_RUNTIME_DIR that wdm passes to the launched session; without it most
+# desktops will not start. pam_loginuid is not in any common-* fragment, so it
+# is listed here the way sddm and gdm list it.
+#
+# pam_env and pam_limits are in the same position: pam-auth-update generates
+# only permit, deny, umask, unix and systemd into the common-* fragments, so
+# every Debian login service lists these two itself, and a service that forgets
+# them differs from ssh and login without saying so. Without pam_env the
+# session gets no /etc/environment and no /etc/default/locale; without
+# pam_limits the caps in /etc/security/limits.conf — nproc, maxlogins, memlock,
+# nofile — apply on every other way into the machine but not on this one.
+
+auth        requisite   pam_nologin.so
+auth        required    pam_env.so readenv=1
+auth        required    pam_env.so readenv=1 envfile=/etc/default/locale
+@include common-auth
+-auth       optional    pam_gnome_keyring.so
+-auth       optional    pam_kwallet5.so
+
+@include common-account
+
+@include common-password
+
+session     required    pam_loginuid.so
+session     required    pam_limits.so
+@include common-session
+-session    optional    pam_gnome_keyring.so auto_start
+-session    optional    pam_kwallet5.so auto_start

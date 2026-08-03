@@ -3,6 +3,79 @@
 Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 [Semantic Versioning].
 
+## [Unreleased]
+
+### Added
+
+- **`default_session`, a new protocol event**, carrying the session id the
+  configuration names as the machine-wide default, or an empty string when none
+  is set. `wdm_greeter_v1` is now **version 2** and the event is gated
+  `since="2"`, so a greeter built against version 1 binds at 1 and never sees
+  it. It exists because preselection needs two facts and previously had one:
+  what this user last logged into, and what this machine defaults to.
+- **`window.wdm.default_session`** in the webkit greeter, and a default theme
+  that walks history → `default_session` → first entry, assigning only an id it
+  has actually found in `wdm.sessions`. A recorded id can name a session that
+  was uninstalled since, and a `<select>` set to a value no `<option>` carries
+  shows nothing at all.
+- **`already_bound`**, a protocol error of its own for a second
+  `wdm_greeter_v1` object bound while one is still alive. It was reported as
+  `auth_in_progress`, which described neither the mistake nor the fix.
+- **Per-distribution PAM stacks.** `packaging/pam.d-wdm` is Arch's and needs
+  `system-login`; `pam.d-wdm.debian` uses the pam-auth-update `common-*`
+  fragments and lists `pam_env` and `pam_limits` itself, because Debian's
+  common stack contains neither, and without them `/etc/environment` and
+  `/etc/security/limits.conf` applied to every way into the machine except the
+  graphical one; `pam.d-wdm.fedora` uses authselect's `system-auth` plus
+  `postlogin` and brackets its session stack with `pam_selinux.so`
+  close/open, without which the session wdm forks stays in wdm's own domain and
+  confined logins are silently unconfined.
+
+### Changed
+
+- **`user.last_session` is now honestly empty** for a user who has never logged
+  in. It previously stood in for the machine default, which made "this user's
+  history" and "this machine's configuration" indistinguishable to a greeter
+  that wanted to treat them differently. On a version 1 bind the old behaviour
+  is kept.
+- **`authentication_user` is nulled when a conversation fails**, so a theme
+  cannot read it as the user who is logged in.
+- **`--theme` is strict.** A trailing `--theme` with no value, and `--theme`
+  given twice, are startup errors rather than a fall back to the default —
+  the same reasoning as a misspelled theme name already followed.
+- **The greeter account's home is `/var/empty`**, not `/var/lib/wdm`. wdm sets
+  the greeter's working directory to it, so it must exist: Arch and Fedora ship
+  it in their base filesystem, and `packaging/wdm.tmpfiles` now declares it for
+  Debian, which does not.
+- **`wayland-protocols` is no longer a dependency of `wdm-protocol`.** Nothing
+  in the generated bindings referred to it. Greeter authors depending on the
+  crate no longer pull it in.
+
+### Fixed
+
+- The deb's `postinst` no longer discards `systemctl daemon-reload`'s
+  diagnostic. It is skipped when there is no running systemd — a chroot or a
+  container — and otherwise allowed to say what went wrong, instead of leaving
+  an administrator with a `systemctl enable wdm` that fails for no visible
+  reason.
+- The rpm now runs `systemd-sysusers` and `systemd-tmpfiles --create` from a
+  post-install scriptlet. Fedora's file triggers fire on the files being
+  installed, not on their contents changing, so an upgrade otherwise kept the
+  old directory ownership until the next boot.
+
+### Security
+
+- **`/var/lib/wdm` is root-owned.** It was owned by the unprivileged greeter
+  account, which handed that account a directory root creates and renames files
+  in — a symlink-attack surface, for a state directory the greeter never needs
+  to touch. **On upgrade**, the deb and the rpm both re-run
+  `systemd-tmpfiles --create`, which corrects the ownership in place; a machine
+  set up by hand should run `chown root:root /var/lib/wdm` itself.
+- **The greeter is killed by process group**, not by pid. It is made a session
+  leader at spawn, so anything it started — a helper, a shell wrapper — dies
+  with it rather than surviving into the user's session holding the greeter's
+  end of the protocol socket.
+
 ## [0.1.3] — 2026-07-31
 
 ### Fixed
@@ -121,6 +194,7 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
 [0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2
 [0.1.1]: https://github.com/quinnjr/wdm/releases/tag/v0.1.1

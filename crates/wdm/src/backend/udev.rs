@@ -191,6 +191,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         data.state.login.reset();
+        // As on every other greeter-death path: the old greeter's objects belong
+        // to a connection that is gone, and relying on its destroyed() being
+        // dispatched before the next greeter binds is timing, not a guarantee.
+        data.state.login.clear_bindings();
         data.state.running = true;
         log::info!("taking the seat back");
     }
@@ -216,6 +220,7 @@ fn pump(
             udev.render(data);
         }
 
+        // Flush what this pass generated before blocking; see LoopData::dispatch.
         if let Err(e) = data.dispatch() {
             log::error!("dispatching clients: {e}");
         }
@@ -871,41 +876,95 @@ fn pick_mode(
 ) -> Option<smithay::reexports::drm::control::Mode> {
     let modes = info.modes();
 
-    if let Some(wanted) = wanted {
-        let matching = modes.iter().find(|mode| {
-            let (w, h) = mode.size();
-            if w != wanted.width || h != wanted.height {
-                return false;
+    let candidates: Vec<ModeCandidate> = modes
+        .iter()
+        .map(|mode| {
+            let (width, height) = mode.size();
+            ModeCandidate {
+                width,
+                height,
+                vrefresh: mode.vrefresh(),
+                preferred: mode
+                    .mode_type()
+                    .contains(smithay::reexports::drm::control::ModeTypeFlags::PREFERRED),
             }
-            match wanted.refresh_mhz {
-                None => true,
-                // vrefresh is whole Hz, so compare against the millihertz value
-                // rounded, which is what makes 59.94 match a mode reporting 60.
-                Some(mhz) => {
-                    let reported = mode.vrefresh() * 1000;
-                    reported.abs_diff(mhz) < 1000
-                }
-            }
-        });
+        })
+        .collect();
 
-        match matching {
-            Some(mode) => return Some(*mode),
-            None => log::warn!(
-                "{}-{} does not support mode {wanted}, using its preferred mode",
-                info.interface().as_str(),
-                info.interface_id()
-            ),
+    let choice = select_mode(&candidates, wanted)?;
+
+    if choice.fell_back && let Some(wanted) = wanted {
+        log::warn!(
+            "{}-{} does not support mode {wanted}, using its preferred mode",
+            info.interface().as_str(),
+            info.interface_id()
+        );
+    }
+
+    modes.get(choice.index).copied()
+}
+
+/// A candidate mode reduced to the facts selection cares about.
+///
+/// `drm::control::Mode` only comes from the kernel's connector report, so the
+/// selection logic works on this instead — which is what lets it run in a test
+/// with no GPU.
+#[derive(Debug, Clone, Copy)]
+struct ModeCandidate {
+    width: u16,
+    height: u16,
+    /// Whole hertz, as the kernel reports vrefresh.
+    vrefresh: u32,
+    preferred: bool,
+}
+
+/// Which candidate to use, and whether a configured mode had to be abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModeChoice {
+    index: usize,
+    /// True only when a mode was configured and the connector does not report
+    /// it; the caller warns, because silently ignoring configuration is worse
+    /// than a fallback the user was told about.
+    fell_back: bool,
+}
+
+/// The selection behind [`pick_mode`], pure so it is testable.
+fn select_mode(modes: &[ModeCandidate], wanted: Option<config::Mode>) -> Option<ModeChoice> {
+    if let Some(wanted) = wanted {
+        // vrefresh is whole Hz, so compare in millihertz with a one-hertz
+        // tolerance — that is what makes a configured 59.94 match a mode the
+        // kernel reports as 60. Among modes inside the tolerance the closest
+        // wins, so an exact rate is never lost to an earlier near miss.
+        let matching = modes
+            .iter()
+            .enumerate()
+            .filter(|(_, mode)| mode.width == wanted.width && mode.height == wanted.height)
+            .filter_map(|(index, mode)| match wanted.refresh_mhz {
+                None => Some((index, 0)),
+                Some(mhz) => {
+                    let diff = (mode.vrefresh * 1000).abs_diff(mhz);
+                    (diff < 1000).then_some((index, diff))
+                }
+            })
+            .min_by_key(|&(_, diff)| diff);
+
+        if let Some((index, _)) = matching {
+            return Some(ModeChoice {
+                index,
+                fell_back: false,
+            });
         }
     }
 
-    modes
+    let index = modes
         .iter()
-        .find(|mode| {
-            mode.mode_type()
-                .contains(smithay::reexports::drm::control::ModeTypeFlags::PREFERRED)
-        })
-        .or_else(|| modes.first())
-        .copied()
+        .position(|mode| mode.preferred)
+        .or_else(|| (!modes.is_empty()).then_some(0))?;
+
+    Some(ModeChoice {
+        index,
+        fell_back: wanted.is_some(),
+    })
 }
 
 /// Find a CRTC this connector can drive that is not already in use.
@@ -938,5 +997,148 @@ fn transform_of(transform: config::Transform) -> smithay::utils::Transform {
         config::Transform::Flipped90 => T::Flipped90,
         config::Transform::Flipped180 => T::Flipped180,
         config::Transform::Flipped270 => T::Flipped270,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode(width: u16, height: u16, vrefresh: u32, preferred: bool) -> ModeCandidate {
+        ModeCandidate {
+            width,
+            height,
+            vrefresh,
+            preferred,
+        }
+    }
+
+    fn wanted(width: u16, height: u16, refresh_mhz: Option<u32>) -> Option<config::Mode> {
+        Some(config::Mode {
+            width,
+            height,
+            refresh_mhz,
+        })
+    }
+
+    #[test]
+    fn a_configured_59_94_matches_a_mode_reporting_60() {
+        // The defect this guards: comparing millihertz for equality. The kernel
+        // reports vrefresh in whole hertz, so 59940 must match a 60.
+        let modes = [mode(1920, 1080, 60, true)];
+
+        assert_eq!(
+            select_mode(&modes, wanted(1920, 1080, Some(59_940))),
+            Some(ModeChoice {
+                index: 0,
+                fell_back: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_closest_refresh_wins_over_an_earlier_near_miss() {
+        // Both 59Hz and 60Hz are inside the one-hertz tolerance of 59.94;
+        // taking the first within tolerance would pick 59, which is a whole
+        // hertz away from what was asked for.
+        let modes = [mode(1920, 1080, 59, false), mode(1920, 1080, 60, false)];
+
+        assert_eq!(
+            select_mode(&modes, wanted(1920, 1080, Some(59_940))),
+            Some(ModeChoice {
+                index: 1,
+                fell_back: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_size_without_a_refresh_takes_the_first_match() {
+        let modes = [
+            mode(1920, 1080, 144, false),
+            mode(1920, 1080, 60, false),
+            mode(1280, 720, 60, false),
+        ];
+
+        assert_eq!(
+            select_mode(&modes, wanted(1920, 1080, None)),
+            Some(ModeChoice {
+                index: 0,
+                fell_back: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_missing_configured_mode_falls_back_to_preferred() {
+        // A stale mode in the config must not leave the monitor dark, but the
+        // caller has to be told so it can warn — that is what fell_back is for.
+        let modes = [mode(1920, 1080, 60, false), mode(1280, 720, 60, true)];
+
+        assert_eq!(
+            select_mode(&modes, wanted(2560, 1440, None)),
+            Some(ModeChoice {
+                index: 1,
+                fell_back: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_refresh_outside_the_tolerance_falls_back_to_preferred() {
+        // The realistic config error: the size exists but the rate does not.
+        // The size filter passes and the tolerance filter then drops every
+        // candidate, which is a different path through select_mode than a size
+        // that matches nothing at all — and it must still report fell_back.
+        let modes = [mode(1920, 1080, 60, false), mode(1280, 720, 60, true)];
+
+        assert_eq!(
+            select_mode(&modes, wanted(1920, 1080, Some(75_000))),
+            Some(ModeChoice {
+                index: 1,
+                fell_back: true
+            })
+        );
+    }
+
+    #[test]
+    fn no_preferred_mode_falls_back_to_the_first() {
+        let modes = [mode(1024, 768, 60, false), mode(800, 600, 60, false)];
+
+        assert_eq!(
+            select_mode(&modes, None),
+            Some(ModeChoice {
+                index: 0,
+                fell_back: false
+            })
+        );
+    }
+
+    #[test]
+    fn no_modes_selects_nothing() {
+        assert_eq!(select_mode(&[], None), None);
+        assert_eq!(select_mode(&[], wanted(1920, 1080, Some(60_000))), None);
+    }
+
+    #[test]
+    fn every_config_transform_maps_to_its_smithay_counterpart() {
+        use smithay::utils::Transform as T;
+
+        // The eight-arm mapping is exactly the kind of table a typo survives in
+        // until someone rotates a monitor, so every arm is pinned here.
+        let table = [
+            (config::Transform::Normal, T::Normal),
+            (config::Transform::Rotate90, T::_90),
+            (config::Transform::Rotate180, T::_180),
+            (config::Transform::Rotate270, T::_270),
+            (config::Transform::Flipped, T::Flipped),
+            (config::Transform::Flipped90, T::Flipped90),
+            (config::Transform::Flipped180, T::Flipped180),
+            (config::Transform::Flipped270, T::Flipped270),
+        ];
+
+        for (config, expected) in table {
+            assert_eq!(transform_of(config), expected, "for {config:?}");
+        }
     }
 }

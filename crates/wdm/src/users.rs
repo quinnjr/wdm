@@ -254,35 +254,123 @@ impl LastSessions {
     ///
     /// Writes to a temporary file and renames, so a crash mid-write cannot
     /// leave a truncated file that loses every user's preference.
+    ///
+    /// This runs as root, so it is written to be safe even if the state
+    /// directory is writable by a hostile uid: the parent is opened once and
+    /// every subsequent operation names a single component relative to that fd,
+    /// the stale temporary is removed with `unlinkat` (unlink never follows
+    /// symlinks), and the temporary is created with `O_CREAT|O_EXCL|O_NOFOLLOW`
+    /// — so a pre-placed symlink named `last-session.tmp` cannot make root
+    /// truncate an arbitrary file. Plain `File::create` follows symlinks and
+    /// would.
+    ///
+    /// The guarantee is about the *entries inside* the state directory, which
+    /// is why the directory itself is opened without `O_NOFOLLOW`: stateless
+    /// and factory-reset layouts symlink `/var/lib/<service>` onto a persistent
+    /// partition, and refusing those would silently stop recording sessions
+    /// without buying anything — a hostile uid able to replace `/var/lib/wdm`
+    /// already owns the state.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidInput, "unusable save path");
+
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(parent)?;
+
+        let final_name = path.file_name().ok_or_else(invalid)?;
+        // Appended, not substituted: with_extension("tmp") is the identity for
+        // a path that already ends in `.tmp`, which would make the temporary
+        // and the target the same file — and the unlinkat below would then
+        // delete the store before a single byte was written.
+        let mut tmp_name = final_name.to_os_string();
+        tmp_name.push(".tmp");
+        // Appending cannot collide, but the check is cheap and the consequence
+        // of being wrong is a destroyed store.
+        if tmp_name.as_os_str() == final_name {
+            return Err(invalid());
         }
 
-        let tmp = path.with_extension("tmp");
+        let parent_c = CString::new(parent.as_os_str().as_bytes()).map_err(|_| invalid())?;
+        let final_c = CString::new(final_name.as_bytes()).map_err(|_| invalid())?;
+        let tmp_c = CString::new(tmp_name.as_bytes()).map_err(|_| invalid())?;
 
-        // Written through a File and synced before the rename: `fs::write` plus
-        // `rename` is atomic against a process crash, but after a power cut the
+        // SAFETY: the path is a valid NUL-terminated string, and the returned
+        // fd is checked before it is wrapped in a File that will close it.
+        //
+        // No O_NOFOLLOW: a symlinked state directory is a supported layout, and
+        // the safety of what happens *inside* it comes from operating relative
+        // to this fd with O_EXCL|O_NOFOLLOW on the entries, not from the kind
+        // of the directory itself.
+        let dir_fd = unsafe {
+            libc::open(
+                parent_c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if dir_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: dir_fd is a freshly opened fd this function owns.
+        let dir = unsafe { std::fs::File::from_raw_fd(dir_fd) };
+
+        // A stale or attacker-planted temporary would make O_EXCL fail; unlink
+        // it first. unlink removes a symlink itself, never what it points at,
+        // so this is safe against the planted-symlink case. Failure (usually
+        // ENOENT) is fine — O_EXCL below is the real gate.
+        // SAFETY: valid fd and NUL-terminated name.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp_c.as_ptr(), 0) };
+
+        // SAFETY: valid fd and name; the returned fd is checked before use.
+        let tmp_fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                tmp_c.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if tmp_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Written through a File and synced before the rename: write plus
+        // rename is atomic against a process crash, but after a power cut the
         // filesystem can expose a zero-length file at the target, which loses
         // every user's preference rather than one.
         {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
+            // SAFETY: tmp_fd is a freshly opened fd this block owns.
+            let mut file = unsafe { std::fs::File::from_raw_fd(tmp_fd) };
             file.write_all(self.to_text().as_bytes())?;
             file.sync_all()?;
         }
 
-        std::fs::rename(&tmp, path)?;
+        // SAFETY: valid fd and NUL-terminated names.
+        let rc = unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                tmp_c.as_ptr(),
+                dir.as_raw_fd(),
+                final_c.as_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
 
         // The rename is the operation that has to survive a power cut, and only
         // a directory sync makes it durable — syncing the file alone leaves the
         // directory entry in the page cache, so the rename itself can be lost.
         // Best effort: losing a session preference is cosmetic, and failing the
         // save here would be worse than a stale preference.
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-            && let Err(e) = dir.sync_all()
-        {
+        if let Err(e) = dir.sync_all() {
             log::debug!("syncing {}: {e}", parent.display());
         }
 
@@ -434,6 +522,114 @@ mod tests {
         );
         // The temporary file must not be left behind.
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn save_does_not_follow_a_planted_tmp_symlink() {
+        // save() runs as root on a real system. If the state directory is ever
+        // writable by a hostile uid, a pre-placed `last-session.tmp` symlink
+        // must not make save() write through it — the victim file has to
+        // survive intact whether the save succeeds or fails.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+
+        let path = dir.path().join("last-session");
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+
+        let mut store = LastSessions::default();
+        store.set("testuser", "hyprland.desktop");
+        // Not merely "did not write through the symlink": unlinkat removes the
+        // planted link and O_EXCL then succeeds, so saving anyway is the
+        // specified behaviour. Tolerating an Err here would pass a regression
+        // that made save() fail always.
+        store.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "save wrote through a planted symlink"
+        );
+        assert_eq!(
+            LastSessions::load(&path).get("testuser"),
+            Some("hyprland.desktop")
+        );
+    }
+
+    #[test]
+    fn saves_through_a_symlinked_state_directory() {
+        // Stateless and factory-reset layouts symlink /var/lib/<service> onto a
+        // persistent partition. O_NOFOLLOW on the directory open would make
+        // every save fail ELOOP and silently stop recording sessions.
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("persistent");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("state");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut store = LastSessions::default();
+        store.set("testuser", "sway.desktop");
+        store.save(&link.join("last-session")).unwrap();
+
+        assert_eq!(
+            LastSessions::load(&real.join("last-session")).get("testuser"),
+            Some("sway.desktop")
+        );
+    }
+
+    #[test]
+    fn saving_to_a_dot_tmp_path_does_not_destroy_it() {
+        // The temporary name is built by appending, so it cannot collide with
+        // the target. with_extension("tmp") is the identity here, which would
+        // have made the unlinkat delete the store before writing it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-session.tmp");
+
+        let mut store = LastSessions::default();
+        store.set("testuser", "hyprland.desktop");
+        store.save(&path).unwrap();
+
+        assert_eq!(
+            LastSessions::load(&path).get("testuser"),
+            Some("hyprland.desktop")
+        );
+    }
+
+    #[test]
+    fn saving_to_a_path_without_a_file_name_is_an_error() {
+        // save() is pub; "/" has no file_name, and the unwrap that used to be
+        // implicit there must stay an error rather than a panic in a root
+        // process holding the display.
+        let err = LastSessions::default().save(Path::new("/")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn saves_to_a_bare_relative_name() {
+        // A path with no directory component has an empty parent, which open(2)
+        // rejects with ENOENT; save() substitutes ".". wdm itself only ever
+        // passes the absolute LAST_SESSION_PATH, so this branch is reachable
+        // only through the pub API — which is reason to test it, not to leave
+        // it unexercised.
+        //
+        // The cwd is process-global, so it is moved into a tempdir and put back
+        // immediately. Every other test here names files through an absolute
+        // tempdir path, so nothing else resolves a relative path in the window.
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut store = LastSessions::default();
+        store.set("testuser", "hyprland.desktop");
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = store.save(Path::new("bare-last-session"));
+        std::env::set_current_dir(cwd).unwrap();
+        result.unwrap();
+
+        assert_eq!(
+            LastSessions::load(&dir.path().join("bare-last-session")).get("testuser"),
+            Some("hyprland.desktop")
+        );
     }
 
     #[test]

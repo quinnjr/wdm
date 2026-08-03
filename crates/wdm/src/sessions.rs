@@ -40,6 +40,29 @@ pub struct Session {
     pub path: PathBuf,
 }
 
+impl Session {
+    /// The value `XDG_SESSION_TYPE` carries for this session.
+    ///
+    /// pam_systemd reads it from the PAM environment before `pam_open_session`
+    /// and the launched child reads it from its own, so both call sites must
+    /// agree — which is why the mapping lives here and not at either of them.
+    pub fn xdg_session_type(&self) -> &'static str {
+        match self.session_type {
+            SessionType::Wayland => "wayland",
+            SessionType::X11 => "x11",
+        }
+    }
+
+    /// The value `XDG_SESSION_DESKTOP` carries: the id without its suffix.
+    ///
+    /// `strip_suffix` rather than `trim_end_matches`, which strips a repeated
+    /// suffix: an entry named `x.desktop.desktop` would otherwise be reported as
+    /// `x`, which is not the desktop anything else knows it by.
+    pub fn xdg_session_desktop(&self) -> &str {
+        self.id.strip_suffix(".desktop").unwrap_or(&self.id)
+    }
+}
+
 /// Scan the standard directories for sessions.
 ///
 /// Entries earlier in the search path win, so a session dropped into
@@ -47,12 +70,26 @@ pub struct Session {
 /// Unreadable directories and malformed entries are logged and skipped: one bad
 /// desktop file must not deprive the machine of every other session.
 pub fn discover(locales: &[String]) -> Vec<Session> {
-    let mut found: Vec<Session> = Vec::new();
+    discover_in(
+        WAYLAND_DIRS
+            .iter()
+            .map(|d| (Path::new(*d), SessionType::Wayland))
+            .chain(X11_DIRS.iter().map(|d| (Path::new(*d), SessionType::X11))),
+        locales,
+    )
+}
 
-    let dirs = WAYLAND_DIRS
-        .iter()
-        .map(|d| (Path::new(*d), SessionType::Wayland))
-        .chain(X11_DIRS.iter().map(|d| (Path::new(*d), SessionType::X11)));
+/// The dedup core of [`discover`], parameterised over the directory chain so
+/// the precedence rules can be exercised against temporary directories.
+///
+/// Ids are deduplicated across the *whole* chain, not per type, because
+/// `start_session` looks a session up by id alone — so a Wayland entry shadows
+/// an X11 entry with the same id, and an earlier directory shadows a later one.
+fn discover_in<'a>(
+    dirs: impl Iterator<Item = (&'a Path, SessionType)>,
+    locales: &[String],
+) -> Vec<Session> {
+    let mut found: Vec<Session> = Vec::new();
 
     for (dir, session_type) in dirs {
         for session in scan_dir(dir, session_type, locales) {
@@ -308,6 +345,88 @@ mod tests {
         let found = scan_dir(dir.path(), SessionType::Wayland, &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "Good");
+    }
+
+    fn write_entry(dir: &Path, id: &str, name: &str) {
+        std::fs::write(
+            dir.join(id),
+            format!("[Desktop Entry]\nName={name}\nExec={name}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_wayland_session_shadows_an_x11_session_with_the_same_id() {
+        // Ids are looked up by start_session with no type qualifier, so they
+        // must be unique across both types; the protocol documents the Wayland
+        // entry as the one that wins.
+        let wayland = tempfile::tempdir().unwrap();
+        let x11 = tempfile::tempdir().unwrap();
+        write_entry(wayland.path(), "plasma.desktop", "plasma-wayland");
+        write_entry(x11.path(), "plasma.desktop", "plasma-x11");
+
+        let found = discover_in(
+            [
+                (wayland.path(), SessionType::Wayland),
+                (x11.path(), SessionType::X11),
+            ]
+            .into_iter(),
+            &[],
+        );
+
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].session_type, SessionType::Wayland);
+        assert_eq!(found[0].name, "plasma-wayland");
+    }
+
+    #[test]
+    fn a_local_entry_shadows_the_distribution_entry() {
+        let local = tempfile::tempdir().unwrap();
+        let dist = tempfile::tempdir().unwrap();
+        write_entry(local.path(), "sway.desktop", "sway-local");
+        write_entry(dist.path(), "sway.desktop", "sway-dist");
+
+        let found = discover_in(
+            [
+                (local.path(), SessionType::Wayland),
+                (dist.path(), SessionType::Wayland),
+            ]
+            .into_iter(),
+            &[],
+        );
+
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].name, "sway-local");
+    }
+
+    #[test]
+    fn xdg_session_facts_match_the_types() {
+        // session.rs's build_env and auth.rs's PAM environment both go through
+        // these, so this pins the one mapping both call sites share.
+        let session = |id: &str, session_type| Session {
+            id: id.to_owned(),
+            name: String::new(),
+            exec: String::new(),
+            session_type,
+            path: PathBuf::new(),
+        };
+
+        let sway = session("sway.desktop", SessionType::Wayland);
+        assert_eq!(sway.xdg_session_type(), "wayland");
+        assert_eq!(sway.xdg_session_desktop(), "sway");
+
+        let i3 = session("i3.desktop", SessionType::X11);
+        assert_eq!(i3.xdg_session_type(), "x11");
+        assert_eq!(i3.xdg_session_desktop(), "i3");
+
+        // Only one suffix comes off: trimming repeatedly would rename a session
+        // whose file really is called `weird.desktop.desktop`.
+        let doubled = session("weird.desktop.desktop", SessionType::Wayland);
+        assert_eq!(doubled.xdg_session_desktop(), "weird.desktop");
+
+        // An id with no suffix at all is used as it stands.
+        let bare = session("bare", SessionType::Wayland);
+        assert_eq!(bare.xdg_session_desktop(), "bare");
     }
 
     #[test]

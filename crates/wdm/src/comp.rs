@@ -323,15 +323,11 @@ impl Wdm {
     /// the backend discovered devices; [`Config::rank_outputs`] imposes the
     /// configured order so the primary output does not move between boots.
     pub fn set_outputs(&mut self, connected: Vec<Output>) {
+        // `Output::name()` allocates, so it is called once per output here and
+        // the ranking works on the borrowed names.
         let names: Vec<String> = connected.iter().map(|o| o.name()).collect();
-        let ranked = self
-            .config
-            .rank_outputs(names.iter().map(String::as_str));
-
-        self.outputs = ranked
-            .iter()
-            .filter_map(|name| connected.iter().find(|o| o.name() == *name).cloned())
-            .collect();
+        let ranked = self.config.rank_outputs(names.iter().map(String::as_str));
+        self.outputs = order_by_rank(&ranked, &connected);
 
         // Layer surfaces on an output that has gone away are reassigned rather
         // than closed: unplugging a monitor mid-login must move the login form,
@@ -542,6 +538,24 @@ impl Wdm {
         }
     }
 
+}
+
+/// Reorder `connected` to follow `ranked`, dropping anything unranked.
+///
+/// A ranked name with no connected output is skipped rather than being an
+/// error: ranks are computed from the names of the very outputs passed in, but
+/// pulling this apart from `set_outputs` makes it testable, and a mismatch must
+/// not panic on the hotplug path.
+///
+/// Names are matched with a linear scan, first match wins. Two outputs
+/// reporting the same name should not happen, but a driver quirk or a device
+/// re-added before the old `Output` drops can produce it — and then the *older*
+/// one keeps the name, so layer surfaces already assigned to it stay put.
+fn order_by_rank(ranked: &[&str], connected: &[Output]) -> Vec<Output> {
+    ranked
+        .iter()
+        .filter_map(|name| connected.iter().find(|o| o.name() == *name).cloned())
+        .collect()
 }
 
 fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
@@ -986,6 +1000,61 @@ impl LoopData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use smithay::output::{Mode as OutputMode, PhysicalProperties, Subpixel};
+    use smithay::utils::Size;
+
+    /// An `Output` needs no GPU, so the ranking can be exercised directly.
+    /// `model` carries the identity the duplicate-name test tells copies apart by.
+    fn test_output(name: &str, model: &str) -> Output {
+        let output = Output::new(
+            name.to_owned(),
+            PhysicalProperties {
+                size: Size::from((0, 0)),
+                subpixel: Subpixel::Unknown,
+                make: "wdm".to_owned(),
+                model: model.to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(OutputMode {
+                size: Size::from((1920, 1080)),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        output
+    }
+
+    #[test]
+    fn rank_order_is_applied_to_the_outputs() {
+        // Probe order reversed, as udev is free to report it.
+        let connected = vec![test_output("DP-2", "b"), test_output("DP-1", "a")];
+        let ordered = order_by_rank(&["DP-1", "DP-2"], &connected);
+        let names: Vec<String> = ordered.iter().map(|o| o.name()).collect();
+        assert_eq!(names, ["DP-1", "DP-2"]);
+    }
+
+    #[test]
+    fn a_ranked_name_with_no_output_is_dropped() {
+        // Must not panic and must not leave a hole: this runs on hotplug.
+        let connected = vec![test_output("DP-1", "a")];
+        let ordered = order_by_rank(&["HDMI-A-1", "DP-1"], &connected);
+        let names: Vec<String> = ordered.iter().map(|o| o.name()).collect();
+        assert_eq!(names, ["DP-1"]);
+    }
+
+    #[test]
+    fn duplicate_names_resolve_to_the_first_output() {
+        // The older Output keeps the name, so layer surfaces already assigned to
+        // it are not reassigned by a device re-added before the old one drops.
+        let connected = vec![test_output("DP-1", "old"), test_output("DP-1", "new")];
+        let ordered = order_by_rank(&["DP-1"], &connected);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].physical_properties().model, "old");
+    }
 
     #[test]
     fn logical_offsets_scale_to_physical() {

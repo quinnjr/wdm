@@ -30,6 +30,7 @@ enum Backend {
     Winit,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
     config: PathBuf,
     backend: Backend,
@@ -43,29 +44,45 @@ USAGE:
 
 OPTIONS:
     --config <PATH>     Configuration file [default: /etc/wdm/wdm.toml]
-    --backend <NAME>    udev (real hardware) or winit (nested, for development)
+    --backend <NAME>    udev (real hardware) or winit (nested, for development);
+                        drm and nested are accepted as aliases
                         [default: udev when running as root, otherwise winit]
     -h, --help          Print this help
     -V, --version       Print version
 ";
 
-fn parse_args() -> Result<Args, String> {
+/// What the command line asked for.
+///
+/// `-h` and `-V` are returned rather than handled where they are parsed: doing
+/// the printing and exiting in the caller keeps `parse_args_from` a pure
+/// function, so the usage text — which is user-facing contract — can be tested
+/// without the test binary calling `exit` on itself.
+#[derive(Debug, PartialEq, Eq)]
+enum Parsed {
+    Run(Args),
+    Help,
+    Version,
+}
+
+fn parse_args() -> Result<Parsed, String> {
+    parse_args_from(std::env::args().skip(1), is_root())
+}
+
+/// The parsing itself, separated from `std::env::args` and `geteuid` so tests
+/// can feed it arguments and both privilege levels.
+fn parse_args_from(
+    mut args: impl Iterator<Item = String>,
+    is_root: bool,
+) -> Result<Parsed, String> {
     // Hand-rolled rather than pulling in an argument parser: there are two
     // options and neither is likely to grow.
     let mut config = None;
     let mut backend = None;
-    let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("wdm {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
+            "-h" | "--help" => return Ok(Parsed::Help),
+            "-V" | "--version" => return Ok(Parsed::Version),
             "--config" => {
                 config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?));
             }
@@ -78,17 +95,17 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args {
+    Ok(Parsed::Run(Args {
         config: config.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
         // Defaulting on privilege rather than on the environment: running as
         // root inside a session should still drive real hardware, and running
         // unprivileged cannot drive it at all.
-        backend: backend.unwrap_or(if is_root() {
+        backend: backend.unwrap_or(if is_root {
             Backend::Udev
         } else {
             Backend::Winit
         }),
-    })
+    }))
 }
 
 fn is_root() -> bool {
@@ -108,7 +125,15 @@ fn main() -> ExitCode {
     .init();
 
     let args = match parse_args() {
-        Ok(args) => args,
+        Ok(Parsed::Run(args)) => args,
+        Ok(Parsed::Help) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Parsed::Version) => {
+            println!("wdm {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("wdm: {e}\n\n{USAGE}");
             return ExitCode::from(2);
@@ -147,5 +172,111 @@ fn main() -> ExitCode {
             log::error!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str], is_root: bool) -> Result<Args, String> {
+        match parse_args_from(args.iter().map(|s| s.to_string()), is_root)? {
+            Parsed::Run(args) => Ok(args),
+            other => panic!("expected a run, got {other:?}"),
+        }
+    }
+
+    fn parse_raw(args: &[&str]) -> Result<Parsed, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()), false)
+    }
+
+    #[test]
+    fn help_and_version_are_returned_not_executed() {
+        // They used to call process::exit here, which no test could reach
+        // without taking the test binary down with it.
+        assert_eq!(parse_raw(&["-h"]).unwrap(), Parsed::Help);
+        assert_eq!(parse_raw(&["--help"]).unwrap(), Parsed::Help);
+        assert_eq!(parse_raw(&["-V"]).unwrap(), Parsed::Version);
+        assert_eq!(parse_raw(&["--version"]).unwrap(), Parsed::Version);
+    }
+
+    #[test]
+    fn usage_mentions_everything_the_parser_accepts() {
+        // USAGE is the only documentation of the aliases. A flag the parser
+        // takes but the help omits is a flag nobody can find.
+        for token in [
+            "--config",
+            "--backend",
+            "udev",
+            "drm",
+            "winit",
+            "nested",
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+        ] {
+            assert!(USAGE.contains(token), "USAGE does not mention {token}");
+        }
+    }
+
+    #[test]
+    fn backend_names_and_aliases_parse() {
+        for (name, expected) in [
+            ("udev", Backend::Udev),
+            ("drm", Backend::Udev),
+            ("winit", Backend::Winit),
+            ("nested", Backend::Winit),
+        ] {
+            let args = parse(&["--backend", name], false).unwrap();
+            assert_eq!(args.backend, expected, "--backend {name}");
+        }
+    }
+
+    #[test]
+    fn unknown_backend_is_an_error() {
+        assert!(parse(&["--backend", "x11"], false).is_err());
+    }
+
+    #[test]
+    fn config_without_a_path_is_an_error() {
+        assert!(parse_raw(&["--config"]).is_err());
+    }
+
+    #[test]
+    fn backend_without_a_name_is_an_error() {
+        assert!(parse_raw(&["--backend"]).is_err());
+    }
+
+    #[test]
+    fn config_path_is_taken_verbatim() {
+        let args = parse(&["--config", "/tmp/wdm.toml"], false).unwrap();
+        assert_eq!(args.config, PathBuf::from("/tmp/wdm.toml"));
+    }
+
+    #[test]
+    fn config_defaults_when_not_given() {
+        let args = parse(&[], false).unwrap();
+        assert_eq!(args.config, PathBuf::from(config::DEFAULT_PATH));
+    }
+
+    #[test]
+    fn positional_arguments_are_an_error() {
+        assert!(parse(&["frobnicate"], false).is_err());
+    }
+
+    #[test]
+    fn backend_defaults_on_privilege() {
+        assert_eq!(parse(&[], true).unwrap().backend, Backend::Udev);
+        assert_eq!(parse(&[], false).unwrap().backend, Backend::Winit);
+        // An explicit choice wins over the privilege default in both directions.
+        assert_eq!(
+            parse(&["--backend", "winit"], true).unwrap().backend,
+            Backend::Winit
+        );
+        assert_eq!(
+            parse(&["--backend", "udev"], false).unwrap().backend,
+            Backend::Udev
+        );
     }
 }

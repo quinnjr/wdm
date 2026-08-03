@@ -52,10 +52,12 @@ pub fn build(
         None
     };
 
-    // The directory has to exist and be the greeter's before the socket is
-    // created in it, not after: the socket inherits nothing from a chown that
-    // happens later.
-    crate::supervise::prepare_runtime_dir(greeter_credentials)?;
+    // The directory is created root-owned 0700, and stays root-only until the
+    // socket inside it has been bound and secured. Chowning it to the greeter
+    // first would open a window in which a process running as the greeter uid
+    // could swap the socket for a symlink while root is still fixing the
+    // socket's ownership by path.
+    crate::supervise::create_runtime_dir(privileged)?;
 
     let socket = ListeningSocketSource::new_auto()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
@@ -76,6 +78,11 @@ pub fn build(
         // unable to connect at all.
         return Err(format!("securing {}: {e}", socket_path.display()).into());
     }
+
+    // Only now, with the socket bound and secured, does the greeter get the
+    // directory. Until this point it was root-only, so nothing could tamper
+    // with the paths the two calls above operated on.
+    crate::supervise::hand_over_runtime_dir(greeter_credentials)?;
 
     loop_handle.insert_source(socket, move |stream, _, data| {
         match peer_uid(&stream) {
@@ -215,6 +222,12 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
 /// property of the path, and anything that can already reach the path — a bind
 /// mount, a stray chmod, a process that inherited a directory fd — is then
 /// unrestricted.
+///
+/// Both calls here operate by path and follow symlinks, so ordering carries
+/// the guarantee: this runs while the runtime directory is still root-owned
+/// `0700` — before [`crate::supervise::hand_over_runtime_dir`] gives it to the
+/// greeter — so no unprivileged process can have replaced the socket with a
+/// symlink and turned the chown into a write on an arbitrary file.
 ///
 /// The owner is the half that is easy to forget, and forgetting it does not
 /// weaken the socket, it breaks it: `0600` describes the *owner*, wdm is root,

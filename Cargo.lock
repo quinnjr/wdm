@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "wdm"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "calloop 0.14.4",
  "env_logger",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-greeter"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "fontdue",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-greeter-client"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "gdk4-wayland",
  "log",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "wdm-gtk-greeter"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "gtk4",
@@ -2911,24 +2911,24 @@ dependencies = [
 
 [[package]]
 name = "wdm-protocol"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "wayland-backend",
  "wayland-client",
- "wayland-protocols",
  "wayland-scanner",
  "wayland-server",
 ]
 
 [[package]]
 name = "wdm-webkit-greeter"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "gtk4",
  "gtk4-layer-shell",
  "log",
  "serde_json",
+ "tempfile",
  "wdm-greeter-client",
  "webkit6",
 ]
