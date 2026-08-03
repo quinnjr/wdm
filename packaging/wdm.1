@@ -255,7 +255,20 @@ holds no DRM master, and cannot commit a frame.
 .PP
 Ctrl+Alt+F\fIn\fR is handled by
 .B wdm
-before the greeter sees it, so a wedged greeter can always be escaped from.
+before the greeter sees it, so a wedged greeter can always be escaped from. The
+chord has to be handled rather than left to the kernel: a graphical session puts
+the console keyboard in
+.BR K_OFF ,
+so the kernel no longer translates it. It is intercepted for every state
+.B wdm
+can be in, including the give-up screen shown after a greeter has failed to
+start repeatedly, and if the seat refuses the switch
+.B wdm
+falls back to
+.B VT_ACTIVATE
+on
+.I /dev/tty0
+so the escape hatch does not depend on the session layer being healthy.
 .SH SEE ALSO
 .BR seatd (1),
 .BR systemd (1),

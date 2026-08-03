@@ -252,7 +252,13 @@ fn pump(
 /// Deliberately not fatal. A machine where the switch fails still gets a
 /// greeter if it happens to be on the right VT already, and a display manager
 /// that refuses to start because of a VT ioctl is worse than one that tries.
-fn activate_vt(vt: u32) {
+/// Make `vt` the foreground console.
+///
+/// `wait` blocks until the switch has completed, which startup needs and the
+/// escape-hatch fallback must not do: that call runs on the thread serving
+/// input and the greeter, and waiting there for a switch that may never
+/// complete would wedge the compositor in place of the failure it is escaping.
+fn activate_vt(vt: u32, wait: bool) {
     // ponytail: ioctls by hand rather than a VT crate — three constants and two
     // calls, and the only alternative worth adding a dependency for would be
     // one that also handled VT_PROCESS signal handshakes, which wdm leaves to
@@ -290,7 +296,7 @@ fn activate_vt(vt: u32) {
         // Waiting matters: VT_ACTIVATE only queues the switch, and opening the
         // seat before it completes would register the session against the VT
         // being left rather than the one being entered.
-        if libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
+        if wait && libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
             log::warn!(
                 "waiting for vt {vt}: {}",
                 std::io::Error::last_os_error()
@@ -299,7 +305,11 @@ fn activate_vt(vt: u32) {
         }
     }
 
-    log::info!("vt {vt} is foreground");
+    if wait {
+        log::info!("vt {vt} is foreground");
+    } else {
+        log::info!("queued a switch to vt {vt}");
+    }
 }
 
 impl Udev {
@@ -316,7 +326,7 @@ impl Udev {
         // Before the seat, not after. seatd hands a new client whatever VT is
         // *currently* foreground — `client->session = seat->cur_vt` — so the
         // only way to end up on wdm's own VT is to be standing on it already.
-        activate_vt(vt);
+        activate_vt(vt, true);
 
         let deadline = Instant::now() + SEAT_RETRY_TIMEOUT;
         let (session, notifier) = loop {
@@ -648,7 +658,17 @@ impl Udev {
                 Request::SwitchVt(vt) => {
                     log::info!("switching to vt {vt}");
                     if let Err(e) = self.session.change_vt(vt) {
-                        log::error!("switching to vt {vt}: {e}");
+                        // The chord is the documented way out of a machine
+                        // whose login screen is unusable, so it must not be
+                        // only as reliable as the session layer. libseat can
+                        // refuse — a wedged logind, a session it no longer
+                        // believes is active — and the user pressing it has
+                        // already run out of other options. The kernel's own
+                        // VT_ACTIVATE goes through the same handshake libseat
+                        // would have driven, so the seat still learns it is
+                        // being switched away from.
+                        log::error!("switching to vt {vt} through the seat: {e}; trying the console directly");
+                        activate_vt(vt as u32, false);
                     }
                 }
 
