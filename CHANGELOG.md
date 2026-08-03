@@ -5,6 +5,15 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-03
+
+A minor rather than a patch release: `wdm_greeter_v1` gains an event and a
+version, `user.last_session` changes meaning, and the greeter client's public
+types become `#[non_exhaustive]`. Version 1 greeters keep working — the new
+event is gated and the old `last_session` behaviour is preserved for them — but
+rebuilding against this release can require changes, which is not something a
+patch number is allowed to say.
+
 ### Added
 
 - **`default_session`, a new protocol event**, carrying the session id the
@@ -62,6 +71,11 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
   post-install scriptlet. Fedora's file triggers fire on the files being
   installed, not on their contents changing, so an upgrade otherwise kept the
   old directory ownership until the next boot.
+- **Every crate sets `publish = false`.** wdm ships as distribution packages,
+  and a greeter author takes `wdm-protocol` as a git or path dependency — which
+  is also what keeps the protocol and the compositor implementing it on one
+  version. A greeter resolving `wdm-protocol` independently from a registry is
+  the mismatch `since` gating exists to survive, not one worth inviting.
 
 ### Security
 
@@ -194,7 +208,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0
 [0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
 [0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2
 [0.1.1]: https://github.com/quinnjr/wdm/releases/tag/v0.1.1

@@ -13,6 +13,12 @@ members = [
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
+# wdm ships as distribution packages, not from crates.io. Greeter authors take
+# wdm-protocol as a git or path dependency, which is also what keeps the
+# protocol and the compositor implementing it on the same version — a greeter
+# resolving wdm-protocol independently is the mismatch `since` gating exists to
+# survive, not one to invite.
+publish = false
 
 [workspace.dependencies]
 wdm-protocol = { path = "crates/wdm-protocol", version = "0.2.0" }

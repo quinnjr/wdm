@@ -3,6 +3,7 @@ name = "wdm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 calloop = { version = "0.14.4", features = ["signals"] }
