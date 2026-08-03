@@ -55,10 +55,12 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct SessionDescription {
     pub seat: String,
     pub vtnr: u32,
-    /// `wayland` or `x11`.
+    /// `wayland` or `x11`. Provisional: the greeter has not chosen a session
+    /// when authentication starts, and the chosen type replaces this in PAM's
+    /// environment before `pam_open_session`.
     pub session_type: String,
     /// The desktop id, without the `.desktop` suffix. Empty until the greeter
-    /// has chosen one, which is why it is not required to be set.
+    /// has chosen one, and likewise replaced before `pam_open_session`.
     pub desktop: String,
 }
 
@@ -125,7 +127,17 @@ pub enum AuthEvent {
 #[derive(Debug)]
 enum AuthCommand {
     /// Open the PAM session and report its environment.
-    StartSession,
+    ///
+    /// Carries the facts that were unknown when the thread started: the
+    /// greeter has chosen a session by now, and pam_systemd must hear its type
+    /// and desktop before `pam_open_session` or the logind session is
+    /// registered with the defaults from [`SessionDescription`].
+    StartSession {
+        /// `wayland` or `x11`, for `XDG_SESSION_TYPE`.
+        session_type: String,
+        /// For `XDG_SESSION_DESKTOP`; empty means leave it unset.
+        desktop: String,
+    },
     /// The user's session process has exited; close the PAM session.
     SessionEnded,
 }
@@ -215,12 +227,18 @@ impl AuthHandle {
         }
     }
 
-    /// Ask the thread to open the PAM session.
+    /// Ask the thread to open the PAM session for the chosen session.
     ///
     /// Valid only after [`AuthEvent::Ok`]. The thread replies with
     /// [`AuthEvent::SessionOpened`] or [`AuthEvent::SessionFailed`].
-    pub fn start_session(&self) {
-        let _ = self.commands.send(AuthCommand::StartSession);
+    /// `session_type` and `desktop` are the values `crate::session::build_env`
+    /// gives the child, delivered here too because pam_systemd reads them from
+    /// the PAM environment, not from the child's.
+    pub fn start_session(&self, session_type: String, desktop: String) {
+        let _ = self.commands.send(AuthCommand::StartSession {
+            session_type,
+            desktop,
+        });
     }
 
     /// Tell the thread the user's session process has exited.
@@ -311,9 +329,12 @@ fn run(
 
     // Wait for the greeter to choose a session. A closed channel means the
     // attempt was cancelled or the greeter died; unwinding here runs pam_end.
-    loop {
+    let (session_type, desktop) = loop {
         match commands.recv() {
-            Ok(AuthCommand::StartSession) => break,
+            Ok(AuthCommand::StartSession {
+                session_type,
+                desktop,
+            }) => break (session_type, desktop),
             Ok(AuthCommand::SessionEnded) => {
                 // No session was ever started; nothing to close.
                 log::debug!("session_ended before start_session for {username}");
@@ -322,6 +343,23 @@ fn run(
                 log::debug!("authentication for {username} cancelled before launch");
                 return;
             }
+        }
+    };
+
+    // The greeter's choice supersedes the wayland-with-no-desktop defaults set
+    // before authentication. This must land before open_session: pam_systemd
+    // registers the logind session there, and a session registered as the wrong
+    // type misleads everything keying off sd_session_get_type.
+    for pair in pam_session_env(&session_type, &desktop) {
+        if let Err(e) = context.putenv(pair.as_str()) {
+            // Not fatal: a cosmetic environment variable must not block the
+            // handoff. But it is not cosmetic to logind — open_session below
+            // registers the session with whatever survived, so say which
+            // variable was lost and what the machine will believe instead.
+            log::error!(
+                "putenv {pair} for {username} failed: {e}; \
+                 the logind session will be registered with the wrong type"
+            );
         }
     }
 
@@ -348,13 +386,26 @@ fn run(
     // what pam_systemd needs to release the logind session.
     match commands.recv() {
         Ok(AuthCommand::SessionEnded) => log::info!("session for {username} ended"),
-        Ok(AuthCommand::StartSession) => {
+        Ok(AuthCommand::StartSession { .. }) => {
             log::warn!("ignoring second start_session for {username}");
         }
         Err(_) => log::info!("supervisor dropped the PAM handle for {username}"),
     }
 
     drop(session);
+}
+
+/// The `KEY=VALUE` pairs to push into PAM's environment before `open_session`.
+///
+/// An empty value yields no pair at all rather than `KEY=`: a session with no
+/// desktop must leave `XDG_SESSION_DESKTOP` *unset*, because an empty string is
+/// a value logind will happily record and everything reading it will believe.
+fn pam_session_env(session_type: &str, desktop: &str) -> Vec<String> {
+    [("XDG_SESSION_TYPE", session_type), ("XDG_SESSION_DESKTOP", desktop)]
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
 }
 
 fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
@@ -475,6 +526,31 @@ impl ConversationHandler for ChannelConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pam_session_env_pairs_both_variables() {
+        // Order matters only for the log line, but pinning it keeps the failure
+        // message stable when someone reorders the array.
+        assert_eq!(
+            pam_session_env("x11", "i3"),
+            vec!["XDG_SESSION_TYPE=x11", "XDG_SESSION_DESKTOP=i3"]
+        );
+    }
+
+    #[test]
+    fn pam_session_env_omits_an_empty_desktop() {
+        // Not `XDG_SESSION_DESKTOP=`: unset and empty are different to logind.
+        assert_eq!(
+            pam_session_env("wayland", ""),
+            vec!["XDG_SESSION_TYPE=wayland"]
+        );
+    }
+
+    #[test]
+    fn pam_session_env_omits_an_empty_type() {
+        assert_eq!(pam_session_env("", "sway"), vec!["XDG_SESSION_DESKTOP=sway"]);
+        assert!(pam_session_env("", "").is_empty());
+    }
 
     #[test]
     fn only_prompts_expect_responses() {

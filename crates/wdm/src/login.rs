@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use smithay::output::Output;
+use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::reexports::calloop::LoopHandle;
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use wdm_protocol::server::wdm_greeter_v1::{self, WdmGreeterV1};
 
 use crate::auth::{AuthEvent, AuthHandle};
@@ -40,6 +40,35 @@ fn wire_prompt_style(style: crate::auth::PromptStyle) -> wdm_greeter_v1::PromptS
         crate::auth::PromptStyle::Error => wdm_greeter_v1::PromptStyle::Error,
     }
 }
+
+/// What to put in a `user` event's `last_session` for a peer at `version`.
+///
+/// From version 2 the field is the user's own history and nothing else: the
+/// machine-wide default travels on `default_session`, so a greeter can tell the
+/// administrator's choice from the user's and decide which to preselect.
+///
+/// A version 1 peer has no `default_session` event and therefore no other way
+/// to learn the default at all. Dropping the substitution for those peers would
+/// silently stop honouring `default_session` in the config the moment wdm was
+/// upgraded under an older greeter, so version 1 keeps the old conflated
+/// meaning: history, or the configured default when there is no history.
+fn last_session_for(version: u32, history: &str, default: Option<&str>) -> String {
+    if version >= DEFAULT_SESSION_SINCE || !history.is_empty() {
+        history.to_owned()
+    } else {
+        default.unwrap_or_default().to_owned()
+    }
+}
+
+/// Highest `wdm_greeter_v1` version this compositor implements.
+///
+/// Version 2 added `default_session`. Bumped rather than extended in place
+/// because greeters are separate binaries built against `wdm-protocol`, and a
+/// greeter compiled against version 1 would decode shifted opcodes as garbage.
+const INTERFACE_VERSION: u32 = 2;
+
+/// The version at which `default_session` became available.
+const DEFAULT_SESSION_SINCE: u32 = 2;
 
 /// Backoff applied after each consecutive failed attempt, in seconds.
 ///
@@ -171,8 +200,12 @@ impl Login {
     }
 
     /// Advertise the global.
+    ///
+    /// Version 2 adds `default_session`. A greeter built against version 1
+    /// binds at 1 and is served the version 1 contract; nothing here assumes
+    /// the greeter ships in lockstep with wdm.
     pub fn create_global(display: &DisplayHandle) {
-        display.create_global::<Wdm, WdmGreeterV1, _>(1, ());
+        display.create_global::<Wdm, WdmGreeterV1, _>(INTERFACE_VERSION, ());
     }
 
     /// Record why the previous launch failed, for the next greeter to display.
@@ -256,20 +289,19 @@ impl Login {
 
     /// Push the enumerate phase to a freshly bound greeter.
     fn send_initial_state(&mut self, greeter: &WdmGreeterV1) {
+        let version = greeter.version();
+
         for user in &self.users {
             greeter.user(
                 user.name.clone(),
                 user.display_name.clone(),
                 user.avatar_path.clone(),
-                // Fall back to the configured default so a first-time user is
-                // offered something sensible. Preselecting is the greeter's
-                // policy; wdm only reports.
-                if user.last_session.is_empty() {
-                    self.default_session.clone().unwrap_or_default()
-                } else {
-                    user.last_session.clone()
-                },
+                last_session_for(version, &user.last_session, self.default_session.as_deref()),
             );
+        }
+
+        if version >= DEFAULT_SESSION_SINCE {
+            greeter.default_session(self.default_session.clone().unwrap_or_default());
         }
 
         for session in &self.sessions {
@@ -499,7 +531,7 @@ impl GlobalDispatch<WdmGreeterV1, ()> for Wdm {
         // limits how many times a client may bind.
         if !state.login.bound.is_empty() {
             greeter.post_error(
-                wdm_greeter_v1::Error::AuthInProgress,
+                wdm_greeter_v1::Error::AlreadyBound,
                 "wdm_greeter_v1 is already bound",
             );
             return;
@@ -625,8 +657,9 @@ impl Wdm {
 
         // The session type is not known until start_session, so the seat facts
         // that are known now are supplied and the type defaults to wayland —
-        // the overwhelmingly common case, and better than pam_systemd's own
-        // fallback of "tty".
+        // better than pam_systemd's own fallback of "tty". The real type and
+        // desktop are put into PAM's environment once the greeter has chosen,
+        // before pam_open_session, which is when pam_systemd reads them.
         let description = crate::auth::SessionDescription {
             seat: "seat0".to_owned(),
             vtnr: self.login.vt,
@@ -634,12 +667,7 @@ impl Wdm {
             desktop: String::new(),
         };
 
-        match AuthHandle::start(
-            &username,
-            &tty,
-            description,
-            self.login.events.clone(),
-        ) {
+        match AuthHandle::start(&username, &tty, description, self.login.events.clone()) {
             Ok(handle) => {
                 self.login.auth = Some(handle);
                 self.login.phase = Phase::Authenticating;
@@ -734,8 +762,13 @@ impl Wdm {
         };
 
         // The PAM thread opens the session and reports its environment; the
-        // launch happens when that arrives.
-        auth.start_session();
+        // launch happens when that arrives. The chosen session's type and
+        // desktop travel with the command so pam_systemd registers the logind
+        // session correctly — the values match what build_env gives the child.
+        auth.start_session(
+            session.xdg_session_type().to_owned(),
+            session.xdg_session_desktop().to_owned(),
+        );
 
         self.login.chosen = Some((session, extra_env));
         self.login.phase = Phase::Launching;
@@ -754,7 +787,10 @@ mod tests {
             wire_session_type(crate::sessions::SessionType::Wayland) as u32,
             0
         );
-        assert_eq!(wire_session_type(crate::sessions::SessionType::X11) as u32, 1);
+        assert_eq!(
+            wire_session_type(crate::sessions::SessionType::X11) as u32,
+            1
+        );
     }
 
     #[test]
@@ -764,6 +800,34 @@ mod tests {
         assert_eq!(wire_prompt_style(Visible) as u32, 1);
         assert_eq!(wire_prompt_style(Info) as u32, 2);
         assert_eq!(wire_prompt_style(Error) as u32, 3);
+    }
+
+    #[test]
+    fn version_2_reports_history_only() {
+        // The default travels on its own event, so the two are distinguishable.
+        assert_eq!(
+            last_session_for(2, "sway.desktop", Some("river.desktop")),
+            "sway.desktop"
+        );
+        assert_eq!(last_session_for(2, "", Some("river.desktop")), "");
+    }
+
+    #[test]
+    fn version_1_still_carries_the_configured_default() {
+        // A version 1 greeter never receives default_session, so without this
+        // substitution upgrading wdm would silently stop honouring the
+        // administrator's default for first-time users.
+        assert_eq!(
+            last_session_for(1, "", Some("river.desktop")),
+            "river.desktop"
+        );
+        // History still wins over the default, as it always did.
+        assert_eq!(
+            last_session_for(1, "sway.desktop", Some("river.desktop")),
+            "sway.desktop"
+        );
+        // And no configured default leaves the field empty rather than inventing one.
+        assert_eq!(last_session_for(1, "", None), "");
     }
 
     /// A `Login` with no compositor behind it.
@@ -845,7 +909,10 @@ mod tests {
         // force attempt must not be allowed to retry at full speed.
         assert_eq!(BACKOFF_SECS[0], 0, "the first attempt must not be delayed");
         for pair in BACKOFF_SECS.windows(2) {
-            assert!(pair[1] >= pair[0], "backoff must not shrink: {BACKOFF_SECS:?}");
+            assert!(
+                pair[1] >= pair[0],
+                "backoff must not shrink: {BACKOFF_SECS:?}"
+            );
         }
         assert!(*BACKOFF_SECS.last().unwrap() <= 30);
     }

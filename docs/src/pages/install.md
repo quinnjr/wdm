@@ -57,9 +57,11 @@ Neither enables `wdm.service` on install. A machine being installed onto
 usually has a display manager already, and enabling a second one that claims
 `display-manager.service` is how a boot ends with no login screen at all.
 
-On Debian the greeter account and `/var/lib/wdm` are created from `postinst`,
+On Debian the greeter account and its directories are created from `postinst`,
 because Debian has no file triggers for `sysusers.d` and `tmpfiles.d`; Fedora's
-systemd runs both automatically.
+systemd runs both automatically on install, and the rpm runs them again from a
+post-install scriptlet so that an *upgrade* whose tmpfiles entries changed
+takes effect immediately rather than at the next boot.
 
 ## Install by hand
 
@@ -67,19 +69,38 @@ systemd runs both automatically.
 | --- | --- |
 | `target/release/wdm` | `/usr/bin/wdm` |
 | `target/release/wdm-greeter` | `/usr/lib/wdm/wdm-greeter` |
-| `packaging/pam.d-wdm` | `/etc/pam.d/wdm` |
+| `packaging/pam.d-wdm` | `/etc/pam.d/wdm` (Arch) |
+| `packaging/pam.d-wdm.debian` | `/etc/pam.d/wdm` (Debian) |
+| `packaging/pam.d-wdm.fedora` | `/etc/pam.d/wdm` (Fedora) |
 | `packaging/wdm.service` | `/etc/systemd/system/wdm.service` |
 | `packaging/wdm.toml.example` | `/etc/wdm/wdm.toml` (optional) |
+
+Only Arch has `system-login`; Debian's common stack is the pam-auth-update
+`common-*` fragments and Fedora's is authselect's `system-auth` plus
+`postlogin`, so there are three files rather than one. Install the one for the
+distribution you are on — the packages already pick correctly.
 
 Create the unprivileged account the greeter runs as. The packages do this
 declaratively with `packaging/wdm.sysusers`, which is what the equivalent
 `useradd` looks like:
 
 ```bash
-useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/wdm \
+useradd --system --shell /usr/sbin/nologin --home-dir /var/empty \
         --no-create-home wdm
-install -d -o wdm -g wdm -m 0755 /var/lib/wdm
+install -d -o root -g root -m 0755 /var/empty
+install -d -o root -g root -m 0755 /var/lib/wdm
 ```
+
+The home is `/var/empty` and it has to exist: wdm sets the greeter's working
+directory to it before exec, so a missing directory is a greeter that never
+spawns. Arch and Fedora ship it in their base filesystem package; Debian does
+not, which is why `packaging/wdm.tmpfiles` declares it.
+
+`/var/lib/wdm` — the per-user last-session record — is **root-owned**, not
+owned by `wdm`. Only wdm itself writes there, and it does so as root; giving
+the directory to the unprivileged greeter account would hand that account a
+directory root creates and renames files in, which is a symlink-attack
+surface.
 
 Then `systemctl enable wdm.service`. The unit aliases itself to
 `display-manager.service`.

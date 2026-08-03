@@ -9,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{
     MemoryRenderBuffer, MemoryRenderBufferRenderElement,
@@ -83,6 +84,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
     let mut error_screen = None;
+    // Latches the "could not build the give-up screen" report. The failure is
+    // a property of the buffer and the renderer, neither of which changes
+    // between frames, so logging it per pass is 60 identical lines a second.
+    let mut error_screen_logged = false;
+    // Not for partial rendering — every drawn frame is drawn in full — but as
+    // the answer to "did anything change since the last pass", which is what
+    // lets an idle login screen skip the frame entirely. `from_output` so a
+    // window resize (a mode change on the output) reads as full damage.
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
     while data.state.running {
         let status = winit_events.dispatch_new_events(|event| match event {
@@ -131,10 +141,28 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
         data.state.cleanup_popups();
 
-        if let Err(e) = render(&mut data, &mut backend, &output, start, &mut error_screen) {
+        if let Err(e) = render(
+            &mut data,
+            &mut backend,
+            &output,
+            &mut damage_tracker,
+            start,
+            &mut error_screen,
+            &mut error_screen_logged,
+        ) {
             log::error!("rendering: {e}");
+            // damage_output() commits the elements it was given as "what is on
+            // screen" before any of the GL calls that actually put them there.
+            // A transient failure — a resize losing the context, say — would
+            // otherwise leave the tracker believing a frame it never drew was
+            // presented: the next pass sees no damage, returns early, and
+            // nothing is ever submitted again. Throwing the tracker away
+            // restores the only safe belief, which is that the screen contents
+            // are unknown and the next frame must be full.
+            damage_tracker = OutputDamageTracker::from_output(&output);
         }
 
+        // Flush what this pass generated before blocking; see LoopData::dispatch.
         if let Err(e) = data.dispatch() {
             log::error!("dispatching clients: {e}");
         }
@@ -154,51 +182,78 @@ fn render(
     data: &mut LoopData,
     backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
     output: &Output,
+    damage_tracker: &mut OutputDamageTracker,
     start: Instant,
     error_screen: &mut Option<(String, Size<i32, Physical>, MemoryRenderBuffer)>,
+    error_screen_logged: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = backend.window_size();
     let damage = [Rectangle::from_size(size)];
     let give_up = data.state.give_up_reason.clone();
 
+    let elements: Vec<WdmElement<GlesRenderer>> = match &give_up {
+        // Same element path as the DRM backend, so the give-up screen is
+        // exercised by whichever backend is in use rather than only here.
+        Some(reason) => {
+            // Cached on message *and* size, as the DRM backend does.
+            // Rasterising a full-screen image every frame is exactly what
+            // render::error_buffer's doc says must not happen.
+            if error_screen
+                .as_ref()
+                .is_none_or(|(cached, cached_size, _)| cached != reason || *cached_size != size)
+            {
+                *error_screen =
+                    Some((reason.clone(), size, crate::render::error_buffer(reason, size)));
+                // A new message or size is a new buffer, so a failure to import
+                // it is news again.
+                *error_screen_logged = false;
+            }
+
+            let (_, _, buffer) = error_screen.as_ref().expect("just populated");
+            match MemoryRenderBufferRenderElement::from_buffer(
+                backend.renderer(),
+                (0.0, 0.0),
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(element) => vec![WdmElement::Image(element)],
+                Err(e) => {
+                    if !*error_screen_logged {
+                        log::error!("building the error screen: {e}");
+                        *error_screen_logged = true;
+                    }
+                    // Leaving the window showing whatever was last drawn beats
+                    // clearing it to nothing: the previous frame is at least
+                    // the greeter the user was looking at, whereas an empty
+                    // window says the display manager died. Returning here
+                    // also keeps the damage tracker's idea of the screen
+                    // truthful, since nothing is submitted.
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            let renderer = backend.renderer();
+            data.state.elements(renderer, output)
+        }
+    };
+
+    // The udev backend's `drew` guard, mirrored: when nothing changed since the
+    // last pass there is nothing to submit, and releasing frame callbacks for a
+    // frame that was not drawn asks the greeter to render again immediately —
+    // a busy loop between two idle processes. An age of 1 is always right here
+    // because every frame that *is* drawn is drawn in full, so the window
+    // always shows exactly the state the tracker recorded last.
+    if damage_tracker.damage_output(1, &elements)?.0.is_none() {
+        return Ok(());
+    }
+
     // Scoped: the framebuffer borrows the backend, and submit() needs it back.
     {
         let (renderer, mut framebuffer) = backend.bind()?;
-
-        let elements: Vec<WdmElement<GlesRenderer>> = match &give_up {
-            // Same element path as the DRM backend, so the give-up screen is
-            // exercised by whichever backend is in use rather than only here.
-            Some(reason) => {
-                // Cached on message *and* size, as the DRM backend does.
-                // Rasterising a full-screen image every frame is exactly what
-                // render::error_buffer's doc says must not happen.
-                if error_screen
-                    .as_ref()
-                    .is_none_or(|(cached, cached_size, _)| cached != reason || *cached_size != size)
-                {
-                    *error_screen =
-                        Some((reason.clone(), size, crate::render::error_buffer(reason, size)));
-                }
-
-                let (_, _, buffer) = error_screen.as_ref().expect("just populated");
-                match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    (0.0, 0.0),
-                    buffer,
-                    None,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ) {
-                    Ok(element) => vec![WdmElement::Image(element)],
-                    Err(e) => {
-                        log::error!("building the error screen: {e}");
-                        Vec::new()
-                    }
-                }
-            }
-            None => data.state.elements(renderer, output),
-        };
 
         // Flipped180 because winit's framebuffer origin is the opposite of ours.
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;

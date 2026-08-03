@@ -389,10 +389,19 @@ impl Config {
 
         // Rank by configured position, and by name among the unconfigured. The
         // sort is stable, so equal keys keep their relative order, but the name
-        // tiebreak makes that irrelevant.
+        // tiebreak makes that irrelevant. `position` is a linear scan per
+        // comparison, which is fine: `output` holds one entry per monitor
+        // someone bothered to configure, and nobody has eight of those.
+        // It also settles duplicates the way a reader expects — a connector
+        // named twice takes the rank of its *first* block.
         connected.sort_by_key(|name| {
-            let configured = self.output.iter().position(|o| o.connector == *name);
-            (configured.unwrap_or(usize::MAX), *name)
+            (
+                self.output
+                    .iter()
+                    .position(|o| o.connector == *name)
+                    .unwrap_or(usize::MAX),
+                *name,
+            )
         });
 
         connected
@@ -509,6 +518,30 @@ mod tests {
             "#,
         );
         assert_eq!(c.rank_outputs(["DP-2"]), ["DP-2"]);
+    }
+
+    #[test]
+    fn a_connector_named_twice_takes_its_first_rank() {
+        // `validate` rejects a duplicated connector, so this cannot arrive from
+        // a config file — but `rank_outputs` is reachable from a Config built
+        // any other way, and the tie still has to be settled somewhere. The
+        // first block wins, matching `output_for`, so the two never disagree
+        // about which block describes a connector.
+        let toml = r#"
+            [[output]]
+            connector = "DP-1"
+            [[output]]
+            connector = "DP-2"
+            [[output]]
+            connector = "DP-1"
+            enable = false
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.validate().is_err());
+
+        assert_eq!(c.rank_outputs(["DP-2", "DP-1"]), ["DP-1", "DP-2"]);
+        // And `enable = false` on the second block does not disable DP-1.
+        assert!(c.output_for("DP-1").is_some_and(|o| o.enable));
     }
 
     #[test]

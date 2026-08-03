@@ -1,0 +1,42 @@
+# PAM configuration for wdm — Fedora and derivatives.
+#
+# Install as /etc/pam.d/wdm. The rpm package does this; the Arch and Debian
+# stacks live in pam.d-wdm and pam.d-wdm.debian.
+#
+# Same shape as the Arch stack, but Fedora has no system-login: the common
+# stack is authselect's system-auth, and session work that only makes sense
+# for a real login — pam_lastlog and friends — is split into postlogin, which
+# every login-capable service is expected to include after system-auth.
+# system-auth is what brings in pam_systemd, which creates the logind session
+# and XDG_RUNTIME_DIR that wdm passes to the launched session; without it most
+# desktops will not start. pam_loginuid is not in system-auth, so it is listed
+# here the way sddm and gdm list it.
+#
+# The session stack is bracketed by pam_selinux close/open, as every
+# login-capable Fedora service brackets its own. `close` runs first and resets
+# any exec context inherited from wdm; `open` computes the context the user's
+# session should run in and arms setexeccon(3) for the exec that follows, so it
+# has to come before system-auth rather than after. Without the pair, the
+# session wdm forks stays in wdm's own domain: confined logins (staff_u,
+# guest_u, xguest_u) would be silently unconfined and MCS separation would not
+# apply — on a distribution that ships SELinux enforcing.
+
+auth        substack    system-auth
+-auth       optional    pam_gnome_keyring.so
+-auth       optional    pam_kwallet5.so
+auth        include     postlogin
+
+account     required    pam_nologin.so
+account     include     system-auth
+
+password    include     system-auth
+
+session     required    pam_selinux.so close
+session     required    pam_loginuid.so
+session     optional    pam_keyinit.so force revoke
+session     required    pam_selinux.so open
+session     optional    pam_namespace.so
+session     include     system-auth
+session     include     postlogin
+-session    optional    pam_gnome_keyring.so auto_start
+-session    optional    pam_kwallet5.so auto_start

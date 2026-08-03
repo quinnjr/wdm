@@ -18,6 +18,9 @@ webkit6 = "0.6"
 # injection waiting to happen.
 serde_json = "1"
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 # See crates/wdm/Cargo.toml. The default theme is data, not documentation: the
 # greeter refuses to start without the theme it was pointed at.
 [package.metadata.deb]

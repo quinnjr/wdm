@@ -1,3 +1,14 @@
-# State directory for the per-user last-session record. Owned by the greeter
-# account, which is the only thing that writes it.
-d /var/lib/wdm 0755 wdm wdm -
+# State directory for the per-user last-session record. Written only by wdm
+# itself, which runs as root — greeters never touch it directly, they only see
+# its contents relayed over the protocol — so it is root-owned. Giving it to
+# the unprivileged greeter account would hand that account a directory root
+# creates and renames files in, which is a symlink-attack surface.
+d /var/lib/wdm 0755 root root -
+
+# The greeter account's home (see wdm.sysusers). wdm sets the child's working
+# directory to it before exec, so it has to exist or the greeter never spawns —
+# and a spawn that fails with ENOENT is retried, backed off, and given up on,
+# which is a boot with no login screen. Arch and Fedora get /var/empty from
+# their base filesystem package; Debian does not, so it is declared here. It
+# must exist and must stay empty: nothing is ever written to it.
+d /var/empty 0755 root root -

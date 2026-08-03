@@ -69,10 +69,10 @@ pub fn render(message: &str, width: i32, height: i32) -> Image {
     let width = width.max(1);
     let height = height.max(1);
 
-    let mut data = Vec::with_capacity((width * height * 4) as usize);
-    for _ in 0..(width * height) {
-        data.extend_from_slice(&BACKGROUND);
-    }
+    // One allocation for the whole background rather than a per-pixel loop:
+    // this path runs when the machine is already in trouble, and at 4K the
+    // difference is millions of iterations.
+    let data = BACKGROUND.repeat((width * height) as usize);
 
     let mut image = Image {
         width,

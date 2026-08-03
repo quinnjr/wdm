@@ -17,13 +17,22 @@ for (const session of wdm.sessions) {
   el("session").add(new Option(session.name, session.id));
 }
 
-// The session the selected user last used. wdm reports it; preselecting it is
-// the theme's choice, which is the point of putting the policy here.
+// The session to preselect: the user's history, then the machine's configured
+// default, then whatever is first. That chain is Model::preferred_session in
+// wdm-greeter-client, which is the reference implementation the other greeters
+// share; this is the same chain written in the theme, because wdm reports the
+// facts and choosing between them is policy. Each candidate is checked against
+// the installed sessions: history can name one that was uninstalled since, and
+// assigning a value no <option> carries leaves the dropdown showing nothing at
+// all. Falling through to the first session is that same guarantee — like
+// preferred_session's unwrap_or(0), never leave the dropdown blank.
 const selectPreferredSession = () => {
   const user = wdm.users.find((u) => u.name === el("user").value);
-  if (user && user.last_session) {
-    el("session").value = user.last_session;
-  }
+  const installed = (id) => wdm.sessions.some((s) => s.id === id);
+  const wanted = [user && user.last_session, wdm.default_session].find(
+    (id) => id && installed(id),
+  );
+  el("session").value = wanted || wdm.sessions[0].id;
 };
 
 // Two elements, not one, and this is the whole reason: "Authentication
@@ -37,6 +46,23 @@ const show = (id, text) => {
 };
 
 const start = () => {
+  // Nothing to log into, or nobody to log in: say so and stop, like the other
+  // greeters do. Calling authenticate("") instead would throw from top level
+  // and take the rest of this script with it — a blank, dead form.
+  if (wdm.users.length === 0 || wdm.sessions.length === 0) {
+    show(
+      "error",
+      wdm.users.length === 0
+        ? "No users available to log in"
+        : "No sessions installed",
+    );
+    el("prompt").textContent = "";
+    for (const id of ["user", "session", "answer"]) {
+      el(id).disabled = true;
+    }
+    return;
+  }
+
   show("message", "");
   show("error", "");
   el("answer").value = "";

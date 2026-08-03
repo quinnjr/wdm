@@ -23,7 +23,7 @@
     DEALINGS IN THE SOFTWARE.
   </copyright>
 
-  <interface name="wdm_greeter_v1" version="1">
+  <interface name="wdm_greeter_v1" version="2">
     <description summary="login and session control for a wdm greeter">
       The singleton object a wdm greeter binds to log a user in.
 
@@ -52,6 +52,9 @@
       <entry name="invalid_env" value="4"
              summary="the env array is not NUL-separated NAME=VALUE entries with
                       NAME matching [A-Za-z0-9_]+"/>
+      <entry name="already_bound" value="5"
+             summary="a second wdm_greeter_v1 object was bound while one is
+                      still alive"/>
     </enum>
 
     <enum name="session_type">
@@ -134,7 +137,9 @@
       <arg name="display_name" type="string" summary="from GECOS, may be empty"/>
       <arg name="avatar_path" type="string" summary="absolute path, empty if none"/>
       <arg name="last_session" type="string"
-           summary="session id used at this user's last successful login, empty if none"/>
+           summary="session id used at this user's last successful login; empty
+                    if none on version 2, the configured default session on
+                    version 1"/>
     </event>
 
     <event name="session">
@@ -142,6 +147,10 @@
         Scanned from the wayland-sessions and xsessions directories under
         /usr/local/share and /usr/share, in that order — an entry in
         /usr/local/share shadows a distribution entry with the same id.
+
+        Ids are unique across the whole list, not per type: start_session looks
+        a session up by id alone, so a Wayland session also shadows an X11
+        session with the same id.
       </description>
       <arg name="id" type="string" summary="stable identifier, the desktop file name"/>
       <arg name="name" type="string" summary="human readable name"/>
@@ -175,8 +184,9 @@
 
     <event name="done">
       <description summary="the enumerate phase is complete">
-        All initial user, session, output_rank and last_error events have been
-        sent. output_rank may still be re-emitted later on hotplug.
+        All initial user, session, output_rank, last_error and — on version 2
+        and above — default_session events have been sent. output_rank may
+        still be re-emitted later on hotplug.
       </description>
     </event>
 
@@ -202,6 +212,30 @@
         rate limiting.
       </description>
       <arg name="reason" type="string" summary="human readable cause"/>
+    </event>
+
+    <event name="default_session" since="2">
+      <description summary="advertise the configured default session">
+        Sent during the enumerate phase, before done. Carries the session id
+        the compositor's configuration names as the machine-wide default, or
+        an empty string when none is configured.
+
+        A user event's last_session is that user's own history and nothing
+        else; this event is the fallback a greeter may preselect for a user
+        who has never logged in. Preselection remains the greeter's policy.
+
+        Gated behind version 2, and listed last so that every event a version 1
+        peer knows keeps the opcode it had. Version negotiation alone would be
+        enough — the compositor never sends this to a resource bound at
+        version 1 — but leaving the earlier opcodes where they were means even
+        a peer that misnegotiates decodes the events it does understand.
+
+        A version 1 peer cannot learn the default through any other event, so
+        the compositor substitutes it into that peer's user.last_session when
+        the user has no history of their own.
+      </description>
+      <arg name="id" type="string"
+           summary="a session id, empty when the config sets none"/>
     </event>
   </interface>
 </protocol>

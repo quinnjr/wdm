@@ -24,8 +24,20 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wdm_protocol::client::wdm_greeter_v1::{self, WdmGreeterV1};
 
+/// Highest `wdm_greeter_v1` version this crate understands.
+///
+/// Bound as `min(advertised, this)`, so a greeter built against version 2 still
+/// runs on a wdm that only offers version 1 — it simply never sees
+/// `default_session`, and `last_session` carries the configured default for it
+/// as it did before the split.
+const INTERFACE_VERSION: u32 = 2;
+
 /// A user wdm offered.
-#[derive(Clone)]
+///
+/// Non-exhaustive: the protocol advertises more about a user than the UI
+/// currently draws, and adding a field must not break an out-of-tree greeter.
+#[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct User {
     pub name: String,
     pub display_name: String,
@@ -44,14 +56,16 @@ impl User {
 }
 
 /// A session wdm offered.
-#[derive(Clone)]
+#[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct Session {
     pub id: String,
     pub name: String,
 }
 
 /// A question PAM is waiting on.
-#[derive(Clone)]
+#[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct Prompt {
     pub id: u32,
     pub text: String,
@@ -63,11 +77,20 @@ pub struct Prompt {
 ///
 /// Wayland events mutate this; the UI reads it. `revision` increments on every
 /// change so the UI can tell whether a repaint is warranted without diffing.
+///
+/// Non-exhaustive: every protocol addition lands here as a new field, and an
+/// out-of-tree greeter must not need a source change to keep compiling. It is
+/// constructed through [`Default`] and [`Link::connect`], never by literal.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct Model {
     pub greeter: Option<WdmGreeterV1>,
     pub users: Vec<User>,
     pub sessions: Vec<Session>,
+    /// The machine-wide default session from wdm's configuration, empty when
+    /// none is set. A user's `last_session` is their own history only, so this
+    /// is the fallback for a user who has never logged in.
+    pub default_session: String,
     pub prompt: Option<Prompt>,
     pub error: Option<String>,
     /// The last `info` or `error` style message PAM sent.
@@ -131,20 +154,37 @@ impl Model {
         self.touch();
     }
 
+    /// Record that the connection to wdm is gone.
+    ///
+    /// Reported through the model because the UIs already draw everything from
+    /// it: the failure lands as a sticky notice (so it is shown, not scrolled
+    /// away by a retry — `blocked` suppresses auto-retry, which would only spin
+    /// against a dead socket) and ends whatever the conversation was doing. The
+    /// alternative was a log line nobody at a login screen can read, under a
+    /// greeter stuck on "Starting session…" forever.
+    pub fn link_lost(&mut self, why: &str) {
+        self.push_notice(format!("Lost the connection to wdm: {why}"));
+        self.authenticated = false;
+        self.conversation_over = true;
+        self.prompt = None;
+        self.touch();
+    }
+
     pub fn session_id(&self, index: usize) -> Option<&str> {
         self.sessions.get(index).map(|s| s.id.as_str())
     }
 
-    /// Index of the session this user last used, or 0.
+    /// Index of the session this user last used, the configured default, or 0.
     ///
-    /// wdm reports `last_session`; preselecting it is the greeter's choice.
+    /// wdm reports the user's history and the machine default separately;
+    /// preselecting either is the greeter's choice. History wins because the
+    /// user's own last choice is a better guess than the administrator's.
     pub fn preferred_session(&self, user: usize) -> usize {
-        let Some(user) = self.users.get(user) else {
-            return 0;
-        };
-        self.sessions
-            .iter()
-            .position(|s| s.id == user.last_session)
+        let by_id = |id: &str| self.sessions.iter().position(|s| s.id == id);
+        self.users
+            .get(user)
+            .and_then(|u| by_id(&u.last_session))
+            .or_else(|| by_id(&self.default_session))
             .unwrap_or(0)
     }
 }
@@ -153,6 +193,10 @@ impl Model {
 pub struct Link {
     connection: Connection,
     queue: EventQueue<Model>,
+    /// Set once dispatch or flush has failed. A Wayland connection does not
+    /// recover; pumping a dead one would report the same failure sixty times a
+    /// second.
+    dead: bool,
 }
 
 impl Link {
@@ -198,20 +242,37 @@ impl Link {
             );
         }
 
-        Ok((Self { connection, queue }, model))
+        Ok((
+            Self {
+                connection,
+                queue,
+                dead: false,
+            },
+            model,
+        ))
     }
 
     /// Deliver any events that have arrived.
     ///
-    /// Returns true when the model changed.
+    /// Returns true when the model changed. A dispatch or flush failure is not
+    /// swallowed: a flush that fails has dropped a request on the floor — a
+    /// `respond` never answered, a `start_session` never started — so it is
+    /// written into the model as [`Model::link_lost`] for the UI to show,
+    /// instead of a log line under a greeter waiting forever.
     pub fn pump(&mut self, model: &mut Model) -> bool {
+        if self.dead {
+            return false;
+        }
         let before = model.revision;
 
         if let Err(e) = self.queue.dispatch_pending(model) {
             log::error!("dispatching wdm_greeter_v1: {e}");
-        }
-        if let Err(e) = self.connection.flush() {
+            self.dead = true;
+            model.link_lost(&e.to_string());
+        } else if let Err(e) = self.connection.flush() {
             log::error!("flushing: {e}");
+            self.dead = true;
+            model.link_lost(&e.to_string());
         }
 
         model.revision != before
@@ -232,11 +293,16 @@ impl Dispatch<WlRegistry, ()> for Model {
         handle: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
-            name, interface, ..
+            name,
+            interface,
+            version,
         } = event
             && interface == "wdm_greeter_v1"
         {
-            state.greeter = Some(registry.bind(name, 1, handle, ()));
+            // Version 2 adds default_session. Binding above what the compositor
+            // advertises is a protocol error, and binding above what this crate
+            // was generated against would promise events it cannot decode.
+            state.greeter = Some(registry.bind(name, version.min(INTERFACE_VERSION), handle, ()));
         }
     }
 }
@@ -264,6 +330,10 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
 
             wdm_greeter_v1::Event::Session { id, name, .. } => {
                 state.sessions.push(Session { id, name });
+            }
+
+            wdm_greeter_v1::Event::DefaultSession { id } => {
+                state.default_session = id;
             }
 
             // Placement is left to the compositor. wdm puts a layer surface with
@@ -399,6 +469,77 @@ mod tests {
         assert!(model.error.is_none());
         assert!(!model.blocked);
         assert!(!model.conversation_over);
+    }
+
+    #[test]
+    fn a_lost_link_is_shown_and_ends_the_conversation() {
+        // The failure a swallowed flush error used to produce: the user clicks
+        // log in, the request never leaves, and the greeter shows
+        // "Starting session…" until someone power-cycles the machine.
+        let mut model = Model {
+            authenticated: true,
+            ..Model::default()
+        };
+        let before = model.revision;
+
+        model.link_lost("broken pipe");
+
+        // Visible, attributed, and final: the notice carries the reason, the
+        // conversation is over, and nothing auto-retries against a dead socket.
+        assert!(model.notice.as_deref().unwrap().contains("broken pipe"));
+        assert!(!model.authenticated);
+        assert!(model.conversation_over);
+        assert!(!model.should_auto_retry());
+        assert_ne!(model.revision, before, "the UI would never repaint");
+    }
+
+    fn model_with_sessions() -> Model {
+        let session = |id: &str| Session {
+            id: id.to_owned(),
+            name: id.to_owned(),
+        };
+        Model {
+            sessions: vec![
+                session("sway.desktop"),
+                session("hyprland.desktop"),
+                session("river.desktop"),
+            ],
+            users: vec![User {
+                name: "alice".to_owned(),
+                display_name: String::new(),
+                last_session: String::new(),
+            }],
+            ..Model::default()
+        }
+    }
+
+    #[test]
+    fn preferred_session_prefers_the_users_history() {
+        let mut model = model_with_sessions();
+        model.users[0].last_session = "river.desktop".to_owned();
+        // Even with a default configured: the user's own last choice is a
+        // better guess than the administrator's.
+        model.default_session = "hyprland.desktop".to_owned();
+        assert_eq!(model.preferred_session(0), 2);
+    }
+
+    #[test]
+    fn preferred_session_falls_back_to_the_configured_default() {
+        // A first-time user has no history; wdm reports last_session empty and
+        // the machine default on its own event.
+        let mut model = model_with_sessions();
+        model.default_session = "hyprland.desktop".to_owned();
+        assert_eq!(model.preferred_session(0), 1);
+    }
+
+    #[test]
+    fn preferred_session_defaults_to_the_first_session() {
+        // No history and no configured default: preselect something rather
+        // than nothing.
+        let model = model_with_sessions();
+        assert_eq!(model.preferred_session(0), 0);
+        // An out-of-range user index must not panic either.
+        assert_eq!(model.preferred_session(7), 0);
     }
 
     #[test]

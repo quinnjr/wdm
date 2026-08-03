@@ -1,6 +1,8 @@
-# PAM configuration for wdm.
+# PAM configuration for wdm — Arch and derivatives, which have system-login.
 #
-# Install as /etc/pam.d/wdm.
+# Install as /etc/pam.d/wdm. The Arch package does this; the Debian and Fedora
+# stacks live in pam.d-wdm.debian and pam.d-wdm.fedora, because neither distro
+# has system-login and each spells its common stack differently.
 #
 # Modelled on the stack a display manager needs: authenticate the user, check the
 # account is allowed in, then open a session so pam_systemd creates the logind
