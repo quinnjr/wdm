@@ -349,12 +349,12 @@ impl Login {
         }
     }
 
-    /// Handle an event from the PAM thread.
+    /// Handle an event from the PAM helper.
     pub fn handle_auth_event(&mut self, event: AuthEvent) -> Action {
         match event {
             AuthEvent::Prompt { id, text, style } => {
-                // Same guard as the Ok arm below. The PAM thread holds a clone
-                // of the sender, so a prompt emitted just before cancel is still
+                // Same guard as the Ok arm below. The reader thread holds a
+                // clone of the sender, so a prompt emitted just before cancel is still
                 // in the channel; forwarding it makes the greeter ask a question
                 // whose answer wdm then kills it for (no_auth).
                 if self.auth.is_none() {
@@ -391,10 +391,9 @@ impl Login {
 
             AuthEvent::Failed(reason) => {
                 // Same guard as the Prompt and Ok arms, and load-bearing for two
-                // separate reasons. Cancelling is how the PAM thread is told to
-                // stop: `reset` drops the handle, the conversation's `recv`
-                // fails, and PAM unwinds through CONV_ERR into exactly this
-                // event. Without the guard a cancel produces the `auth_failed`
+                // separate reasons. Cancelling is how the helper is told to
+                // stop: `reset` drops the handle, the helper's `recv` hits EOF,
+                // and PAM unwinds through CONV_ERR into exactly this event. Without the guard a cancel produces the `auth_failed`
                 // the XML promises will not follow — `report_failure_after`
                 // captures the *post*-reset generation, so the timer's
                 // generation-and-phase check passes and the still-bound greeter
@@ -527,7 +526,7 @@ impl Login {
         Duration::from_secs(BACKOFF_SECS[index])
     }
 
-    /// Tell the PAM thread the user's session process has exited.
+    /// Tell the PAM helper the user's session process has exited.
     ///
     /// This is what runs `pam_close_session`. Skipping it leaks a logind session
     /// per login, because pam_systemd only releases one when the session closes.
@@ -798,7 +797,7 @@ impl Wdm {
             };
         };
 
-        // The PAM thread opens the session and reports its environment; the
+        // The helper opens the session and reports its environment; the
         // launch happens when that arrives. The chosen session's type and
         // desktop travel with the command so pam_systemd registers the logind
         // session correctly — the values match what build_env gives the child.
@@ -1442,8 +1441,9 @@ mod tests {
     fn a_cancelled_attempt_is_neither_reported_nor_charged() {
         // The XML says of `cancel`: "Aborts the PAM conversation. No auth_ok or
         // auth_failed follows." But cancelling is *implemented* by dropping the
-        // AuthHandle, which makes the PAM thread's `recv` fail, which unwinds
-        // through CONV_ERR and arrives here as AuthEvent::Failed. So the one
+        // AuthHandle, which closes wdm's end of the helper's socket, which makes
+        // the helper's `recv` hit EOF, which unwinds PAM through CONV_ERR and
+        // arrives here as AuthEvent::Failed. So the one
         // event the protocol promises will not follow a cancel is precisely the
         // event a cancel generates.
         let mut h = Harness::new(vec![test_user("")], None);

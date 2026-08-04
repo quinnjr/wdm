@@ -39,11 +39,12 @@
 //!
 //! # What is not here yet
 //!
-//! `Msg::Launch` gets as far as `pam_open_session` and stops. Forking the user's
-//! session out of the helper — and the `Launch::validate`/`Launch::build` split
-//! that goes with it — is the next layer of this change; until it lands, wdm
-//! still authenticates through [`crate::auth`]'s thread and nothing sends this
-//! helper a message. See the `ponytail:` in [`serve`].
+//! `Msg::Launch` gets as far as `pam_open_session` and stops: the helper reports
+//! the environment it produced as [`Msg::SessionOpened`] and holds the PAM
+//! session open, and wdm forks and `exec`s the user's session itself, exactly as
+//! it did when PAM ran on a thread. Moving that fork in here — and with it the
+//! `Launch::validate`/`Launch::build` split — is the next layer of this change.
+//! See the `ponytail:` in [`serve`].
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -239,14 +240,16 @@ fn serve(wire: &Wire, pam: &mut dyn Pam) {
         Ok(env) => {
             // ponytail: the session is not launched here yet. This layer proves
             // the helper can authenticate and open a session out of process;
-            // forking, dropping privileges and `exec`ing the session — with the
-            // environment `env` holds, which is where XDG_RUNTIME_DIR comes
-            // from — belongs to the layer that also splits `Launch::prepare`
-            // into validate and build. Until then wdm still launches sessions
-            // itself and nothing sends this helper a Launch, so the pid is a
-            // placeholder rather than a lie about a process that exists.
+            // forking, dropping privileges and `exec`ing the session belongs to
+            // the layer that also splits `Launch::prepare` into validate and
+            // build. Until then wdm forks the session itself, which is why the
+            // environment goes back over the wire rather than being consumed
+            // here: `XDG_RUNTIME_DIR` only exists once `pam_open_session` has
+            // run, and wdm must not invent it. No `SessionStarted` follows,
+            // because no process has started — sending one with a placeholder
+            // pid would be a lie about something wdm could go on to signal.
             log::debug!("PAM session opened with {} environment entries", env.len());
-            wire.send(&Msg::SessionStarted { pid: 0 });
+            wire.send(&Msg::SessionOpened { env });
 
             // Hold the PAM session open until wdm says otherwise. The `hold`
             // callback returning is what drops the session and closes it, so
@@ -274,6 +277,7 @@ fn name_of(msg: &Msg) -> &'static str {
         Msg::Prompt { .. } => "prompt",
         Msg::Ok => "ok",
         Msg::Failed(_) => "failed",
+        Msg::SessionOpened { .. } => "session_opened",
         Msg::SessionStarted { .. } => "session_started",
         Msg::SessionFailed(_) => "session_failed",
         Msg::SessionEnded { .. } => "session_ended",
@@ -751,7 +755,15 @@ mod tests {
                 },
             );
 
-            assert_eq!(expect(&wdm, "the session"), Msg::SessionStarted { pid: 0 });
+            // The environment `open_session` produced, not a pid: wdm is still
+            // the process that forks the session, so this message is what it
+            // launches with.
+            assert_eq!(
+                expect(&wdm, "the session"),
+                Msg::SessionOpened {
+                    env: vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
+                }
+            );
 
             // Dropping wdm's end is how a finished session and a cancellation
             // both present.

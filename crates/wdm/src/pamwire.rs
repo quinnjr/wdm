@@ -101,6 +101,16 @@ pub enum Msg {
     Ok,
     /// The attempt failed; the helper is exiting.
     Failed(String),
+    /// `pam_open_session` succeeded, and this is the environment it produced.
+    ///
+    /// The environment crosses the wire because `XDG_RUNTIME_DIR` and everything
+    /// else a module exports is only known once the session is open, and the
+    /// session is opened in the helper. wdm still forks and `exec`s the user's
+    /// session itself, so it needs those variables; when that moves into the
+    /// helper this message stops carrying them anywhere and becomes purely
+    /// informational, but it does not stop being sent — it is the only signal
+    /// that `open_session` succeeded as opposed to merely having been asked for.
+    SessionOpened { env: Vec<(String, String)> },
     /// The session process is running.
     SessionStarted { pid: u32 },
     /// `pam_open_session` or the launch itself failed; the helper is exiting.
@@ -134,6 +144,7 @@ const TAG_FAILED: u8 = 5;
 const TAG_SESSION_STARTED: u8 = 6;
 const TAG_SESSION_FAILED: u8 = 7;
 const TAG_SESSION_ENDED: u8 = 8;
+const TAG_SESSION_OPENED: u8 = 9;
 
 const STYLE_SECRET: u8 = 0;
 const STYLE_VISIBLE: u8 = 1;
@@ -295,6 +306,10 @@ impl Msg {
                 out.push(TAG_FAILED);
                 put_str(&mut out, reason);
             }
+            Self::SessionOpened { env } => {
+                out.push(TAG_SESSION_OPENED);
+                put_pairs(&mut out, env);
+            }
             Self::SessionStarted { pid } => {
                 out.push(TAG_SESSION_STARTED);
                 put_u32(&mut out, *pid);
@@ -354,6 +369,7 @@ impl Msg {
             },
             TAG_OK => Self::Ok,
             TAG_FAILED => Self::Failed(r.string()?),
+            TAG_SESSION_OPENED => Self::SessionOpened { env: r.pairs()? },
             TAG_SESSION_STARTED => Self::SessionStarted { pid: r.u32()? },
             TAG_SESSION_FAILED => Self::SessionFailed(r.string()?),
             TAG_SESSION_ENDED => Self::SessionEnded {
@@ -412,6 +428,18 @@ mod tests {
         });
         round_trip(Msg::Ok);
         round_trip(Msg::Failed("Authentication failure".to_owned()));
+        round_trip(Msg::SessionOpened {
+            env: vec![
+                ("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned()),
+                ("XDG_SESSION_ID".to_owned(), "3".to_owned()),
+            ],
+        });
+        // An open session with no exported environment at all is a real
+        // outcome — a stack with no pam_systemd and no pam_env produces one —
+        // and an empty pair list is the shape a decoder is most likely to get
+        // wrong, because it is the one where "no bytes left" and "no entries"
+        // look the same.
+        round_trip(Msg::SessionOpened { env: Vec::new() });
         round_trip(Msg::SessionStarted { pid: 4321 });
         round_trip(Msg::SessionFailed("no such session".to_owned()));
         round_trip(Msg::SessionEnded {
