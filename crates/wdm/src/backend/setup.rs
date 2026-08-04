@@ -142,7 +142,9 @@ pub fn build(
         data.state.running = false;
     })?;
 
-    // PAM threads report here.
+    // The PAM helper reports here, through the thread that reads its socket.
+    // Everything the helper says about an attempt — prompts, the verdict, the
+    // session starting and ending — arrives on this channel.
     let (events_tx, events_rx) = smithay::reexports::calloop::channel::channel();
     loop_handle.insert_source(events_rx, |event, _, data| {
         if let smithay::reexports::calloop::channel::Event::Msg(event) = event {

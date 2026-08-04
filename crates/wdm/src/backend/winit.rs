@@ -124,19 +124,25 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
         poll_greeter(&mut data, &loop_handle);
 
-        if let Handled::HandOff(launch) = handle_action(&mut data, &loop_handle) {
-            // Nothing to release: the nested backend never held a display. The
-            // session is still spawned so the environment and privilege drop can
-            // be inspected, but it will not find a compositor to talk to.
-            log::warn!(
-                "launching a session for {} without a display to hand over",
-                launch.username()
-            );
-            match launch.spawn() {
-                Ok(child) => data.state.session = Some(child),
-                Err(e) => log::error!("spawning session: {e}"),
+        if let Handled::HandOff { username } = handle_action(&mut data, &loop_handle) {
+            // The same order as the udev backend, for the same reason and with
+            // one part missing: there is no display to release, because the
+            // nested backend never held one. The greeter still goes first, so
+            // the sequence a reader sees here is the sequence that matters.
+            data.state.greeter.kill();
+            data.state.layers.clear();
+
+            // The session is still launched, so the environment, the privilege
+            // drop and the helper's own handling can be inspected — but it will
+            // not find a compositor to talk to.
+            log::warn!("launching a session for {username} without a display to hand over");
+            if data.state.login.launch() {
+                let outcome = super::wait_for_session(&mut event_loop, &mut data);
+                log::info!("session for {username}: {outcome}");
             }
+            data.state.login.end_session();
             data.state.running = false;
+            break;
         }
 
         data.state.cleanup_popups();

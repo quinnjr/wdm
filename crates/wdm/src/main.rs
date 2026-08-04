@@ -12,6 +12,7 @@ mod config;
 mod errscreen;
 mod input;
 mod login;
+mod pamhelper;
 mod pamwire;
 mod render;
 mod session;
@@ -63,6 +64,12 @@ enum Parsed {
     Run(Args),
     Help,
     Version,
+    /// `wdm --pam-helper`: run PAM for a parent wdm over the socket on fd 3.
+    ///
+    /// Absent from [`USAGE`] on purpose. It is an implementation detail with a
+    /// file descriptor for an interface, not a supported command, and it is
+    /// documented in [`crate::pamhelper`] where the fd is documented with it.
+    PamHelper,
 }
 
 fn parse_args() -> Result<Parsed, String> {
@@ -79,10 +86,24 @@ fn parse_args_from(
     // options and neither is likely to grow.
     let mut config = None;
     let mut backend = None;
+    let mut seen = 0usize;
 
     while let Some(arg) = args.next() {
+        let first = seen == 0;
+        seen += 1;
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            // Only as the sole argument. wdm builds this command line itself,
+            // so anything else is a person or a script that has misunderstood
+            // what it is — and the mode inherits a socket, so silently ignoring
+            // the rest of the line would run PAM with a descriptor nobody
+            // arranged.
+            "--pam-helper" => {
+                if !first || args.next().is_some() {
+                    return Err("--pam-helper takes no other arguments".to_owned());
+                }
+                return Ok(Parsed::PamHelper);
+            }
             "-V" | "--version" => return Ok(Parsed::Version),
             "--config" => {
                 config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?));
@@ -127,6 +148,10 @@ fn main() -> ExitCode {
 
     let args = match parse_args() {
         Ok(Parsed::Run(args)) => args,
+        // Before the config is loaded, and before anything touches a device:
+        // the helper needs neither, and the whole point of it is a process that
+        // has opened nothing a PAM module could trip over.
+        Ok(Parsed::PamHelper) => return pamhelper::run(),
         Ok(Parsed::Help) => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -219,6 +244,24 @@ mod tests {
         ] {
             assert!(USAGE.contains(token), "USAGE does not mention {token}");
         }
+    }
+
+    #[test]
+    fn pam_helper_is_reachable_only_on_its_own() {
+        // The mode inherits a socket on fd 3, so it must not be entered by a
+        // command line that was meant to do something else.
+        assert_eq!(parse_raw(&["--pam-helper"]).unwrap(), Parsed::PamHelper);
+        assert!(parse_raw(&["--pam-helper", "--backend", "winit"]).is_err());
+        assert!(parse_raw(&["--backend", "winit", "--pam-helper"]).is_err());
+        assert!(parse_raw(&["--config", "/tmp/x.toml", "--pam-helper"]).is_err());
+    }
+
+    #[test]
+    fn usage_does_not_advertise_the_pam_helper() {
+        // Deliberate, per the design: an implementation detail with a file
+        // descriptor for an interface is not a supported command, and putting
+        // it in --help invites someone to run it.
+        assert!(!USAGE.contains("--pam-helper"));
     }
 
     #[test]

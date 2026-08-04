@@ -132,9 +132,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
         super::setup::start(&mut data, &loop_handle, &socket_name);
 
-        let launch = pump(&mut event_loop, &mut data, &mut udev, &loop_handle)?;
+        let handoff = pump(&mut event_loop, &mut data, &mut udev, &loop_handle)?;
 
-        let Some(launch) = launch else {
+        let Some(username) = handoff else {
             // The loop ended without a launch: a signal asked wdm to stop. The
             // greeter is killed by Greeter's Drop as `data` goes out of scope.
             log::info!("shutting down");
@@ -148,37 +148,51 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         udev.release(&loop_handle, &data.state.display.clone());
         drop(udev);
 
-        let username = launch.username().to_owned();
-        match launch.spawn() {
-            Ok(mut child) => {
-                log::info!("session for {username} running as pid {}", child.id());
-                let started = Instant::now();
-                let status = child.wait();
-                let ran_for = started.elapsed();
+        // Only now. `launch` is what makes the helper run pam_open_session, and
+        // the whole reason the helper exists is that this line comes after the
+        // three above rather than before them: a module that forks and exits
+        // inside pam_sm_open_session — pam_kwallet5 does, on its error path —
+        // used to inherit wdm's live EGL context and run the driver's atexit
+        // handlers against GPU state it shared with the parent, which on NVIDIA
+        // faulted wdm's own channel and killed the compositor mid-login. There
+        // is now no DRM device, no renderer and no seat anywhere in this process
+        // when that call is made, and PAM does not run in this process at all.
+        //
+        // The price is that a failure from here on cannot be shown immediately:
+        // the greeter is dead. It becomes the next greeter's `last_error`.
+        log::info!("handing the display to {username}'s session");
+        data.state.login.launch();
 
-                // Closing the PAM session is what releases the logind session;
-                // without it pam_systemd leaks one per login.
-                data.state.login.end_session();
+        // The helper forks the session, waits for it, and reports how it ended.
+        // wdm is not the session's parent and could not wait for it even if it
+        // wanted to — which is the point: the session had to be forked from the
+        // process that ran open_session, or loginuid, the session keyring, the
+        // mount namespace and ambient capabilities reach nothing.
+        let outcome = super::wait_for_session(&mut event_loop, &mut data);
 
-                match status {
-                    Ok(status) if ran_for < Duration::from_secs(2) => {
-                        // A session that dies immediately is a broken Exec or a
-                        // compositor that cannot start. Say so, or the user just
-                        // sees the login screen reappear.
-                        let reason =
-                            format!("session exited immediately ({status}) after {ran_for:?}");
-                        log::error!("{reason}");
-                        data.state.login.set_last_error(reason);
-                    }
-                    Ok(status) => log::info!("session for {username} exited: {status}"),
-                    Err(e) => log::error!("waiting for session: {e}"),
-                }
-            }
-            Err(e) => {
-                let reason = format!("could not start session: {e}");
+        // Releases wdm's end so the reader thread stops and reaps the helper.
+        // pam_close_session is the helper's own, paired on the handle that
+        // opened the session.
+        data.state.login.end_session();
+
+        match outcome {
+            crate::login::SessionOutcome::Ended { status, ran_for }
+                if ran_for < Duration::from_secs(2) =>
+            {
+                // A session that dies immediately is a broken Exec or a
+                // compositor that cannot start. Say so, or the user just sees
+                // the login screen reappear.
+                let reason = format!("session exited immediately ({status}) after {ran_for:?}");
                 log::error!("{reason}");
                 data.state.login.set_last_error(reason);
-                data.state.login.end_session();
+            }
+            crate::login::SessionOutcome::Ended { status, .. } => {
+                log::info!("session for {username} exited: {status}");
+            }
+            crate::login::SessionOutcome::Failed(reason) => {
+                let reason = format!("could not start session: {reason}");
+                log::error!("{reason}");
+                data.state.login.set_last_error(reason);
             }
         }
 
@@ -188,12 +202,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // dispatched before the next greeter binds is timing, not a guarantee.
         data.state.login.clear_bindings();
 
-        // Signals arrive on a signalfd that only event_loop.dispatch reads, and
-        // the loop has not been running for as long as the user's session
-        // lasted — which can be hours. A SIGTERM that arrived in that window is
-        // still pending here, and starting the next generation before reading it
-        // would grab the seat, VT_ACTIVATE back to wdm's VT and flash a greeter
-        // at someone who asked wdm to stop, while systemd waits out
+        // Signals arrive on a signalfd that only event_loop.dispatch reads.
+        // `wait_for_session` above does dispatch, so a SIGTERM sent during the
+        // user's session is usually already handled by the time this runs — but
+        // one that arrived in the window between that loop's last dispatch and
+        // here is still pending, and starting the next generation before reading
+        // it would grab the seat, VT_ACTIVATE back to wdm's VT and flash a
+        // greeter at someone who asked wdm to stop, while systemd waits out
         // TimeoutStopSec and then SIGKILLs. One non-blocking pass lets the
         // handler speak first. Sources belonging to the released generation are
         // gone by now, so this pass sees only the long-lived ones.
@@ -212,19 +227,23 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the event loop until a session should be launched or wdm should exit.
+///
+/// Returns the name of the user whose session was validated, if one was. The
+/// session itself is held in the `Login` and is started by the caller, after the
+/// display has been released.
 fn pump(
     event_loop: &mut EventLoop<'static, LoopData>,
     data: &mut LoopData,
     udev: &mut Udev,
     loop_handle: &LoopHandle<'static, LoopData>,
-) -> Result<Option<crate::session::Launch>, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     while data.state.running {
         udev.drain_requests(data, loop_handle);
         poll_greeter(data, loop_handle);
         data.state.cleanup_popups();
 
-        if let Handled::HandOff(launch) = handle_action(data, loop_handle) {
-            return Ok(Some(launch));
+        if let Handled::HandOff { username } = handle_action(data, loop_handle) {
+            return Ok(Some(username));
         }
 
         if udev.active {

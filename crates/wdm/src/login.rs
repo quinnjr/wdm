@@ -105,21 +105,42 @@ enum Phase {
 pub enum Action {
     /// Nothing to do.
     None,
-    /// Authentication succeeded and a session should be launched.
-    Launch(LaunchRequest),
+    /// Authentication succeeded, the account and the session have been
+    /// validated, and the display must now be released.
+    ///
+    /// Deliberately carries nothing but a name for the log line. What is
+    /// launched is held in [`Login::chosen`] and is only acted on by
+    /// [`Login::launch`], which the backend calls *after* the display is gone —
+    /// so there is no second copy of it that could be launched from somewhere
+    /// that still holds the GPU.
+    Launch { username: String },
     /// The greeter should be restarted, optionally told why.
     RestartGreeter { error: Option<String> },
 }
 
-/// A validated request to launch a session.
+/// How the user's session ended, once the helper has said so.
+///
+/// Reaches the backend through [`Login::take_session_outcome`] rather than
+/// through [`Action`], because the backend is not running `handle_action` at
+/// that point: it is sitting in its handoff, with the display released and the
+/// greeter dead, waiting for exactly this.
 #[derive(Debug)]
-pub struct LaunchRequest {
-    pub username: String,
-    pub session: Session,
-    /// Environment from `pam_open_session`.
-    pub pam_env: Vec<(String, String)>,
-    /// Environment the greeter asked for.
-    pub extra_env: Vec<(String, String)>,
+pub enum SessionOutcome {
+    /// The session ran and exited. `status` is the helper's rendering of the
+    /// wait status.
+    Ended { status: String, ran_for: Duration },
+    /// `pam_open_session`, the environment assembly or the fork failed, so no
+    /// session ever ran.
+    Failed(String),
+}
+
+impl std::fmt::Display for SessionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ended { status, ran_for } => write!(f, "{status} after {ran_for:?}"),
+            Self::Failed(reason) => write!(f, "never started: {reason}"),
+        }
+    }
 }
 
 /// The login state machine and the data the enumerate phase advertises.
@@ -159,9 +180,19 @@ pub struct Login {
     /// The pending deferred failure report, so it can be replaced rather than
     /// stacked.
     failure_timer: Option<smithay::reexports::calloop::RegistrationToken>,
-    /// Session chosen by `start_session`, held until PAM reports the session
-    /// environment.
+    /// Session chosen by `start_session`, held until the backend has released
+    /// the display and calls [`Login::launch`].
     chosen: Option<(Session, Vec<(String, String)>)>,
+    /// Set once [`Login::launch`] has told the helper to go.
+    ///
+    /// What it decides is where a `SessionFailed` is reported. Before the
+    /// handoff there is still a greeter, and the answer is to restart it with
+    /// the reason; after it, the display is gone and the backend is blocked
+    /// waiting for an outcome, so the same event has to become one instead —
+    /// otherwise the backend waits for a session that will never start.
+    handed_off: bool,
+    /// How the session ended, once the helper has said. Drained by the backend.
+    session_outcome: Option<SessionOutcome>,
 
     events: smithay::reexports::calloop::channel::Sender<AuthEvent>,
     loop_handle: LoopHandle<'static, LoopData>,
@@ -194,6 +225,8 @@ impl Login {
             generation: 0,
             failure_timer: None,
             chosen: None,
+            handed_off: false,
+            session_outcome: None,
             events,
             loop_handle,
         }
@@ -234,6 +267,12 @@ impl Login {
         self.auth = None;
         self.pending_prompt = None;
         self.chosen = None;
+        // The next login generation starts before the handoff, not after the
+        // previous one: leaving these set would route its first SessionFailed
+        // into an outcome nobody is waiting for, and hand the generation after
+        // that a stale one immediately.
+        self.handed_off = false;
+        self.session_outcome = None;
 
         // Timers live on the long-lived LoopHandle, which outlives this login
         // generation and every one after it. Bumping the generation only makes
@@ -349,12 +388,12 @@ impl Login {
         }
     }
 
-    /// Handle an event from the PAM thread.
+    /// Handle an event from the PAM helper.
     pub fn handle_auth_event(&mut self, event: AuthEvent) -> Action {
         match event {
             AuthEvent::Prompt { id, text, style } => {
-                // Same guard as the Ok arm below. The PAM thread holds a clone
-                // of the sender, so a prompt emitted just before cancel is still
+                // Same guard as the Ok arm below. The reader thread holds a
+                // clone of the sender, so a prompt emitted just before cancel is still
                 // in the channel; forwarding it makes the greeter ask a question
                 // whose answer wdm then kills it for (no_auth).
                 if self.auth.is_none() {
@@ -391,10 +430,9 @@ impl Login {
 
             AuthEvent::Failed(reason) => {
                 // Same guard as the Prompt and Ok arms, and load-bearing for two
-                // separate reasons. Cancelling is how the PAM thread is told to
-                // stop: `reset` drops the handle, the conversation's `recv`
-                // fails, and PAM unwinds through CONV_ERR into exactly this
-                // event. Without the guard a cancel produces the `auth_failed`
+                // separate reasons. Cancelling is how the helper is told to
+                // stop: `reset` drops the handle, the helper's `recv` hits EOF,
+                // and PAM unwinds through CONV_ERR into exactly this event. Without the guard a cancel produces the `auth_failed`
                 // the XML promises will not follow — `report_failure_after`
                 // captures the *post*-reset generation, so the timer's
                 // generation-and-phase check passes and the still-bound greeter
@@ -423,27 +461,35 @@ impl Login {
                 Action::None
             }
 
-            AuthEvent::SessionOpened { env } => {
-                let Some(auth) = &self.auth else {
-                    log::error!("PAM session opened with no attempt in flight");
-                    return Action::RestartGreeter {
-                        error: Some("the login attempt was cancelled".to_owned()),
-                    };
-                };
-                let Some((session, extra_env)) = self.chosen.take() else {
-                    log::error!("PAM session opened with no session chosen");
-                    return Action::RestartGreeter { error: None };
-                };
+            AuthEvent::SessionStarted { pid } => {
+                // Informational. wdm is not this process's parent — the helper
+                // is, and has to be — so there is nothing to record and nothing
+                // to wait on. It is logged because it names the process that now
+                // owns the display, which is the first thing anyone wants when a
+                // login goes dark.
+                log::info!("the session is running as pid {pid}");
+                Action::None
+            }
 
-                Action::Launch(LaunchRequest {
-                    username: auth.username().to_owned(),
-                    session,
-                    pam_env: env,
-                    extra_env,
-                })
+            AuthEvent::SessionEnded { status, ran_for } => {
+                self.session_outcome = Some(SessionOutcome::Ended { status, ran_for });
+                Action::None
             }
 
             AuthEvent::SessionFailed(reason) => {
+                if self.handed_off {
+                    // The display is already released and the backend is waiting
+                    // on an outcome, not dispatching actions. Restarting the
+                    // greeter from here would queue an action nobody drains and
+                    // leave the backend waiting for a session that will never
+                    // start.
+                    log::error!("the session never started: {reason}");
+                    self.session_outcome = Some(SessionOutcome::Failed(reason));
+                    return Action::None;
+                }
+
+                // Before the handoff this is the helper dying between auth_ok
+                // and the launch, and there is still a greeter to tell.
                 self.auth = None;
                 self.chosen = None;
                 self.phase = Phase::Idle;
@@ -527,10 +573,56 @@ impl Login {
         Duration::from_secs(BACKOFF_SECS[index])
     }
 
-    /// Tell the PAM thread the user's session process has exited.
+    /// Tell the helper to open the PAM session and run the chosen session.
     ///
-    /// This is what runs `pam_close_session`. Skipping it leaks a logind session
-    /// per login, because pam_systemd only releases one when the session closes.
+    /// **Only call this once the display has been released** — the DRM device,
+    /// the renderer, libinput and the libseat session all dropped. It is the
+    /// single call site of [`crate::auth::AuthHandle::start_session`] for
+    /// exactly that reason: `pam_open_session` runs the moment the message
+    /// arrives, and a module that `fork`s and `exit`s inside it takes the
+    /// compositor's EGL state with it if there is still one to take.
+    ///
+    /// Returns whether the helper was told anything. A `false` has already set
+    /// an outcome, so the caller's wait ends immediately rather than blocking on
+    /// a session that was never asked for.
+    pub fn launch(&mut self) -> bool {
+        let Some((session, extra_env)) = self.chosen.take() else {
+            // Only reachable if the backend handed off without a validated
+            // choice, which start_session is what prevents.
+            log::error!("launch with no session chosen");
+            self.session_outcome = Some(SessionOutcome::Failed("no session was chosen".to_owned()));
+            return false;
+        };
+        let Some(auth) = &self.auth else {
+            // The attempt was cancelled between the handoff decision and here.
+            // The greeter is already dead and the display already gone, so this
+            // can only be reported through the next greeter's last_error.
+            log::error!("launch with no authentication in flight");
+            self.session_outcome = Some(SessionOutcome::Failed(
+                "the login attempt expired before the session could start".to_owned(),
+            ));
+            return false;
+        };
+
+        // Before the send, not after: a SessionFailed can arrive on the very
+        // next dispatch, and it has to be routed as an outcome rather than as a
+        // greeter restart.
+        self.handed_off = true;
+        auth.start_session(&session, extra_env, self.vt);
+        true
+    }
+
+    /// Take how the session ended, if the helper has said yet.
+    pub fn take_session_outcome(&mut self) -> Option<SessionOutcome> {
+        self.session_outcome.take()
+    }
+
+    /// Dismiss the helper now the session is over.
+    ///
+    /// `pam_close_session` is the helper's own, paired on the handle that opened
+    /// the session — it cannot be anyone else's, since no other process holds
+    /// that handle. This releases wdm's end so the reader thread stops and reaps
+    /// the helper, rather than leaving a zombie per login.
     pub fn end_session(&mut self) {
         if let Some(auth) = &self.auth {
             auth.session_ended();
@@ -589,6 +681,20 @@ impl Dispatch<WdmGreeterV1, ()> for Wdm {
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        if state.login.handed_off {
+            // The greeter was killed and the display released before the helper
+            // was told to launch, but bytes it had already written are still on
+            // its socket and are dispatched from `wait_for_session`. Every
+            // request here reaches `Login::reset` one way or another — `cancel`
+            // and `destroy` directly — and a reset now would discard the
+            // session outcome the backend is blocked waiting for, leaving it
+            // waiting forever with no greeter and no session. Nothing a greeter
+            // can say is actionable at this point anyway: the login it is
+            // talking about has already happened.
+            log::debug!("ignoring a greeter request made after the handoff");
+            return;
+        }
+
         let action = match request {
             wdm_greeter_v1::Request::CreateSession { username } => {
                 state.create_session(resource, username)
@@ -797,20 +903,37 @@ impl Wdm {
                 error: Some("the login attempt expired, please try again".to_owned()),
             };
         };
+        let username = auth.username().to_owned();
 
-        // The PAM thread opens the session and reports its environment; the
-        // launch happens when that arrives. The chosen session's type and
-        // desktop travel with the command so pam_systemd registers the logind
-        // session correctly — the values match what build_env gives the child.
-        auth.start_session(
-            session.xdg_session_type().to_owned(),
-            session.xdg_session_desktop().to_owned(),
-        );
+        // Here, and not after the handoff, because this is the last moment at
+        // which there is a greeter on screen to be told. Everything that follows
+        // — releasing the display, opening the PAM session, forking — happens
+        // with nothing to display an error on, so a failure there can only reach
+        // the user through the *next* greeter's last_error.
+        //
+        // This is also the check that stops `create_session("root")` plus the
+        // root password from launching a root graphical session; see
+        // Launch::validate for why that is reachable at all.
+        if let Err(e) = crate::session::Launch::validate(&session, &username) {
+            log::error!("preparing session {session_id}: {e}");
+            self.login.reset();
+            return Action::RestartGreeter {
+                error: Some(e.to_string()),
+            };
+        }
 
+        // Recorded now rather than after the session starts: the session is what
+        // the user chose, and a compositor that crashes on startup should still
+        // be preselected so they can try it again or pick another.
+        self.login.remember_session(&username, &session.id);
+
+        // Held, not sent. The message that starts PAM's session goes out from
+        // Login::launch, which the backend calls only once the display has been
+        // released — that ordering is the whole reason the helper exists.
         self.login.chosen = Some((session, extra_env));
         self.login.phase = Phase::Launching;
 
-        Action::None
+        Action::Launch { username }
     }
 }
 
@@ -1016,6 +1139,8 @@ mod tests {
         // why default_session was appended rather than inserted.
         pub const USER: u16 = 0;
         pub const DONE: u16 = 4;
+        /// wdm_greeter_v1.destroy, the first request in the XML.
+        pub const DESTROY: u16 = 0;
         pub const AUTH_OK: u16 = 6;
         pub const AUTH_FAILED: u16 = 7;
         pub const DEFAULT_SESSION: u16 = 8;
@@ -1126,6 +1251,11 @@ mod tests {
                 body.extend_from_slice(&version.to_ne_bytes());
                 body.extend_from_slice(&GREETER.to_ne_bytes());
                 self.send(REGISTRY, 0, &body);
+            }
+
+            /// wdm_greeter_v1.destroy, which also cancels the conversation.
+            pub fn destroy_greeter(&mut self) {
+                self.send(GREETER, DESTROY, &[]);
             }
 
             /// Drain everything the server has written so far.
@@ -1442,8 +1572,9 @@ mod tests {
     fn a_cancelled_attempt_is_neither_reported_nor_charged() {
         // The XML says of `cancel`: "Aborts the PAM conversation. No auth_ok or
         // auth_failed follows." But cancelling is *implemented* by dropping the
-        // AuthHandle, which makes the PAM thread's `recv` fail, which unwinds
-        // through CONV_ERR and arrives here as AuthEvent::Failed. So the one
+        // AuthHandle, which closes wdm's end of the helper's socket, which makes
+        // the helper's `recv` hit EOF, which unwinds PAM through CONV_ERR and
+        // arrives here as AuthEvent::Failed. So the one
         // event the protocol promises will not follow a cancel is precisely the
         // event a cancel generates.
         let mut h = Harness::new(vec![test_user("")], None);
@@ -1497,6 +1628,136 @@ mod tests {
                 .iter()
                 .any(|m| m.opcode == wire::AUTH_FAILED),
             "auth_failed reached a greeter that had cancelled"
+        );
+    }
+
+    #[test]
+    fn a_session_failure_after_the_handoff_becomes_an_outcome_not_a_restart() {
+        // The two halves of the same event, and getting it wrong hangs wdm.
+        // Before the handoff there is still a greeter, so the answer is to
+        // restart it with the reason. After it, the display is released and the
+        // backend is sitting in `wait_for_session` — which does not drain
+        // actions — so a RestartGreeter there would be queued for nobody while
+        // the backend waited forever for a session that will never start.
+        let mut login = login();
+
+        // Before.
+        let action = login.handle_auth_event(AuthEvent::SessionFailed("pam said no".to_owned()));
+        assert!(
+            matches!(action, Action::RestartGreeter { error: Some(ref e) } if e == "pam said no"),
+            "a pre-handoff failure must reach the greeter that is still on screen: {action:?}"
+        );
+        assert!(login.take_session_outcome().is_none());
+
+        // After.
+        login.handed_off = true;
+        let action = login.handle_auth_event(AuthEvent::SessionFailed("pam said no".to_owned()));
+        assert!(
+            matches!(action, Action::None),
+            "a post-handoff failure queued an action nobody drains: {action:?}"
+        );
+        let outcome = login
+            .take_session_outcome()
+            .expect("the backend was left waiting for a session that never started");
+        assert!(
+            matches!(outcome, SessionOutcome::Failed(ref e) if e == "pam said no"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_ends_produces_an_outcome_once() {
+        let mut login = login();
+        login.handed_off = true;
+
+        assert!(login.take_session_outcome().is_none());
+        let action = login.handle_auth_event(AuthEvent::SessionEnded {
+            status: "exit status: 0".to_owned(),
+            ran_for: Duration::from_secs(90),
+        });
+        assert!(matches!(action, Action::None));
+
+        let outcome = login.take_session_outcome().expect("no outcome recorded");
+        let SessionOutcome::Ended { status, ran_for } = outcome else {
+            panic!("expected a session that ended, got {outcome:?}");
+        };
+        assert_eq!(status, "exit status: 0");
+        assert_eq!(ran_for, Duration::from_secs(90));
+
+        // Taken, not peeked: leaving it behind would end the *next* login
+        // generation's wait immediately, before its session had even started.
+        assert!(login.take_session_outcome().is_none());
+    }
+
+    #[test]
+    fn a_greeter_request_after_the_handoff_cannot_strand_the_backend() {
+        // The greeter is killed before the helper is told to launch, but bytes
+        // it had already written are still on its socket and get dispatched from
+        // `wait_for_session`. A `cancel` or `destroy` among them reaches
+        // Login::reset, which clears the session outcome — so the backend would
+        // sit in its wait forever, with no greeter, no session and a released
+        // display. The only way out would be the VT chord.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+
+        h.state.login.phase = Phase::Launching;
+        h.state.login.handed_off = true;
+        h.state.login.session_outcome = Some(SessionOutcome::Ended {
+            status: "exit status: 0".to_owned(),
+            ran_for: Duration::from_secs(90),
+        });
+
+        // wdm_greeter_v1.destroy, which is the request a dying greeter is most
+        // likely to have written last.
+        client.destroy_greeter();
+        h.dispatch();
+
+        assert!(
+            h.state.login.take_session_outcome().is_some(),
+            "a greeter request after the handoff discarded the session outcome"
+        );
+        assert!(
+            h.state.pending_actions.is_empty(),
+            "a greeter request after the handoff queued work for nobody"
+        );
+    }
+
+    #[test]
+    fn reset_forgets_the_previous_generations_handoff() {
+        // `reset` runs between login generations. Leaving `handed_off` set would
+        // route the next generation's pre-handoff SessionFailed — the helper
+        // dying between auth_ok and the launch — into an outcome nobody is
+        // waiting for, so the greeter would never be restarted and the login
+        // screen would sit there.
+        let mut login = login();
+        login.handed_off = true;
+        login.session_outcome = Some(SessionOutcome::Failed("stale".to_owned()));
+
+        login.reset();
+
+        assert!(
+            !login.handed_off,
+            "the handoff flag outlived its generation"
+        );
+        assert!(
+            login.take_session_outcome().is_none(),
+            "a stale outcome would end the next generation's wait immediately"
+        );
+    }
+
+    #[test]
+    fn launching_with_nothing_chosen_ends_the_wait_rather_than_hanging() {
+        // Only reachable if the backend handed off without a validated choice,
+        // which start_session is what prevents. It matters anyway: by the time
+        // `launch` is called the display is already gone, so a `false` that did
+        // not also record an outcome would leave the backend blocked forever
+        // with no greeter and no session — a black screen with no way out but
+        // the VT chord.
+        let mut login = login();
+        assert!(!login.launch(), "launch claimed to have started something");
+        assert!(
+            login.take_session_outcome().is_some(),
+            "a refused launch left the backend waiting forever"
         );
     }
 

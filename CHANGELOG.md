@@ -5,6 +5,53 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-04
+
+wdm no longer runs PAM in its own process. The conversation and the session
+move into a freshly `exec`'d, single-threaded helper that forks the user's
+session — the arrangement `login(1)` and `sshd` use, and for the reasons they
+use it.
+
+`pam_kwallet5` is restored to all three PAM stacks: the hazard that made it
+kill the compositor mid-login is closed rather than worked around.
+
+**The reordered handoff has run on no hardware.** `--backend winit` cannot
+exercise DRM, the seat, or the handoff, so the path this release exists to
+change rests on review and on tests that stop at the process boundary.
+
+### Fixed
+
+- **PAM now runs in its own process, and the user's session is forked from it.**
+  0.4.0 unblocked login by removing `pam_kwallet5` from the shipped PAM stacks.
+  That treated one module; the hazard was structural, and **any** module that
+  forks and exits during `pam_open_session` reproduced it. It is now closed, and
+  `pam_kwallet5` is started again on all three distributions.
+
+  `wdm --pam-helper` is a freshly `exec`'d copy of wdm's own binary that talks to
+  wdm over a `SOCK_SEQPACKET` socket on fd 3. It has never loaded a graphics
+  driver, so there are no `atexit` handlers and no EGL state for a forking module
+  to corrupt. And wdm releases the DRM device, the renderer, libinput and the
+  libseat session **before** it tells the helper to open the session at all, so
+  there is no display state anywhere in the process that runs PAM.
+
+  Three further defects fall out of the same change, none of which was fixable by
+  configuration:
+
+  - `pam_loginuid: set_loginuid failed`. The kernel refuses the write unless the
+    writing task is the one `/proc/self` names — the thread-group leader — and
+    PAM ran on a spawned thread. The helper is single-threaded, and the session
+    it forks inherits the value.
+  - `pam_systemd: Failed to set ambient capabilities`. `prctl` is per-thread, so
+    the capabilities never reached the session even when the call succeeded.
+  - `pam_keyinit`, `pam_selinux` and `pam_namespace` never reached the session,
+    because `fork()` from `main` copies only the calling thread's state. The
+    session is now forked from the process that ran `pam_open_session`.
+
+  A session that fails to start after the display has been released can no longer
+  be reported immediately — there is no greeter on screen. It is shown by the
+  next greeter as `last_error`, which is the price of not opening a PAM session
+  while holding the GPU.
+
 ## [0.4.0] — 2026-08-04
 
 A security and conformance release. **Upgrade if you run 0.3.0**: an
@@ -498,7 +545,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/quinnjr/wdm/releases/tag/v0.5.0
 [0.4.0]: https://github.com/quinnjr/wdm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0

@@ -159,9 +159,10 @@ fn avatar_for(name: &str, home: &Path) -> String {
 pub fn discover(range: UidRange, last_sessions: &LastSessions) -> Vec<User> {
     // SAFETY: getpwent is not reentrant and shares a static iteration cursor, so
     // the invariant is that no other thread calls getpwent/setpwent/endpwent.
-    // wdm calls this only from the event loop thread. The PAM threads do resolve
-    // accounts through NSS, but via getpwnam_r, which does not touch that
-    // cursor — the earlier justification named the wrong reason.
+    // wdm calls this only from the event loop thread. PAM does not run in this
+    // process at all any more — it runs in the helper — and the account
+    // resolution that does happen here and there goes through getpwnam_r, which
+    // does not touch that cursor.
     let all = unsafe { uzers::all_users() };
 
     let mut users: Vec<User> = all
