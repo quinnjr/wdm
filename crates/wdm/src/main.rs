@@ -135,24 +135,63 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-fn main() -> ExitCode {
-    // WDM_LOG rather than RUST_LOG so a session's own RUST_LOG cannot
-    // reconfigure the display manager's logging.
-    //
-    // `filter_or`, not `filter`: with no default directive the floor is `error`,
-    // and `auth::to_greeter`'s journal line — the *only* record of why an
-    // authentication failed, now that the greeter is told nothing — is emitted
-    // at `info` and would be discarded on any install that has not set WDM_LOG.
-    // The default belongs here rather than in packaging/wdm.service so that a
-    // hand-installed wdm, or one started from a shell for a bring-up, keeps the
-    // record too.
+/// The default filter for both loggers when `WDM_LOG` is unset.
+///
+/// Scoped to wdm rather than a bare `info`: a bare default directive is a
+/// *global* floor, so every dependency that logs at info would land in the
+/// journal unfiltered. wdm's own records are what the default exists for —
+/// `auth::to_greeter`'s journal line is the only record of why an authentication
+/// failed, now that the greeter is told nothing, and it is emitted at `info`.
+/// Everything else is heard from at `warn`, which is where smithay's commit and
+/// EGL failures are.
+const DEFAULT_LOG: &str = "warn,wdm=info";
+
+/// Route both diagnostic channels to stderr, from one environment variable.
+///
+/// wdm logs through `log`; smithay 0.7 logs through `tracing`, and 36 `warn!`
+/// and `error!` sites in its DRM backend alone go nowhere without a subscriber —
+/// atomic commit rejections, format negotiation failures, EGL import errors. Two
+/// facades, therefore two initialisations, but deliberately **one** variable: an
+/// operator debugging a black screen should not have to discover a second one.
+/// `WDM_LOG` rather than `RUST_LOG` so a session's own `RUST_LOG` cannot
+/// reconfigure the display manager's logging.
+///
+/// The default belongs here rather than in `packaging/wdm.service`, so a
+/// hand-installed wdm, or one started from a shell for a bring-up, keeps it too.
+fn init_logging() {
+    // `filter_or`, not `filter`: with no default directive the floor is `error`.
     env_logger::Builder::from_env(
         env_logger::Env::new()
-            .filter_or("WDM_LOG", "info")
+            .filter_or("WDM_LOG", DEFAULT_LOG)
             .write_style("WDM_LOG_STYLE"),
     )
     .format_timestamp_millis()
     .init();
+
+    // `set_global_default` rather than tracing-subscriber's own `init()`: that
+    // also installs `tracing_log::LogTracer`, which claims the global `log`
+    // logger slot env_logger has just taken, so the whole call would fail and
+    // smithay would stay silent — the defect this exists to fix. The
+    // `tracing-log` feature is off in Cargo.toml for the same reason.
+    //
+    // A malformed WDM_LOG falls back rather than exiting: env_logger has already
+    // done the same with it, and a display manager that refuses to start over a
+    // logging directive is worse than one that starts with the default.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("WDM_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .finish();
+    // Reported through neither facade: `log` would be circular-looking and
+    // `tracing` has no subscriber, which is precisely what failed.
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("wdm: smithay's diagnostics will be discarded: {e}");
+    }
+}
+
+fn main() -> ExitCode {
+    init_logging();
 
     let args = match parse_args() {
         Ok(Parsed::Run(args)) => args,

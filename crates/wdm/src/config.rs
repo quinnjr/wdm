@@ -570,6 +570,7 @@ mod tests {
             connector = "DP-1"
             mode = "2560x1440@144"
             scale = 1.5
+            transform = "flipped-90"
 
             [[output]]
             connector = "HDMI-A-1"
@@ -579,7 +580,51 @@ mod tests {
         assert_eq!(c.vt, 7);
         assert_eq!(c.default_session.as_deref(), Some("hyprland.desktop"));
         assert_eq!(c.output_for("DP-1").unwrap().scale, Some(1.5));
+        assert_eq!(
+            c.output_for("DP-1").unwrap().transform,
+            Transform::Flipped90
+        );
         assert!(!c.output_for("HDMI-A-1").unwrap().enable);
+    }
+
+    #[test]
+    fn every_documented_transform_spelling_parses() {
+        // The spellings come from `rename_all = "kebab-case"` plus five
+        // per-variant renames, and packaging/wdm.toml.example documents all
+        // eight. Nothing tied the two together: a typo in a rename attribute
+        // would leave a documented value unparseable, and a malformed config is
+        // fatal — so the failure is not a rotation that does not happen, it is
+        // wdm refusing to start at all.
+        let table = [
+            ("normal", Transform::Normal),
+            ("90", Transform::Rotate90),
+            ("180", Transform::Rotate180),
+            ("270", Transform::Rotate270),
+            ("flipped", Transform::Flipped),
+            ("flipped-90", Transform::Flipped90),
+            ("flipped-180", Transform::Flipped180),
+            ("flipped-270", Transform::Flipped270),
+        ];
+
+        for (spelling, expected) in table {
+            let c: Config = toml::from_str(&format!(
+                "[[output]]\nconnector = \"DP-1\"\ntransform = \"{spelling}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("transform = {spelling:?} does not parse: {e}"));
+            assert_eq!(
+                c.output_for("DP-1").unwrap().transform,
+                expected,
+                "transform = {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_omitted_transform_is_normal() {
+        // The documented default, and the reason every other output block in
+        // these tests can leave the key out.
+        let c: Config = toml::from_str("[[output]]\nconnector = \"DP-1\"\n").unwrap();
+        assert_eq!(c.output_for("DP-1").unwrap().transform, Transform::Normal);
     }
 
     #[test]

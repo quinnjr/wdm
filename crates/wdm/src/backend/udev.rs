@@ -37,7 +37,7 @@ use smithay::reexports::drm::control::{Device as ControlDevice, ResourceHandles,
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, backend::GlobalId};
-use smithay::utils::{DeviceFd, Physical, Size};
+use smithay::utils::DeviceFd;
 
 use crate::comp::{LoopData, Wdm};
 use crate::config::{self, Config};
@@ -49,12 +49,25 @@ use super::{Handled, Request, handle_action, poll_greeter};
 /// first so a greeter that draws translucency gets it.
 const COLOR_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 
-/// How long to wait for the seat after a session exits before giving up.
+/// How long [`Udev::new`] keeps retrying before giving up.
 ///
-/// logind needs a moment to tear the previous session down. Retrying rather than
-/// failing outright matters because failing here leaves the machine with no
-/// login prompt at all.
-const SEAT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+/// It covers the seat *and* the GPU, because the settling race is the same one
+/// twice: after a session exits, logind needs a moment to tear the previous
+/// session down, and the compositor that just released the DRM node needs a
+/// moment for the kernel to actually free it — `DrmDevice::new` runs immediately
+/// after. Retrying rather than failing outright matters because failing here
+/// leaves the machine with no login prompt at all, and with `Restart=always` and
+/// `StartLimitBurst=5` in the unit, five such failures leave it that way
+/// permanently.
+const STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a pass waits for events when the last one drew nothing.
+///
+/// See [`pump`]: this is the idle rate, not a responsiveness floor.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How long a pass waits after one that drew.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 type Allocator = GbmAllocator<DrmDeviceFd>;
 type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
@@ -72,10 +85,16 @@ struct Device {
     renderer: GlesRenderer,
     /// One entry per active CRTC.
     outputs: HashMap<crtc::Handle, Head>,
-    /// The give-up screen, rasterised once and reused. It never changes, and
-    /// rebuilding a full-screen image every frame on the one path that runs when
-    /// everything else has failed would be gratuitous.
-    error_screen: Option<(String, Size<i32, Physical>, MemoryRenderBuffer)>,
+    /// The message the rasters below were built for. Emptied when it changes,
+    /// which is the only thing that invalidates them.
+    error_reason: String,
+    /// The give-up screen, rasterised once **per output size** and reused. One
+    /// slot keyed on `(reason, size)` was not enough: it is consulted once per
+    /// head, so two monitors of different resolutions alternated the key and
+    /// rebuilt it twice a tick — and `errscreen::render` allocates a full
+    /// framebuffer (33MB at 4K) and re-rasterises every glyph each time, on the
+    /// one path that runs when everything else has already failed.
+    error_screens: HashMap<(i32, i32), MemoryRenderBuffer>,
     /// The DRM event source, removed before the device is dropped.
     drm_token: RegistrationToken,
     /// udev reports device removal by device id, not by path, so the id is what
@@ -144,7 +163,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // Everything that holds the display goes now, in this order: greeter
         // first so it stops drawing, then the device, then the seat.
         data.state.greeter.kill();
-        data.state.layers.clear();
+        // Layers, cursor and focus together: the cursor status in particular is
+        // a reference to a surface of the client about to be reaped, and the
+        // next generation renders it. See Wdm::forget_greeter.
+        data.state.forget_greeter();
         udev.release(&loop_handle, &data.state.display.clone());
         drop(udev);
 
@@ -246,21 +268,34 @@ fn pump(
             return Ok(Some(username));
         }
 
-        if udev.active {
-            udev.render(data);
-        }
+        let drew = udev.active && udev.render(data);
 
         // Flush what this pass generated before blocking; see LoopData::dispatch.
         if let Err(e) = data.dispatch() {
             log::error!("dispatching clients: {e}");
         }
 
-        // A VT switch or a pause arrives through the loop, so a short timeout
-        // keeps wdm responsive even with no client activity.
-        if event_loop
-            .dispatch(Some(Duration::from_millis(16)), data)
-            .is_err()
-        {
+        // Frame pacing, and nothing else. It is *not* what keeps wdm responsive:
+        // a VT switch arrives on the libseat notifier's fd, input on libinput's,
+        // client requests on the display's poll fd, the helper's messages on the
+        // auth channel and a `systemctl stop` on the signalfd — all of them
+        // registered calloop sources, and calloop wakes on fd readiness whatever
+        // the timeout is. What the timeout does is bound how long a pass that
+        // nothing woke waits before drawing again, which matters for the first
+        // frame after a mode set and for anything a client animates without
+        // committing.
+        //
+        // So it stretches when the last pass committed nothing. An idle login
+        // screen was otherwise forced through 60 full passes a second —
+        // drain_requests, a `waitpid` for the greeter, a whole popup-tree walk
+        // and a rebuild of every element list per output — for smithay's damage
+        // check to then throw all of it away. Blocking indefinitely instead
+        // would be wrong: a greeter that dies is noticed by `poll_greeter`, and
+        // nothing in the loop wakes on SIGCHLD. Its connection closing does wake
+        // the display fd, so IDLE_TIMEOUT is the bound for a greeter that
+        // manages to die without that happening, not the normal path.
+        let timeout = if drew { FRAME_INTERVAL } else { IDLE_TIMEOUT };
+        if event_loop.dispatch(Some(timeout), data).is_err() {
             break;
         }
     }
@@ -342,9 +377,16 @@ fn activate_vt(vt: u32, wait: bool) {
 impl Udev {
     /// Take the seat, open the GPU, and register every event source.
     ///
-    /// Retries acquiring the seat: after a session exits, logind needs a moment
-    /// to release it, and failing here would leave the machine with no login
-    /// prompt.
+    /// Both the seat and the GPU are retried until [`STARTUP_RETRY_TIMEOUT`]:
+    /// after a session exits, logind needs a moment to release the seat and the
+    /// kernel a moment to free the DRM node the session's compositor was
+    /// holding, and failing either would leave the machine with no login prompt.
+    ///
+    /// Finding no GPU at all is a warning rather than an error, which is the one
+    /// asymmetry here worth stating: [`Request::DeviceAdded`] is a working
+    /// recovery path — it is how a GPU that appears later is picked up — so
+    /// exiting instead would burn a `StartLimitBurst` slot on a machine that was
+    /// about to work.
     fn new(
         loop_handle: &LoopHandle<'static, LoopData>,
         data: &mut LoopData,
@@ -355,7 +397,10 @@ impl Udev {
         // only way to end up on wdm's own VT is to be standing on it already.
         activate_vt(vt, true);
 
-        let deadline = Instant::now() + SEAT_RETRY_TIMEOUT;
+        // One deadline for the whole of this function, not one per step: the two
+        // waits are for the same previous session going away, so a seat that
+        // took nine seconds must not then grant the GPU another ten.
+        let deadline = Instant::now() + STARTUP_RETRY_TIMEOUT;
         let (session, notifier) = loop {
             match LibSeatSession::new() {
                 Ok(pair) => break pair,
@@ -427,17 +472,52 @@ impl Udev {
             active: true,
         };
 
-        // Prefer the GPU logind marks primary; otherwise the first one udev
-        // reported. A machine with a discrete and an integrated GPU otherwise
-        // gets whichever udev happened to enumerate first.
-        let chosen = primary_gpu(&seat_name)
-            .ok()
-            .flatten()
-            .or_else(|| all_gpus(&seat_name).ok().and_then(|g| g.into_iter().next()))
-            .or_else(|| initial_devices.into_iter().next())
-            .ok_or("no GPU found on this seat")?;
+        loop {
+            // Prefer the GPU logind marks primary; otherwise the first one udev
+            // reported. A machine with a discrete and an integrated GPU
+            // otherwise gets whichever udev happened to enumerate first.
+            //
+            // Re-resolved each pass rather than once: on the retry path the
+            // reason there is nothing to open may be that udev has not settled
+            // either, and a device chosen from a stale enumeration would be
+            // retried forever.
+            let chosen = primary_gpu(&seat_name)
+                .ok()
+                .flatten()
+                .or_else(|| all_gpus(&seat_name).ok().and_then(|g| g.into_iter().next()))
+                .or_else(|| initial_devices.first().cloned());
 
-        udev.open_device(&chosen, loop_handle, data)?;
+            match chosen {
+                // DrmDevice::new runs here, immediately after the previous
+                // session's compositor released the node — the same settling
+                // race the seat retry above exists for.
+                Some(path) => match udev.open_device(&path, loop_handle, data) {
+                    Ok(()) => break,
+                    Err(e) if Instant::now() < deadline => {
+                        log::debug!("opening {} failed ({e}), retrying", path.display());
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => return Err(e),
+                },
+
+                None if Instant::now() < deadline => {
+                    log::debug!("no gpu on {seat_name} yet, retrying");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+
+                // Not fatal, deliberately. Request::DeviceAdded picks up a GPU
+                // that appears later, so wdm waits with no outputs rather than
+                // exiting — the greeter, the user list and the session list are
+                // all still valid, and exiting would spend one of the unit's
+                // five restarts on a machine that is only slow to enumerate.
+                None => {
+                    log::warn!(
+                        "no gpu found on {seat_name}; waiting for one to appear, nothing will be drawn until it does"
+                    );
+                    break;
+                }
+            }
+        }
 
         // Deliberately no change_vt here. It used to run at this point, and it
         // was the reason nothing ever appeared: seatd registers a session
@@ -514,7 +594,8 @@ impl Udev {
             output_manager,
             renderer,
             outputs: HashMap::new(),
-            error_screen: None,
+            error_reason: String::new(),
+            error_screens: HashMap::new(),
             drm_token,
             device_id: node.dev_id(),
         });
@@ -694,7 +775,14 @@ impl Udev {
         // Coalescing keeps one burst to one probe.
         let mut rescan = false;
 
-        for request in std::mem::take(&mut data.state.requests) {
+        // Taken rather than drained in place, because the arms below need `data`
+        // mutably — `open_device` in particular. The emptied buffer is handed
+        // back at the end so its capacity survives: `take` alone leaves the
+        // queue at capacity 0, so the next `request` allocates and this frees,
+        // once per pass forever.
+        let mut requests = std::mem::take(&mut data.state.requests);
+
+        for request in requests.drain(..) {
             match request {
                 Request::SwitchVt(vt) => {
                     log::info!("switching to vt {vt}");
@@ -797,15 +885,24 @@ impl Udev {
             }
         }
 
+        // Only if nothing was queued while this ran: an arm above may have
+        // pushed a request, and that queue is the live one.
+        if data.state.requests.is_empty() {
+            data.state.requests = requests;
+        }
+
         if rescan {
             self.scan_connectors(data);
         }
     }
 
     /// Draw every output that needs it.
-    fn render(&mut self, data: &mut LoopData) {
+    ///
+    /// Returns whether anything was actually committed, which is what [`pump`]
+    /// uses to decide how long to wait before coming round again.
+    fn render(&mut self, data: &mut LoopData) -> bool {
         let Some(device) = &mut self.device else {
-            return;
+            return false;
         };
 
         let give_up = data.state.give_up_reason.as_deref();
@@ -831,24 +928,20 @@ impl Udev {
                         .map(|m| m.size)
                         .unwrap_or_else(|| (640, 480).into());
 
-                    // Keyed on the size as well as the message: two outputs of
-                    // different resolutions would otherwise share one raster and
+                    // A raster per size, not one slot keyed on the size: this
+                    // runs once per head, so a single slot is thrashed by two
+                    // monitors with different modes and rebuilt on every pass.
+                    // Sharing one raster between them is not the alternative —
                     // the second would show the text in a box of the wrong size.
-                    if device
-                        .error_screen
-                        .as_ref()
-                        .is_none_or(|(cached, cached_size, _)| {
-                            cached != reason || *cached_size != size
-                        })
-                    {
-                        device.error_screen = Some((
-                            reason.to_owned(),
-                            size,
-                            crate::render::error_buffer(reason, size),
-                        ));
+                    if device.error_reason != reason {
+                        device.error_reason = reason.to_owned();
+                        device.error_screens.clear();
                     }
 
-                    let (_, _, buffer) = device.error_screen.as_ref().expect("just populated");
+                    let buffer = device
+                        .error_screens
+                        .entry((size.w, size.h))
+                        .or_insert_with(|| crate::render::error_buffer(reason, size));
                     // The size is given explicitly, and in *logical* pixels: the
                     // buffer is rasterised at the physical mode size with a
                     // buffer scale of 1, so leaving this None makes smithay read
@@ -904,6 +997,8 @@ impl Udev {
             data.state
                 .send_frames(data.state.uptime().as_millis() as u32);
         }
+
+        drew
     }
 
     /// Give up the display so a session's compositor can take it.

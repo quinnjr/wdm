@@ -155,6 +155,14 @@ let pendingAnswer = null;
 // take the rest of this script with it — a blank, dead form.
 const usable = () => {
   if (wdm.users.length === 0 || wdm.sessions.length === 0) {
+    // The same clear the linkDead() branch below gets through giveUp(), and
+    // for the same reason: the submit handler buffers the password *before*
+    // calling start(), so a bail here would leave it in the WebKit web process
+    // — a separate address space from the greeter — with no conversation left
+    // to spend it on and no way for the user to see it is still there. Not
+    // reachable while ready() disables the inputs at load on such a machine,
+    // which is exactly the kind of fact that stops being true.
+    pendingAnswer = null;
     replaceText(
       "error",
       wdm.users.length === 0

@@ -17,6 +17,15 @@ serde = { version = "1.0.229", features = ["derive"] }
 smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_egl", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "renderer_gl", "wayland_frontend", "desktop", "use_system_lib", "backend_gbm"] }
 thiserror.workspace = true
 toml = "1.1.4"
+# smithay emits its diagnostics through `tracing`, not `log`: every atomic
+# commit rejection, format negotiation failure and EGL import error in
+# backend/drm and backend/egl is a `tracing::warn!`. Without a subscriber all of
+# them are discarded, which on the handoff — the path with the least hardware
+# coverage — removes the only record of why a commit failed. `tracing-log` is
+# deliberately *off*: env_logger is already the global `log` logger, so bridging
+# would either fight it for the slot or duplicate every record.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "smallvec", "std"] }
 uzers = "0.12.2"
 wdm-protocol = { workspace = true, features = ["server"] }
 zeroize = "1.9.0"
