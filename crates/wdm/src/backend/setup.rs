@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -120,6 +121,17 @@ pub fn build(
             Ok(PostAction::Continue)
         },
     )?;
+
+    // Both backends, because both own a greeter child. Without this the loop has
+    // exactly one exit — a login handoff under udev, the window closing under
+    // winit — so a `systemctl stop wdm` or a Ctrl-C in a development session
+    // takes the default disposition, never runs Greeter's Drop, and leaves the
+    // greeter and its process group orphaned until SIGKILL.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
+    loop_handle.insert_source(signals, |event, _, data: &mut LoopData| {
+        log::info!("caught {:?}, shutting down", event.signal());
+        data.state.running = false;
+    })?;
 
     // PAM threads report here.
     let (events_tx, events_rx) = smithay::reexports::calloop::channel::channel();

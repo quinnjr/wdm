@@ -327,10 +327,19 @@ impl Greeter {
             Err(e) => {
                 // The child is unwaitable, which means the handle is useless.
                 // Treat it as an exit so wdm does not wait on it forever.
+                //
+                // Not routed through note_exit with a fabricated status: there
+                // is no status, and inventing a successful one would put
+                // "greeter exited cleanly" on the give-up screen, contradicting
+                // the error logged beside it. Like note_spawn_failure, this
+                // counts as a rapid failure whatever the greeter's uptime was —
+                // an unwaitable handle says nothing about how long the process
+                // lived, so the elapsed time is discarded rather than trusted.
                 log::error!("waiting on greeter: {e}");
                 self.child = None;
                 self.sweep_group();
-                Some(self.note_exit(ExitStatus::from_raw(0)))
+                self.started = None;
+                Some(self.record_failure(true, format!("could not be waited for: {e}")))
             }
         }
     }
@@ -640,6 +649,25 @@ mod tests {
             panic!("expected give-up");
         };
         assert!(reason.contains("could not be started"), "{reason}");
+        assert!(reason.contains("tty1"), "{reason}");
+    }
+
+    #[test]
+    fn an_unwaitable_greeter_is_not_reported_as_a_clean_exit() {
+        // poll()'s Err arm cannot be provoked without an unwaitable child, so
+        // this pins the message construction it routes through instead. The
+        // give-up screen shows this text verbatim, and the bug being guarded
+        // against was a fabricated exit status making it read "exited cleanly"
+        // right next to a logged waitpid error.
+        let mut g = greeter("/bin/true");
+        let reason = format!("could not be waited for: {}", std::io::Error::from_raw_os_error(libc::ECHILD));
+        g.record_failure(true, reason.clone());
+        g.record_failure(true, reason.clone());
+        let Disposition::GaveUp { reason } = g.record_failure(true, reason) else {
+            panic!("expected give-up");
+        };
+        assert!(reason.contains("could not be waited for"), "{reason}");
+        assert!(!reason.contains("exited cleanly"), "{reason}");
         assert!(reason.contains("tty1"), "{reason}");
     }
 

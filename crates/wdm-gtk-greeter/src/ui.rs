@@ -296,15 +296,18 @@ impl Ui {
 
         // A machine with nothing to log into is worth saying out loud rather
         // than presenting an empty form.
-        let usable = !no_users && !no_sessions;
-        self.entry.set_sensitive(usable);
-        self.submit.set_sensitive(usable);
-        if !usable {
-            self.error.set_label(if no_users {
-                "No users available to log in"
-            } else {
-                "No sessions installed"
-            });
+        let reason = unusable_reason(no_users, no_sessions);
+        self.entry.set_sensitive(reason.is_none());
+        self.submit.set_sensitive(reason.is_none());
+        if let Some(text) = reason {
+            // Into the model as well as onto the label, for the reason spelled
+            // out in `launch()`: refresh() re-derives the label from
+            // `model.error` on every revision, so a widget-only message is
+            // wiped by the next event — leaving a permanently insensitive form
+            // with nothing on it to explain why. The borrow is scoped and
+            // dropped before the widget calls below.
+            self.model.borrow_mut().error = Some(text.to_owned());
+            self.error.set_label(text);
             self.error.set_visible(true);
         }
 
@@ -450,17 +453,30 @@ impl Ui {
         // that is what becomes `notice` — while the secret it is waiting on is
         // still pending. The "wait for the user" branch below would otherwise
         // clear the half-typed answer and pretend the attempt had ended.
-        let (prompt, error, notice, authenticated, conversation_over, auto_retry) = {
+        let (prompt, error, notice, authenticated, conversation_over, auto_retry, unusable) = {
             let model = self.model.borrow();
             (
                 model.prompt.clone(),
                 model.error.clone(),
-                model.notice.clone(),
+                // One label, so the pieces PAM sent separately are joined. The
+                // per-notice styles are lost here deliberately: this greeter has
+                // nowhere to put them, and the notice line already reads as the
+                // account's news rather than the attempt's verdict.
+                model.notice_text(),
                 model.authenticated,
                 model.conversation_over,
                 model.should_auto_retry(),
+                unusable_reason(model.users.is_empty(), model.sessions.is_empty()),
             )
         };
+
+        // `model.error` when there is one, and otherwise the reason there is
+        // nothing on this machine to log into. The second is not redundant with
+        // what `reload_lists` wrote: `begin_attempt` clears `error` because it
+        // belongs to an attempt, while an empty user or session list is a fact
+        // about the machine that outlives every attempt, so it is re-derived
+        // here rather than being allowed to blank itself.
+        let error = error.or_else(|| unusable.map(str::to_owned));
 
         self.error.set_label(error.as_deref().unwrap_or(""));
         self.error.set_visible(error.is_some());
@@ -510,13 +526,27 @@ impl Ui {
     /// `refresh()`'s "PAM explained itself" branch and `launch()`'s no-session
     /// fallback — so the state they leave behind cannot drift apart.
     ///
+    /// "Try again" is offered only while there is something to try against. One
+    /// of the states that reaches here is a lost connection, and after that
+    /// `Link::pump` returns early forever: Enter would send nothing, change
+    /// nothing, and leave the user pressing a key at a screen that cannot
+    /// answer. Saying so points them at the console instead.
+    ///
     /// Sensitivity is deliberately not touched: only `reload_lists` turns the
     /// form off, and it does so because there is nothing on this machine to log
     /// into. Re-enabling here would hand the user an entry that cannot lead
     /// anywhere — which is exactly the state the no-session fallback is in.
     fn wait_for_user(&self) {
+        // Scoped, and released before any widget call: every path into a widget
+        // from here can re-enter and borrow the model again.
+        let retry_possible = self.model.borrow().retry_is_possible();
+
         self.attempting.set(false);
-        self.prompt.set_label("Press Enter to try again");
+        self.prompt.set_label(if retry_possible {
+            "Press Enter to try again"
+        } else {
+            "Connection to wdm lost — switch to a text console"
+        });
         self.entry.set_text("");
     }
 
@@ -565,6 +595,24 @@ impl Ui {
 
 fn refs(items: &[String]) -> Vec<&str> {
     items.iter().map(String::as_str).collect()
+}
+
+/// Why this machine has nothing to log into, if it has nothing.
+///
+/// A free function so the choice of message can be checked without a display,
+/// and so the two places that need it — `reload_lists`, which turns the form
+/// off, and `refresh`, which re-derives the label every revision — cannot
+/// disagree about the wording. Missing users are reported ahead of missing
+/// sessions because a machine with neither is first of all a machine with
+/// nobody to be. Wording matches wdm-greeter and the default webkit theme.
+fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
+    if no_users {
+        Some("No users available to log in")
+    } else if no_sessions {
+        Some("No sessions installed")
+    } else {
+        None
+    }
 }
 
 /// Put the enumerate-phase `last_error` back after the first attempt cleared it.
@@ -628,5 +676,40 @@ mod tests {
         restore_enumerate_error(&mut model, Some("session ended: crashed".to_owned()));
 
         assert_eq!(model.error.as_deref(), Some("Authentication failure"));
+    }
+
+    #[test]
+    fn an_unusable_machine_says_which_half_is_missing() {
+        assert_eq!(
+            unusable_reason(true, false),
+            Some("No users available to log in")
+        );
+        assert_eq!(unusable_reason(false, true), Some("No sessions installed"));
+        // Neither: the missing users are the more fundamental of the two.
+        assert_eq!(
+            unusable_reason(true, true),
+            Some("No users available to log in")
+        );
+        assert_eq!(unusable_reason(false, false), None);
+    }
+
+    #[test]
+    fn the_unusable_reason_outlives_an_attempt() {
+        // The defect this guards: the message was written onto the label only,
+        // and refresh() re-derives that label from `model.error` on every
+        // revision — so the next event left a permanently insensitive form with
+        // nothing on it to say why. Deriving it from the lists instead means no
+        // revision can blank it.
+        let mut model = Model::default();
+        model.error = Some(unusable_reason(true, true).unwrap().to_owned());
+
+        model.begin_attempt();
+        assert!(model.error.is_none(), "an attempt clears `error` as it must");
+
+        // What refresh() falls back to once it has.
+        assert_eq!(
+            unusable_reason(model.users.is_empty(), model.sessions.is_empty()),
+            Some("No users available to log in")
+        );
     }
 }

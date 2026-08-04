@@ -119,9 +119,14 @@ fn prepare(data: &mut LoopData, request: LaunchRequest) -> Option<Launch> {
 
 /// Tear down the current greeter and start a fresh one after `delay`.
 ///
-/// `error` is advertised to the new greeter through `last_error`, so a user
-/// whose session failed to start is told why instead of being bounced back to a
-/// login prompt with no explanation.
+/// `error`, when there is one, is advertised to the new greeter through
+/// `last_error`, so a user whose session failed to start is told why instead of
+/// being bounced back to a login prompt with no explanation. `None` means "this
+/// restart has nothing to add", not "forget what was recorded": a greeter that
+/// dies before it ever binds restarts with no error of its own, and overwriting
+/// here would discard the reason the session failed before anyone had seen it.
+/// The error is cleared where it has served its purpose — [`crate::login::Login::begin_attempt`],
+/// once the user has moved on to a new attempt.
 pub fn restart_greeter(
     data: &mut LoopData,
     loop_handle: &LoopHandle<'static, LoopData>,
@@ -132,7 +137,9 @@ pub fn restart_greeter(
     data.state.login.reset();
     // The old greeter's objects belong to a connection that is gone.
     data.state.login.clear_bindings();
-    data.state.login.set_last_error(error);
+    if error.is_some() {
+        data.state.login.set_last_error(error);
+    }
     // Surfaces belonging to the dead greeter must go, or they keep being
     // rendered over the new one.
     data.state.layers.clear();

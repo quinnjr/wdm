@@ -11,4 +11,12 @@ d /var/lib/wdm 0755 root root -
 # which is a boot with no login screen. Arch and Fedora get /var/empty from
 # their base filesystem package; Debian does not, so it is declared here. It
 # must exist and must stay empty: nothing is ever written to it.
+#
+# `d` adjusts an existing directory rather than skipping it, so on Arch and
+# Fedora this re-asserts 0755 root root over the base package's own /var/empty.
+# That is deliberate, and it is what makes the greeter's home the same on all
+# three distributions instead of whatever the local filesystem package chose;
+# the values match what Arch's `filesystem` already ships. It does mean a
+# distribution that shipped /var/empty tighter than 0755 would be widened, which
+# is the cost of not having a per-distribution copy of this file.
 d /var/empty 0755 root root -

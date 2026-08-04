@@ -1,8 +1,9 @@
 post_install() {
 	cat <<-MSG
-	>>> wdm runs on VT 7 and does not touch VT 1, so Ctrl+Alt+F1 stays a
-	    working text console. Verify you can reach it before enabling the
-	    unit: if wdm fails to start you will have no graphical login.
+	>>> wdm runs on VT 7 and leaves VT 1 a working text console — it
+	    switches to it only to hand you one when it gives up. Verify you can
+	    reach it before enabling the unit: if wdm fails to start you will
+	    have no graphical login.
 
 	>>> The DRM path has not yet run on real hardware. Development uses a
 	    nested backend that cannot exercise DRM, the seat, or the handoff
@@ -14,5 +15,15 @@ post_install() {
 }
 
 post_upgrade() {
+	# systemd-sysusers never modifies an account that already exists, so a
+	# machine that installed 0.1.x keeps the greeter's home at /var/lib/wdm
+	# forever — the directory root creates and renames files in, which is
+	# exactly what the home was moved out of. Guarded on the old value so it
+	# is idempotent and so an administrator who chose a different home is
+	# left alone.
+	if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+		usermod -d /var/empty wdm || :
+	fi
+
 	post_install
 }

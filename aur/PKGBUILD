@@ -19,7 +19,12 @@ makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
 # does not resolve a virtual provided by a sibling package of the same split,
 # and adding it to makedepends would make the package unbuildable, since
 # nothing in the repositories provides it.
-provides=('wdm-greeter-implementation')
+#
+# The virtual is declared only in the three greeter package_*() functions, never
+# at pkgbase level. A pkgbase provides= is inherited by every split package, and
+# `unset provides` in package_wdm() cannot be expressed in .SRCINFO — makepkg
+# emits no clearing line — so a helper resolving from .SRCINFO would see `wdm`
+# providing the virtual it depends on and install no greeter at all.
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('10aff2d22a13ca641839714cebb34e74cc16bca6d188ba19977e93642767d464')
 
@@ -33,7 +38,11 @@ build() {
   cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --all-targets
+  # Not --all-targets: nothing installed here is a test, example or bench, and
+  # check() builds the test targets itself. Building them twice is a real cost
+  # on a workspace that links GTK4, WebKitGTK and smithay/EGL in release mode,
+  # and it makes a broken test fail in build() rather than in check().
+  cargo build --frozen --release
 }
 
 check() {
@@ -48,7 +57,6 @@ check() {
 package_wdm() {
   depends=('libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm' 'libxkbcommon'
            'pam' 'wdm-greeter-implementation')
-  unset provides
   backup=('etc/pam.d/wdm' 'etc/wdm/wdm.toml')
   install=wdm.install
 

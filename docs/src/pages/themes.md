@@ -67,6 +67,15 @@ window.authentication_complete = () => {};      // check wdm.is_authenticated
 "Password:" — the stack decides what it asks, and an expiry or two-factor prompt
 is not a password prompt. Mask when `kind` is `"password"`.
 
+`show_message` fires once per message PAM sent, carrying that message's own
+style: `"info"` for `PAM_TEXT_INFO`, `"error"` for `PAM_ERROR_MSG`. PAM sends
+them one at a time and often splits one explanation across two — "the account is
+locked" as an error, "10 minutes left to unlock" as info — so they arrive as
+separate calls rather than one joined line. A theme that wants to style them
+differently can; one that does not can ignore `kind` and append them all to the
+same element. The verdict of the attempt is reported separately, as `"error"`,
+after every message belonging to it.
+
 ## What a theme is responsible for
 
 The greeter has no policy of its own. It does not preselect a session, does not
@@ -84,10 +93,11 @@ those would be fighting every theme that disagreed. So a theme must:
 - **Restart the conversation when the user changes.** PAM's is per user, and a
   half-answered one for somebody else cannot be reused.
 - **Keep `show_message` on screen past `authentication_complete`.** This is
-  where a locked account explains itself — "the account is locked, 10 minutes
-  left to unlock" arrives as an `info` message, and the `error` that follows it
-  is only the verdict. A theme that puts both in the same element shows the user
-  only the half that says nothing.
+  where a locked account explains itself, and the `error` that follows the
+  messages is only the verdict — "Authentication failure" says nothing the user
+  can act on. A theme that puts the messages and the verdict in the same
+  element, so the verdict overwrites them, shows the user only the half that
+  says nothing.
 - **Not retry on its own.** Restarting immediately clears that explanation, and
   against a `pam_faillock` stack each attempt can extend the lock. Wait for the
   user.

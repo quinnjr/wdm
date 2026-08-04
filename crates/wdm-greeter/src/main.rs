@@ -348,12 +348,18 @@ impl App {
     ///
     /// Returns true when the key was consumed, so Enter and Escape choose and
     /// dismiss rather than submitting the password or clearing the field.
+    ///
+    /// Only non-printable keys are claimed. The drop-down used to take `j` and
+    /// `k` as vi motions, which meant a password containing either lost those
+    /// characters silently while the list was open — no echo, no error, and a
+    /// login that fails for no visible reason. A login screen's drop-down is not
+    /// a pager, and the arrows already move the selection.
     fn menu_key(&mut self, keysym: xkbcommon::xkb::Keysym) -> bool {
         use xkbcommon::xkb::keysyms;
 
         match keysym.raw() {
-            keysyms::KEY_Up | keysyms::KEY_k => self.move_selection(-1),
-            keysyms::KEY_Down | keysyms::KEY_j => self.move_selection(1),
+            keysyms::KEY_Up => self.move_selection(-1),
+            keysyms::KEY_Down => self.move_selection(1),
             keysyms::KEY_Home => {
                 self.session_index = 0;
                 self.needs_redraw = true;
@@ -1005,6 +1011,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if app.layer_shell.is_none() {
         return Err("the compositor does not offer zwlr_layer_shell_v1".into());
     }
+    // Unreachable against wdm, which always advertises both — but this greeter's
+    // point is that it runs anywhere, and without them `ensure_surface` and
+    // `draw` return from a let-else on every pass: a process spinning forever
+    // with nothing on screen, which is the failure the checks above exist to
+    // avoid.
+    if app.compositor.is_none() {
+        return Err("the compositor does not offer wl_compositor".into());
+    }
+    if app.shm.is_none() {
+        return Err(
+            "the compositor does not offer wl_shm; this greeter renders into shared memory".into(),
+        );
+    }
 
     while !app.exit {
         app.ensure_surface(&qh);
@@ -1104,9 +1123,16 @@ mod tests {
         assert!(!app.menu_open, "Escape must close the menu");
 
         // A printable key is not the menu's: it falls through to the answer
-        // field even while the menu is open.
-        app.menu_open = true;
-        assert!(!app.menu_key(Keysym::new(keysyms::KEY_a)));
+        // field even while the menu is open. `j` and `k` are the ones that
+        // matter — they were bound as vi motions, so an open drop-down ate them
+        // out of the password with nothing on screen to say so.
+        for key in [keysyms::KEY_a, keysyms::KEY_j, keysyms::KEY_k] {
+            app.menu_open = true;
+            assert!(
+                !app.menu_key(Keysym::new(key)),
+                "the menu consumed a printable key"
+            );
+        }
     }
 
     #[test]

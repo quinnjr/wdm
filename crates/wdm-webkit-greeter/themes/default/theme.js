@@ -45,6 +45,19 @@ const show = (id, text) => {
   node.hidden = !text;
 };
 
+// Appends rather than replaces, because the greeter calls show_message once per
+// message PAM sent and PAM routinely splits one explanation in two. Assigning
+// textContent here would leave the user reading "(10 minutes left to unlock)"
+// with nothing saying what is locked.
+const append = (id, text) => {
+  const node = el(id);
+  if (node.textContent) {
+    node.textContent += " ";
+  }
+  node.textContent += text;
+  node.hidden = false;
+};
+
 const start = () => {
   // Nothing to log into, or nobody to log in: say so and stop, like the other
   // greeters do. Calling authenticate("") instead would throw from top level
@@ -85,8 +98,13 @@ window.show_prompt = (text, kind) => {
 // PAM said something, without asking. This is where a locked account explains
 // itself, so it stays until the user starts another attempt — including past
 // the "Authentication failure" that follows it.
+//
+// One call per message, carrying that message's own style, so the two elements
+// split by severity: "the account is locked" (error) above "10 minutes left to
+// unlock" (info). The verdict arrives the same way and joins the error line,
+// which is why both accumulate — the last thing said must not erase the reason.
 window.show_message = (text, kind) =>
-  show(kind === "error" ? "error" : "message", text);
+  append(kind === "error" ? "error" : "message", text);
 
 // The conversation ended, either way.
 window.authentication_complete = () => {

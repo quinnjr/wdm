@@ -5,6 +5,59 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- **A theme is told PAM's message styles apart.** `show_message` now fires once
+  per message PAM sent, carrying that message's own kind — `"info"` for
+  `PAM_TEXT_INFO`, `"error"` for `PAM_ERROR_MSG` — instead of joining them into
+  one line reported as `"info"` whatever they were. A locked account can be
+  shown in red with the minutes remaining beside it in grey, and the WebKit
+  greeter stops disagreeing with the reference greeter about the same input.
+  The default theme accumulates messages rather than replacing, because PAM
+  routinely splits one explanation in two.
+- **`Model::notice` is now `Model::notices`**, a list of `Notice { kind, text }`
+  rather than one joined string, with `Model::notice_text()` for a greeter that
+  has a single label to put them in. Greeter-visible: an out-of-tree greeter
+  reading `notice` needs the one-line change.
+
+### Fixed
+
+- **A `wl_output` global leaked** on every failed connector rescan. The global
+  was created before the fallible part of bringing an output up, so a failure
+  left one advertised that nothing could withdraw — and a greeter that bound it
+  saw defaults rather than the real mode, scale and transform.
+- **A session's failure reason could be lost.** If the greeter died before it
+  bound the protocol, the reason recorded for `last_error` was overwritten with
+  nothing, and the greeter that finally came up showed the unexplained bounce
+  that event exists to prevent.
+- **The reference greeter swallowed `j` and `k` from passwords** while the
+  session drop-down was open: both were bound as vi-style motion with no
+  modifier, and the key router consulted the menu first.
+- **A hung WebKit web process is now detected**, not just a crashed one. An
+  evaluation that never comes back at all counts as a failure after a deadline,
+  so a page that stops answering escalates to the same give-up the greeter
+  already had for one that answers with errors.
+- **The GTK greeter's "nothing to log into" message survived** the next model
+  event. It was written to the widget rather than the model, so anything that
+  triggered a repaint blanked it and left an insensitive form with no text.
+- **An unwaitable greeter is no longer reported as having exited cleanly** on
+  the give-up screen, next to a log line saying `waitpid` failed.
+- The nested backend now handles `SIGTERM`/`SIGINT`, so a development wdm no
+  longer orphans its greeter and that greeter's process group.
+- Fedora upgrades no longer revert a customised `/etc/wdm/wdm.toml` or PAM
+  stack: both are marked `%config(noreplace)`, matching what the deb and the
+  Arch package already did.
+- The deb's `postinst` reports a failing `systemd-sysusers` or
+  `systemd-tmpfiles` instead of discarding it — the two failures that decide
+  whether wdm can start at all.
+- The AUR `wdm` package no longer advertises the `wdm-greeter-implementation`
+  virtual it depends on, which defeated the greeter-choice prompt for anything
+  resolving from `.SRCINFO`.
+- Documentation the audit found stale: the greeter-author dependency snippet
+  named a version that cannot resolve now that the crates are unpublished, the
+  man page still identified as 0.1.3, and `/run/wdm`'s ownership was described
+  by its end state rather than the two phases the code actually goes through.
+
 ## [0.2.0] — 2026-08-03
 
 A minor rather than a patch release: `wdm_greeter_v1` gains an event and a
@@ -84,7 +137,11 @@ patch number is allowed to say.
   in — a symlink-attack surface, for a state directory the greeter never needs
   to touch. **On upgrade**, the deb and the rpm both re-run
   `systemd-tmpfiles --create`, which corrects the ownership in place; a machine
-  set up by hand should run `chown root:root /var/lib/wdm` itself.
+  set up by hand should run `chown root:root /var/lib/wdm` itself. The greeter
+  account's home moved to `/var/empty` for the same reason, and
+  `systemd-sysusers` never modifies an account that already exists — the
+  packages now run `usermod -d /var/empty wdm` on upgrade, and a machine set up
+  by hand should run it too.
 - **The greeter is killed by process group**, not by pid. It is made a session
   leader at spawn, so anything it started — a helper, a shell wrapper — dies
   with it rather than surviving into the user's session holding the greeter's

@@ -5,8 +5,27 @@
 set -e
 
 if [ "$1" = configure ]; then
-    systemd-sysusers /usr/lib/sysusers.d/wdm.conf >/dev/null 2>&1 || true
-    systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf >/dev/null 2>&1 || true
+    # Neither output nor exit status is discarded here, for the same reason as
+    # daemon-reload below: these two calls decide whether wdm can start at all.
+    # Without the account wdm exits 1 at startup; without /var/empty the greeter
+    # is never spawned, because wdm chdirs into it before exec. Swallowing
+    # either leaves an administrator with a display manager that fails for no
+    # visible reason. Non-fatal all the same — an install must not abort.
+    systemd-sysusers /usr/lib/sysusers.d/wdm.conf \
+        || echo "wdm: creating the wdm account failed; wdm.service will not start" >&2
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf \
+        || echo "wdm: creating /var/lib/wdm and /var/empty failed; the greeter will not spawn" >&2
+
+    # systemd-sysusers never modifies an account that already exists, so a
+    # machine that installed 0.1.x keeps the greeter's home at /var/lib/wdm
+    # forever — the directory root creates and renames files in, which is
+    # exactly what the home was moved out of. Guarded on the old value so it is
+    # idempotent and so an administrator who chose a different home is left
+    # alone.
+    if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+        usermod -d /var/empty wdm \
+            || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+    fi
 
     # Make the freshly installed unit visible to systemd, so that a
     # `systemctl enable wdm` typed right after install works. This reloads
@@ -28,3 +47,12 @@ if [ "$1" = configure ]; then
     # display-manager.service is how a boot ends with no login screen at all.
     :
 fi
+
+# No prerm or postrm is shipped, deliberately. `apt purge` therefore leaves the
+# wdm account, /var/lib/wdm and /var/empty behind. Accounts created by
+# sysusers.d are conventionally never removed — a uid that files elsewhere may
+# still be owned by should not be handed to the next account allocated — and
+# /var/empty belongs to the base filesystem package on Arch and Fedora, so
+# deleting it here would be removing another package's directory on the one
+# distribution where wdm happens to create it. The conffiles dpkg does remove
+# on purge are declared as such in the package metadata, not handled here.

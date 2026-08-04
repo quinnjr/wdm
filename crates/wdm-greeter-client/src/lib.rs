@@ -63,6 +63,46 @@ pub struct Session {
     pub name: String,
 }
 
+/// Which of PAM's two no-answer message styles a [`Notice`] carries.
+///
+/// The protocol's `prompt_style` has four entries; `secret` and `visible`
+/// expect an answer and become a [`Prompt`], so only these two land here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// `PAM_TEXT_INFO` — an explanation, not a failure.
+    #[default]
+    Info,
+    /// `PAM_ERROR_MSG` — PAM saying something went wrong. Distinct from
+    /// [`Model::error`], which is the conversation's verdict rather than a
+    /// message the stack chose to send.
+    Error,
+}
+
+impl NoticeKind {
+    /// The name a greeter shows this under, and the string the WebKit greeter
+    /// hands a theme as `show_message`'s second argument.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One thing PAM said that expects no answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: String,
+}
+
+impl Notice {
+    pub fn new(kind: NoticeKind, text: String) -> Self {
+        Self { kind, text }
+    }
+}
+
 /// A question PAM is waiting on.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -93,13 +133,19 @@ pub struct Model {
     pub default_session: String,
     pub prompt: Option<Prompt>,
     pub error: Option<String>,
-    /// The last `info` or `error` style message PAM sent.
+    /// The `info` and `error` style messages PAM has sent this conversation.
     ///
-    /// Sticky: it survives the end of a conversation and is cleared only when
+    /// Sticky: they survive the end of a conversation and are cleared only when
     /// the user deliberately starts another attempt. This is where a lockout
     /// notice arrives ("the account is locked, 10 minutes left"), and it is
     /// precisely the text that must not scroll past.
-    pub notice: Option<String>,
+    ///
+    /// A list rather than one string because PAM sends them one at a time and
+    /// the two styles mean different things — a greeter that can show them
+    /// differently should be able to. One that cannot has
+    /// [`notice_text`](Model::notice_text), which joins them the way a single
+    /// label needs.
+    pub notices: Vec<Notice>,
     /// Set by `auth_ok`; the UI launches a session in response.
     pub authenticated: bool,
     /// Set only by `auth_failed`, and cleared when a new attempt starts.
@@ -112,6 +158,14 @@ pub struct Model {
     /// Set when PAM sent a notice during this conversation, which suppresses
     /// auto-retry.
     pub blocked: bool,
+    /// Set by [`Model::link_lost`], and never cleared: a Wayland connection
+    /// does not come back.
+    ///
+    /// It lives here rather than being read off [`Link`] so the UI keeps
+    /// drawing from one place, and because it outlives the conversation state
+    /// around it — [`Model::begin_attempt`] clears everything an attempt owns,
+    /// and a dead socket is not one of those things.
+    pub link_dead: bool,
     pub revision: u64,
 }
 
@@ -134,14 +188,31 @@ impl Model {
     /// Record one of PAM's explanations.
     ///
     /// PAM often splits a single explanation over two messages ("locked due to
-    /// 3 failed logins" then "10 minutes left"), so they are joined rather than
+    /// 3 failed logins" then "10 minutes left"), so they accumulate rather than
     /// the second replacing the first.
-    pub fn push_notice(&mut self, text: String) {
-        self.notice = Some(match self.notice.take() {
-            Some(prior) => format!("{prior} {text}"),
-            None => text,
-        });
+    pub fn push_notice(&mut self, kind: NoticeKind, text: String) {
+        self.notices.push(Notice::new(kind, text));
         self.blocked = true;
+    }
+
+    /// Every notice as one string, for a greeter with a single label to put it
+    /// in.
+    ///
+    /// Joined with a space because the pieces are usually one sentence PAM
+    /// split in two, and `None` when there is nothing to say, so a caller can
+    /// hide the label rather than showing an empty one.
+    pub fn notice_text(&self) -> Option<String> {
+        if self.notices.is_empty() {
+            return None;
+        }
+        let mut joined = String::new();
+        for notice in &self.notices {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(&notice.text);
+        }
+        Some(joined)
     }
 
     /// Clear everything belonging to the previous attempt.
@@ -149,7 +220,7 @@ impl Model {
         self.conversation_over = false;
         self.blocked = false;
         self.error = None;
-        self.notice = None;
+        self.notices.clear();
         self.prompt = None;
         self.touch();
     }
@@ -163,11 +234,26 @@ impl Model {
     /// alternative was a log line nobody at a login screen can read, under a
     /// greeter stuck on "Starting session…" forever.
     pub fn link_lost(&mut self, why: &str) {
-        self.push_notice(format!("Lost the connection to wdm: {why}"));
+        self.push_notice(
+            NoticeKind::Error,
+            format!("Lost the connection to wdm: {why}"),
+        );
         self.authenticated = false;
         self.conversation_over = true;
+        self.link_dead = true;
         self.prompt = None;
         self.touch();
+    }
+
+    /// Whether another attempt could still reach wdm.
+    ///
+    /// The UI ends a conversation by inviting the user to press Enter and try
+    /// again. After a lost link that invitation is a lie: `Link::pump` returns
+    /// early forever once it has failed, so nothing the form sends leaves the
+    /// process and the screen never changes again. The greeter says what is
+    /// actually true instead — the session is unreachable from here.
+    pub fn retry_is_possible(&self) -> bool {
+        !self.link_dead
     }
 
     pub fn session_id(&self, index: usize) -> Option<&str> {
@@ -252,7 +338,16 @@ impl Link {
         ))
     }
 
-    /// Deliver any events that have arrived.
+    /// Deliver the events GDK has already read off the connection, and flush
+    /// our own requests.
+    ///
+    /// This dispatches what libwayland has *queued*; it never reads the socket.
+    /// Nothing here owns the fd — GDK does, and its main loop is what turns
+    /// bytes on the wire into queued events for our objects. That is the whole
+    /// reason this crate shares GDK's connection rather than opening its own,
+    /// and it is why a stalled GDK loop shows up here as a `pump` that quietly
+    /// returns false forever rather than as an error. Reading the fd ourselves
+    /// would race the owner of it.
     ///
     /// Returns true when the model changed. A dispatch or flush failure is not
     /// swallowed: a flush that fails has dropped a request on the floor — a
@@ -357,7 +452,14 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
                 match style.into_result() {
                     // Neither expects an answer. Both are PAM explaining
                     // itself, so both stick and both stop the auto-retry.
-                    Ok(PromptStyle::Info | PromptStyle::Error) => state.push_notice(text),
+                    Ok(style @ (PromptStyle::Info | PromptStyle::Error)) => {
+                        let kind = if style == PromptStyle::Error {
+                            NoticeKind::Error
+                        } else {
+                            NoticeKind::Info
+                        };
+                        state.push_notice(kind, text);
+                    }
                     Ok(style) => {
                         state.prompt = Some(Prompt {
                             id,
@@ -376,7 +478,7 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
                 state.blocked = false;
                 state.prompt = None;
                 state.error = None;
-                state.notice = None;
+                state.notices.clear();
                 state.touch();
             }
 
@@ -418,7 +520,10 @@ mod tests {
         // form under the user, and feeding the lock.
         let model = Model {
             blocked: true,
-            notice: Some("The account is locked due to 3 failed logins.".to_owned()),
+            notices: vec![Notice::new(
+                NoticeKind::Info,
+                "The account is locked due to 3 failed logins.".to_owned(),
+            )],
             ..failed()
         };
         assert!(!model.should_auto_retry());
@@ -457,7 +562,7 @@ mod tests {
     fn a_deliberate_attempt_clears_the_previous_one() {
         let mut model = Model {
             blocked: true,
-            notice: Some("locked".to_owned()),
+            notices: vec![Notice::new(NoticeKind::Info, "locked".to_owned())],
             error: Some("Authentication failure".to_owned()),
             ..failed()
         };
@@ -465,7 +570,7 @@ mod tests {
         model.begin_attempt();
 
         // The user chose to try again, so the explanation has been read.
-        assert!(model.notice.is_none());
+        assert!(model.notices.is_empty());
         assert!(model.error.is_none());
         assert!(!model.blocked);
         assert!(!model.conversation_over);
@@ -486,11 +591,31 @@ mod tests {
 
         // Visible, attributed, and final: the notice carries the reason, the
         // conversation is over, and nothing auto-retries against a dead socket.
-        assert!(model.notice.as_deref().unwrap().contains("broken pipe"));
+        assert!(model.notice_text().unwrap().contains("broken pipe"));
+        // A lost link is PAM-independent, but it is a failure, so it is styled
+        // as one rather than as an aside.
+        assert_eq!(model.notices[0].kind, NoticeKind::Error);
         assert!(!model.authenticated);
         assert!(model.conversation_over);
         assert!(!model.should_auto_retry());
         assert_ne!(model.revision, before, "the UI would never repaint");
+    }
+
+    #[test]
+    fn a_lost_link_leaves_no_retry_to_offer() {
+        // The defect this guards: the form ended a lost link with "Press Enter
+        // to try again", but Link::pump returns early forever once it has
+        // failed, so Enter provably could not reach wdm.
+        let mut model = Model::default();
+        assert!(model.retry_is_possible(), "a live link can be retried");
+
+        model.link_lost("broken pipe");
+        assert!(!model.retry_is_possible());
+
+        // And starting an attempt does not resurrect it: begin_attempt clears
+        // what the attempt owned, and the socket is not that.
+        model.begin_attempt();
+        assert!(!model.retry_is_possible());
     }
 
     fn model_with_sessions() -> Model {
@@ -547,10 +672,10 @@ mod tests {
         // PAM splits a lockout across two messages; keeping only the last one
         // loses the half that says why.
         let mut model = Model::default();
-        model.push_notice("The account is locked.".to_owned());
-        model.push_notice("(10 minutes left to unlock)".to_owned());
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        model.push_notice(NoticeKind::Info, "(10 minutes left to unlock)".to_owned());
 
-        let notice = model.notice.as_deref().unwrap();
+        let notice = model.notice_text().unwrap();
         assert!(notice.contains("locked"), "{notice}");
         assert!(notice.contains("10 minutes"), "{notice}");
         // And a notice always suppresses the retry that would scroll it away.

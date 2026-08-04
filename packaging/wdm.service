@@ -4,9 +4,15 @@ Documentation=man:wdm(1)
 # systemd-user-sessions.service removes /run/nologin, so logins are permitted by
 # the time wdm offers a prompt.
 After=systemd-user-sessions.service plymouth-quit-wait.service
-# Deliberately no Conflicts=: wdm runs on VT 7, which no getty is enabled on.
-# tty1 stays a working text console, which is the recovery path when a
-# third-party greeter wedges.
+# Deliberately no Conflicts=: wdm's default VT is 7, which no getty is enabled
+# on, and tty1 stays a working text console — the recovery path when a
+# third-party greeter wedges. Conflicts=getty@tty1.service would stop that getty
+# and take the recovery console away, so it is not shipped even inert.
+#
+# This describes the default, not an invariant: `vt` is a configuration key
+# (/etc/wdm/wdm.toml). Setting it to a VT a getty uses — 1 through 6 — needs a
+# drop-in adding Conflicts=getty@ttyN.service and After=getty@ttyN.service for
+# that N, or wdm and the getty contend for the same VT with nothing arbitrating.
 
 # Past the limit wdm stays down rather than flickering forever; tty1 still
 # works. These belong in [Unit] -- systemd ignores them under [Service], which
@@ -24,8 +30,9 @@ RestartSec=1
 # PAM, and drops privileges itself when launching the greeter and the session.
 User=root
 
-# The greeter's runtime directory and the Wayland socket live here, owned by the
-# unprivileged greeter user.
+# The greeter's runtime directory and the Wayland socket live here. It is
+# created root-owned 0700 by systemd; wdm hands it to the greeter account only
+# after the socket inside it is bound and secured.
 RuntimeDirectory=wdm
 RuntimeDirectoryMode=0700
 

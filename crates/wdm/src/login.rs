@@ -916,4 +916,396 @@ mod tests {
         }
         assert!(*BACKOFF_SECS.last().unwrap() <= 30);
     }
+
+    /// Enough of the Wayland wire format to bind a global by hand.
+    ///
+    /// wdm depends on `wdm-protocol` with the `server` feature only, so there
+    /// is no client library anywhere in this dependency graph to drive a test
+    /// connection with. The messages a bind needs are few and small, so they
+    /// are encoded here instead: host byte order, an eight byte header of
+    /// object id followed by size and opcode packed into one word, and every
+    /// argument padded to four bytes.
+    ///
+    /// This exists because the version gating and the `already_bound` refusal
+    /// live in `bind` and `send_initial_state`, which no pure function test can
+    /// reach — a regression there would leave every other test in this file
+    /// passing.
+    mod wire {
+        use std::io::{ErrorKind, Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        /// wl_display is always object 1; the other ids are this client's to
+        /// allocate and are fixed because each connection binds exactly once.
+        pub const DISPLAY: u32 = 1;
+        pub const REGISTRY: u32 = 2;
+        pub const GREETER: u32 = 3;
+
+        /// wl_display.error, the event a protocol violation arrives as.
+        pub const DISPLAY_ERROR: u16 = 0;
+        /// wl_registry.global, one per advertised global.
+        pub const REGISTRY_GLOBAL: u16 = 0;
+
+        // Event opcodes are the order the events appear in the XML, which is
+        // why default_session was appended rather than inserted.
+        pub const USER: u16 = 0;
+        pub const DONE: u16 = 4;
+        pub const AUTH_OK: u16 = 6;
+        pub const DEFAULT_SESSION: u16 = 8;
+
+        pub struct Message {
+            pub object: u32,
+            pub opcode: u16,
+            body: Vec<u8>,
+        }
+
+        impl Message {
+            pub fn args(&self) -> Args<'_> {
+                Args {
+                    data: &self.body,
+                    pos: 0,
+                }
+            }
+        }
+
+        pub struct Args<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+
+        impl Args<'_> {
+            pub fn uint(&mut self) -> u32 {
+                let word = self.data[self.pos..self.pos + 4].try_into().unwrap();
+                self.pos += 4;
+                u32::from_ne_bytes(word)
+            }
+
+            pub fn string(&mut self) -> String {
+                // The length counts the terminating NUL, which is not part of
+                // the value; the whole argument is then padded to four bytes.
+                let len = self.uint() as usize;
+                let text = if len == 0 {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&self.data[self.pos..self.pos + len - 1]).into_owned()
+                };
+                self.pos += len.next_multiple_of(4);
+                text
+            }
+        }
+
+        pub struct Client {
+            sock: UnixStream,
+            received: Vec<Message>,
+        }
+
+        impl Client {
+            pub fn new(sock: UnixStream) -> Self {
+                // Non-blocking so a read after the server has flushed drains
+                // whatever is there and stops, rather than waiting for an event
+                // that is never coming.
+                sock.set_nonblocking(true).unwrap();
+                Self {
+                    sock,
+                    received: Vec::new(),
+                }
+            }
+
+            fn send(&mut self, object: u32, opcode: u16, body: &[u8]) {
+                let size = 8 + body.len();
+                let mut message = Vec::with_capacity(size);
+                message.extend_from_slice(&object.to_ne_bytes());
+                message.extend_from_slice(&(((size as u32) << 16) | opcode as u32).to_ne_bytes());
+                message.extend_from_slice(body);
+                self.sock.write_all(&message).unwrap();
+            }
+
+            /// wl_display.get_registry.
+            pub fn get_registry(&mut self) {
+                self.send(DISPLAY, 1, &REGISTRY.to_ne_bytes());
+            }
+
+            /// wl_registry.bind, whose new_id is untyped and so carries the
+            /// interface name and the version the client is built against.
+            pub fn bind(&mut self, name: u32, interface: &str, version: u32) {
+                let mut body = Vec::new();
+                body.extend_from_slice(&name.to_ne_bytes());
+                let bytes = interface.as_bytes();
+                body.extend_from_slice(&((bytes.len() + 1) as u32).to_ne_bytes());
+                body.extend_from_slice(bytes);
+                body.push(0);
+                while body.len() % 4 != 0 {
+                    body.push(0);
+                }
+                body.extend_from_slice(&version.to_ne_bytes());
+                body.extend_from_slice(&GREETER.to_ne_bytes());
+                self.send(REGISTRY, 0, &body);
+            }
+
+            /// Drain everything the server has written so far.
+            pub fn pump(&mut self) {
+                let mut chunk = [0u8; 16 * 1024];
+                let mut data = Vec::new();
+                loop {
+                    match self.sock.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("reading from the compositor: {e}"),
+                    }
+                }
+
+                let mut pos = 0;
+                while pos + 8 <= data.len() {
+                    let object = u32::from_ne_bytes(data[pos..pos + 4].try_into().unwrap());
+                    let word = u32::from_ne_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+                    let size = (word >> 16) as usize;
+                    let opcode = (word & 0xffff) as u16;
+                    self.received.push(Message {
+                        object,
+                        opcode,
+                        body: data[pos + 8..pos + size].to_vec(),
+                    });
+                    pos += size;
+                }
+            }
+
+            pub fn events(&self) -> &[Message] {
+                &self.received
+            }
+
+            /// The registry name of a global, so it can be bound.
+            pub fn global(&self, interface: &str) -> Option<u32> {
+                self.received
+                    .iter()
+                    .filter(|m| m.object == REGISTRY && m.opcode == REGISTRY_GLOBAL)
+                    .find_map(|m| {
+                        let mut args = m.args();
+                        let name = args.uint();
+                        (args.string() == interface).then_some(name)
+                    })
+            }
+
+            /// Every event the compositor sent to the greeter object.
+            pub fn greeter_events(&self) -> Vec<&Message> {
+                self.received
+                    .iter()
+                    .filter(|m| m.object == GREETER)
+                    .collect()
+            }
+        }
+    }
+
+    /// A compositor with a real `wayland_server::Display` behind it.
+    ///
+    /// Everything here runs in-process and needs neither root nor a GPU: the
+    /// display never opens a listening socket, and clients are inserted from
+    /// socket pairs.
+    struct Harness {
+        display: smithay::reexports::wayland_server::Display<Wdm>,
+        state: Wdm,
+        /// The event loop the `Login` took its handle from. Never dispatched;
+        /// held only so the handle stays usable.
+        _event_loop: smithay::reexports::calloop::EventLoop<'static, LoopData>,
+        /// The auth channel's receiving half, which a running wdm keeps in its
+        /// event loop. Dropping it would close the channel, so nothing here
+        /// could ever start a conversation.
+        _auth_rx: smithay::reexports::calloop::channel::Channel<AuthEvent>,
+    }
+
+    struct NoClientData;
+    impl smithay::reexports::wayland_server::backend::ClientData for NoClientData {}
+
+    impl Harness {
+        fn new(users: Vec<User>, default_session: Option<&str>) -> Self {
+            let display =
+                smithay::reexports::wayland_server::Display::<Wdm>::new().unwrap();
+            let handle = display.handle();
+
+            let (events, auth_rx) = smithay::reexports::calloop::channel::channel();
+            let event_loop: smithay::reexports::calloop::EventLoop<'static, LoopData> =
+                smithay::reexports::calloop::EventLoop::try_new().unwrap();
+
+            let login = Login::new(
+                users,
+                Vec::new(),
+                default_session.map(str::to_owned),
+                PathBuf::from("/nonexistent/wdm-test"),
+                7,
+                events,
+                event_loop.handle(),
+            );
+
+            let config: crate::config::Config = toml::from_str("").unwrap();
+            let greeter =
+                crate::supervise::Greeter::new("/bin/true", "nobody", "wayland-test", false)
+                    .unwrap();
+            let state = Wdm::new(&handle, config, login, greeter).unwrap();
+            // Advertised separately from the compositor's own globals, exactly
+            // as the backends do it.
+            Login::create_global(&handle);
+
+            Self {
+                display,
+                state,
+                _event_loop: event_loop,
+                _auth_rx: auth_rx,
+            }
+        }
+
+        /// Attach a client to the display and hand back its end of the socket.
+        fn connect(&mut self) -> wire::Client {
+            let (theirs, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            self.display
+                .handle()
+                .insert_client(ours, std::sync::Arc::new(NoClientData))
+                .unwrap();
+            wire::Client::new(theirs)
+        }
+
+        fn dispatch(&mut self) {
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+        }
+
+        /// Connect, bind `wdm_greeter_v1` at `version`, and collect the reply.
+        fn bind_greeter(&mut self, version: u32) -> wire::Client {
+            let mut client = self.connect();
+            client.get_registry();
+            self.dispatch();
+            client.pump();
+
+            let name = client
+                .global("wdm_greeter_v1")
+                .expect("wdm_greeter_v1 was not advertised");
+            client.bind(name, "wdm_greeter_v1", version);
+            self.dispatch();
+            client.pump();
+            client
+        }
+    }
+
+    fn test_user(last_session: &str) -> User {
+        User {
+            name: "testuser".to_owned(),
+            display_name: "Test User".to_owned(),
+            avatar_path: String::new(),
+            last_session: last_session.to_owned(),
+        }
+    }
+
+    /// The `last_session` string a bound greeter was told for the only user.
+    fn user_last_session(client: &wire::Client) -> String {
+        let user = client
+            .greeter_events()
+            .into_iter()
+            .find(|m| m.opcode == wire::USER)
+            .expect("no user event");
+        let mut args = user.args();
+        args.string();
+        args.string();
+        args.string();
+        args.string()
+    }
+
+    #[test]
+    fn a_version_2_greeter_is_told_the_default_separately() {
+        // The pure test above says what last_session_for computes; this says
+        // that the enumerate phase actually applies it per resource version,
+        // which is the part a greeter observes.
+        let mut h = Harness::new(vec![test_user("")], Some("river.desktop"));
+        let client = h.bind_greeter(2);
+
+        assert_eq!(
+            user_last_session(&client),
+            "",
+            "history was conflated with the configured default"
+        );
+
+        let events = client.greeter_events();
+        let default = events
+            .iter()
+            .position(|m| m.opcode == wire::DEFAULT_SESSION)
+            .expect("no default_session event");
+        let done = events
+            .iter()
+            .position(|m| m.opcode == wire::DONE)
+            .expect("no done event");
+        assert!(default < done, "default_session arrived after done");
+        assert_eq!(
+            events[default].args().string(),
+            "river.desktop"
+        );
+    }
+
+    #[test]
+    fn a_version_1_greeter_gets_the_default_in_last_session_instead() {
+        // A version 1 peer has no default_session event to learn the
+        // administrator's choice from, so it keeps the old conflated meaning.
+        // Sending the event anyway would be a wire error on that peer.
+        let mut h = Harness::new(vec![test_user("")], Some("river.desktop"));
+        let client = h.bind_greeter(1);
+
+        assert_eq!(user_last_session(&client), "river.desktop");
+        assert!(
+            !client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::DEFAULT_SESSION),
+            "default_session was sent to a version 1 resource"
+        );
+        assert!(
+            client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::DONE),
+            "the enumerate phase never ended"
+        );
+    }
+
+    #[test]
+    fn a_second_bind_is_refused_and_gets_no_initial_state() {
+        // One conversation, one driver: a second object could otherwise cancel
+        // the first's conversation just by destroying itself. The refusal must
+        // also come *before* any state is pushed, or a client that binds twice
+        // walks away with a second copy of the user list.
+        let mut h = Harness::new(vec![test_user("sway.desktop")], None);
+        let first = h.bind_greeter(2);
+        assert!(!first.greeter_events().is_empty());
+
+        let second = h.bind_greeter(2);
+
+        let error = second
+            .events()
+            .iter()
+            .find(|m| m.object == wire::DISPLAY && m.opcode == wire::DISPLAY_ERROR)
+            .expect("the second bind was accepted");
+        let mut args = error.args();
+        assert_eq!(args.uint(), wire::GREETER, "the error named another object");
+        assert_eq!(
+            args.uint(),
+            wdm_greeter_v1::Error::AlreadyBound as u32,
+            "refused with the wrong error code"
+        );
+        assert!(
+            second.greeter_events().is_empty(),
+            "a refused bind was still sent the enumerate phase"
+        );
+
+        // Only the first object is left driving the conversation.
+        assert_eq!(h.state.login.bound.len(), 1);
+
+        // And it still works: a refused rival must not take the live greeter
+        // down with it.
+        let mut first = first;
+        h.state.login.broadcast(|g| g.auth_ok());
+        h.dispatch();
+        first.pump();
+        assert!(
+            first
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::AUTH_OK),
+            "the surviving greeter stopped receiving events"
+        );
+    }
 }

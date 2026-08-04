@@ -1,7 +1,7 @@
 .\" wdm(1) -- Wayland display manager that is its own compositor
-.\" Written for wdm 0.1.3. Section 1 rather than 8 because wdm.service's
+.\" Written for wdm 0.2.0. Section 1 rather than 8 because wdm.service's
 .\" Documentation= already points at man:wdm(1).
-.TH WDM 1 "2026-07-31" "wdm 0.1.3" "User Commands"
+.TH WDM 1 "2026-08-03" "wdm 0.2.0" "User Commands"
 .SH NAME
 wdm \- Wayland display manager that is its own compositor
 .SH SYNOPSIS
@@ -93,6 +93,22 @@ needs no
 .B Conflicts=
 against a getty, and tty1 remains a working text console, which is the recovery
 path when a greeter wedges. Must be at least 1.
+.IP
+.B wdm.service
+ships no
+.B Conflicts=
+because of that default. Setting
+.B vt
+to a terminal a getty uses \(en 1 through 6 \(en requires a drop-in adding
+.BI Conflicts=getty@tty N .service
+and
+.BI After=getty@tty N .service
+for that
+.IR N ,
+or
+.B wdm
+and the getty contend for the same VT with nothing arbitrating between them,
+and the recovery console documented above is gone.
 .TP
 .B default_session
 Session id offered to a user with no recorded last session.
@@ -220,9 +236,12 @@ Per\-user record of the last session launched, reported to the greeter so it can
 preselect one.
 .TP
 .I /run/wdm
-Runtime directory, owned by the greeter account and mode 0700. The Wayland
-socket the greeter connects to lives here, mode 0600 and owned by the same
-account; every connection's peer uid is checked against it as well.
+Runtime directory, created root\-owned and mode 0700 by systemd;
+.B wdm
+hands it to the greeter account only after the socket inside it is bound and
+secured. The Wayland socket the greeter connects to lives here, mode 0600 and
+owned by the same account; every connection's peer uid is checked against it as
+well.
 .TP
 .I /usr/lib/wdm/
 Greeter executables.

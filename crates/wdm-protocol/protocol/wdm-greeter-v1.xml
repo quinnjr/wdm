@@ -51,7 +51,8 @@
              summary="start_session named a session id that was never advertised"/>
       <entry name="invalid_env" value="4"
              summary="the env array is not NUL-separated NAME=VALUE entries with
-                      NAME matching [A-Za-z0-9_]+"/>
+                      NAME matching [A-Za-z0-9_]+. A well-formed entry that the
+                      filter described on start_session drops is not an error"/>
       <entry name="already_bound" value="5"
              summary="a second wdm_greeter_v1 object was bound while one is
                       still alive"/>
@@ -125,7 +126,13 @@
       </description>
       <arg name="session_id" type="string" summary="an id from a session event"/>
       <arg name="env" type="array"
-           summary="additional NUL-separated KEY=VALUE entries for the session"/>
+           summary="additional NUL-separated KEY=VALUE entries for the session.
+                    Filtered, not merged wholesale: only LANG, LANGUAGE, LC_*
+                    and XKB_* are honoured, values containing / or NUL are
+                    rejected, and anything else is dropped silently — no event,
+                    no error. The session runs as the authenticated user through
+                    a login shell, so an unfiltered environment would be code
+                    execution as that user."/>
     </request>
 
     <event name="user">

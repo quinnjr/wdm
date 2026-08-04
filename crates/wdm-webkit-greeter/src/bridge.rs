@@ -45,16 +45,38 @@ pub fn parse(raw: &str) -> Option<Request> {
 ///
 /// A wedged web process never acknowledges anything, so `pending` would
 /// otherwise grow for as long as the machine sits at the login screen. The
-/// oldest statements are the ones worth losing: the page's state is
-/// assignments, and a later one supersedes an earlier one.
+/// oldest go first because the page's *state* is assignments, and a later
+/// assignment supersedes an earlier one.
+///
+/// That is not true of the callbacks queued alongside them: `show_message` and
+/// `show_prompt` are events with no successor, so one dropped here is gone for
+/// good — a lockout explanation the user never sees. It is accepted rather than
+/// worked around, because reaching this limit already means the page has not
+/// run any of them: 256 unacknowledged statements is a web process that stopped
+/// answering long before the queue filled, and the escalation that ends in
+/// [`Bridge::is_wedged`] is the answer to that, not a cleverer eviction order.
 const PENDING_LIMIT: usize = 256;
 
 /// Consecutive failed evaluations after which the page is declared dead.
 ///
-/// The pump ticks every 16ms, so this is roughly a second of a web process
-/// that answers nothing. Below that a reload or a crash-and-respawn recovers
-/// on its own and quitting would be worse than waiting.
+/// The pump ticks every 16ms, so an evaluation that comes back `Err` every time
+/// makes this roughly a second. Below that a reload or a crash-and-respawn
+/// recovers on its own and quitting would be worse than waiting.
+///
+/// A silent web process escalates the same way but more slowly, because each
+/// failure costs it [`VERDICT_DEADLINE`] ticks first: about half a minute
+/// before the greeter gives up. Waiting longer on silence than on a refusal is
+/// the right way round — silence is the case a slow theme can also produce.
 const WEDGED_AFTER: u32 = 60;
+
+/// Pump ticks an evaluation may go without a verdict before it counts as one
+/// that failed.
+///
+/// About half a second, which no callback in a login screen has any business
+/// taking. Being wrong about it costs a retransmission, and the statements are
+/// assignments plus callbacks a theme should tolerate seeing twice — the same
+/// cost a genuinely failed evaluation already carries.
+const VERDICT_DEADLINE: u32 = 30;
 
 /// One flush's worth of script, tagged with the epoch it belongs to.
 ///
@@ -73,7 +95,12 @@ pub struct Outbound {
 #[derive(Default)]
 pub struct Bridge {
     prompt: Option<u32>,
-    notice: Option<String>,
+    /// How many of `Model::notices` the page has already been told about.
+    ///
+    /// A count rather than a copy of the last one: the list only grows within a
+    /// conversation, so everything past this index is new, and each is reported
+    /// with its own style instead of being folded into one line.
+    notices_reported: usize,
     error: Option<String>,
     authenticated: bool,
     over: bool,
@@ -87,17 +114,25 @@ pub struct Bridge {
     pending: Vec<String>,
     /// How many of `pending` are in an evaluation whose verdict is still out.
     in_flight: usize,
-    /// Which generation of the conversation `in_flight` belongs to.
+    /// How many pump ticks the evaluation in flight has gone without a verdict.
     ///
-    /// [`restart`](Self::restart) bumps it, and a verdict tagged with an older
-    /// one is discarded. Without that, the real ordering loses events: the
-    /// theme calls `authenticate()`, which restarts the bridge; the next tick
-    /// queues and evaluates the new conversation's statements; and only *then*
-    /// does the pre-restart evaluation land, acknowledging statements it never
-    /// carried. Zeroing `in_flight` in `restart` is not enough, because the
-    /// straggler arrives after it has been set again.
+    /// Counted rather than timed, so `Bridge` stays free of clocks: the pump's
+    /// interval is the unit. See [`tick`](Self::tick).
+    ticks_in_flight: u32,
+    /// Which evaluation `in_flight` belongs to.
+    ///
+    /// [`restart`](Self::restart) and a timed-out [`tick`](Self::tick) both bump
+    /// it, and a verdict tagged with an older one is discarded. Without that,
+    /// the real ordering loses events: the theme calls `authenticate()`, which
+    /// restarts the bridge; the next tick queues and evaluates the new
+    /// conversation's statements; and only *then* does the pre-restart
+    /// evaluation land, acknowledging statements it never carried. Zeroing
+    /// `in_flight` is not enough, because the straggler arrives after it has
+    /// been set again — which is exactly the shape of a late verdict for an
+    /// evaluation that was already written off as timed out.
     epoch: u64,
-    /// Failed evaluations since the last successful one.
+    /// Failed evaluations since the last successful one, counting one that
+    /// never answered at all.
     consecutive_failures: u32,
 }
 
@@ -107,17 +142,40 @@ impl Bridge {
     /// Each entry is a complete statement, evaluated in the page. A theme that
     /// has not defined a given callback simply does not get called, which is
     /// what makes a minimal theme possible.
+    ///
+    /// ## What `show_message`'s `kind` means
+    ///
+    /// One call per message PAM sent, carrying that message's own style —
+    /// `"info"` for `PAM_TEXT_INFO`, `"error"` for `PAM_ERROR_MSG`. PAM sends
+    /// them one at a time and the two mean different things, so they are
+    /// reported one at a time rather than joined into a single line: a theme
+    /// that wants to show a lockout in red and the minutes-remaining beside it
+    /// in grey can, and one that treats both the same simply ignores the
+    /// argument.
+    ///
+    /// `Model::error` is reported as `"error"` too, but it is a different kind
+    /// of thing — the conversation's verdict rather than something the stack
+    /// chose to say — and it arrives after every notice, so a theme that
+    /// re-renders on it still has the explanation in hand.
     pub fn diff(&mut self, model: &Model) {
         let out = &mut self.pending;
 
         // Ordering is deliberate: messages explaining a failure are delivered
         // before the completion callback that a theme reacts to, so a theme
         // that re-renders on completion still has the explanation in hand.
-        if model.notice != self.notice {
-            self.notice = model.notice.clone();
-            if let Some(text) = &self.notice {
-                out.push(call("show_message", &[json!(text), json!("info")]));
+        //
+        // Notices only ever accumulate within a conversation — `begin_attempt`
+        // clears the list, and `restart` resets this counter with it — so the
+        // count is enough to tell which are new, and a theme is never told the
+        // same message twice.
+        if model.notices.len() > self.notices_reported {
+            for notice in &model.notices[self.notices_reported..] {
+                out.push(call(
+                    "show_message",
+                    &[json!(notice.text), json!(notice.kind.as_str())],
+                ));
             }
+            self.notices_reported = model.notices.len();
         }
 
         if model.error != self.error {
@@ -202,6 +260,7 @@ impl Bridge {
             return None;
         }
         self.in_flight = self.pending.len();
+        self.ticks_in_flight = 0;
         Some(Outbound {
             epoch: self.epoch,
             script: self.pending.join("\n"),
@@ -229,6 +288,46 @@ impl Bridge {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         }
         self.in_flight = 0;
+        self.ticks_in_flight = 0;
+    }
+
+    /// Advance the deadline on the evaluation in flight, if there is one.
+    ///
+    /// Called once per pump tick. This is the only thing that notices a web
+    /// process which took the script and said nothing — [`delivered`] hears
+    /// only from evaluations that finished, so a hung web process or a theme
+    /// callback in an infinite loop reaches it never. Left to itself that state
+    /// is permanent: `in_flight` stays set, [`flush`] returns `None` on every
+    /// tick, and the greeter sits alive in front of a login screen that does
+    /// nothing — which is precisely the case [`is_wedged`] is named for and,
+    /// before this existed, the one case it could not see.
+    ///
+    /// A missed deadline is counted as a failed evaluation rather than as its
+    /// own kind of trouble, so there is one way to give up instead of two, and
+    /// a page that alternates between refusing and stalling still escalates.
+    ///
+    /// [`delivered`]: Self::delivered
+    /// [`flush`]: Self::flush
+    /// [`is_wedged`]: Self::is_wedged
+    pub fn tick(&mut self) {
+        if self.in_flight == 0 {
+            return;
+        }
+        self.ticks_in_flight = self.ticks_in_flight.saturating_add(1);
+        if self.ticks_in_flight < VERDICT_DEADLINE {
+            return;
+        }
+
+        // The epoch is bumped for the same reason `restart` bumps it: the
+        // evaluation has been written off, but it has not been cancelled, and
+        // WebKit may still produce a verdict for it. Tagged with the old epoch,
+        // that verdict is discarded — where without the bump a late success
+        // would drain `in_flight` statements belonging to the retransmission
+        // that has since been sent, acknowledging what the page never ran.
+        self.epoch = self.epoch.wrapping_add(1);
+        self.in_flight = 0;
+        self.ticks_in_flight = 0;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
     /// Failed evaluations since the last that succeeded.
@@ -244,6 +343,12 @@ impl Bridge {
     /// A web process that is wedged rather than crashed leaves wdm's supervisor
     /// looking at a healthy greeter process and a login screen that does
     /// nothing, indefinitely. Exiting is what turns that into a respawn.
+    ///
+    /// Both halves of "stopped answering" count towards this, and they have to:
+    /// a web process that refuses every evaluation is reported by
+    /// [`delivered`](Self::delivered), but one that is hung rather than crashed
+    /// refuses nothing — it simply never comes back, and only
+    /// [`tick`](Self::tick) sees that.
     pub fn is_wedged(&self) -> bool {
         self.consecutive_failures >= WEDGED_AFTER
     }
@@ -327,6 +432,14 @@ pub fn api_script(model: &Model) -> String {
     // including the argument checks — a theme that calls respond() with no
     // pending prompt gets an exception it can see, rather than a message the
     // compositor rejects as a protocol error and kills the greeter for.
+    //
+    // start_session needs two checks, not one. Its fallback to the first
+    // session has nothing to fall back to when no sessions are installed, and
+    // posting `undefined` then sends `["start_session"]` — which `parse`
+    // refuses and the message handler logs to a journal nobody is reading,
+    // while the theme, having thrown nothing, sits on "Starting session…"
+    // forever. An exception is the whole promise of these guards: a mistake
+    // shows up in the theme, not as silence.
     format!(
         r#"window.wdm = {{
   users: {users},
@@ -361,7 +474,9 @@ pub fn api_script(model: &Model) -> String {
   }},
   start_session(id) {{
     if (!this.is_authenticated) {{ throw new Error('wdm.start_session before authenticating'); }}
-    this._post('start_session', id || (this.sessions[0] && this.sessions[0].id));
+    const session = id || (this.sessions[0] && this.sessions[0].id);
+    if (!session) {{ throw new Error('wdm.start_session needs a session id'); }}
+    this._post('start_session', session);
   }},
 }};
 "#,
@@ -378,7 +493,7 @@ pub fn api_script(model: &Model) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wdm_greeter_client::{Prompt, Session, User};
+    use wdm_greeter_client::{NoticeKind, Prompt, Session, User};
 
     #[test]
     fn parses_the_verbs() {
@@ -515,6 +630,64 @@ mod tests {
     }
 
     #[test]
+    fn each_notice_carries_the_style_pam_gave_it() {
+        // The defect this pins: both PAM styles used to arrive as one joined
+        // string reported as "info", so a theme could not tell a lockout from
+        // the sentence explaining how long it lasts, and the WebKit greeter
+        // disagreed with the reference greeter on identical input.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        model.push_notice(
+            NoticeKind::Info,
+            "(10 minutes left to unlock)".to_owned(),
+        );
+
+        let js = drain(&mut bridge, &model);
+        let locked = js.find("The account is locked.").unwrap();
+        let minutes = js.find("10 minutes left").unwrap();
+
+        // Two calls, not one joined line, and in the order PAM sent them.
+        assert_eq!(js.matches("window.show_message(").count(), 2, "{js}");
+        assert!(locked < minutes, "{js}");
+
+        // Each with its own style: the lockout is the error, the duration is not.
+        let error_kind = js.find("\"error\"").unwrap();
+        let info_kind = js.find("\"info\"").unwrap();
+        assert!(locked < error_kind && error_kind < minutes, "{js}");
+        assert!(minutes < info_kind, "{js}");
+
+        // Polled state must not re-report what the page has already been told.
+        assert!(drain(&mut bridge, &model).is_empty());
+
+        // And a notice arriving later is the only one reported.
+        model.push_notice(NoticeKind::Error, "Account expired.".to_owned());
+        let js = drain(&mut bridge, &model);
+        assert_eq!(js.matches("window.show_message(").count(), 1, "{js}");
+        assert!(js.contains("Account expired."), "{js}");
+    }
+
+    #[test]
+    fn a_new_attempt_reports_its_notices_again() {
+        // begin_attempt clears the list and restart() resets the counter with
+        // it; if the two ever disagreed, the count would index past the end or
+        // silently swallow the next conversation's first messages.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        assert!(drain(&mut bridge, &model).contains("show_message"));
+
+        model.begin_attempt();
+        bridge.restart();
+        assert!(drain(&mut bridge, &model).is_empty());
+
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        let js = drain(&mut bridge, &model);
+        assert_eq!(js.matches("window.show_message(").count(), 1, "{js}");
+        assert!(js.contains("\"error\""), "{js}");
+    }
+
+    #[test]
     fn reports_success() {
         let mut bridge = Bridge::default();
         let mut model = model();
@@ -602,7 +775,7 @@ mod tests {
     fn one_evaluation_at_a_time() {
         let mut bridge = Bridge::default();
         let mut model = model();
-        model.notice = Some("first".to_owned());
+        model.push_notice(NoticeKind::Info, "first".to_owned());
 
         bridge.diff(&model);
         let first = bridge.flush().unwrap();
@@ -674,7 +847,7 @@ mod tests {
         // sits dead indefinitely unless the greeter admits it.
         let mut bridge = Bridge::default();
         let mut model = model();
-        model.notice = Some("hello".to_owned());
+        model.push_notice(NoticeKind::Info, "hello".to_owned());
         bridge.diff(&model);
 
         for _ in 0..WEDGED_AFTER - 1 {
@@ -696,12 +869,71 @@ mod tests {
     }
 
     #[test]
+    fn a_page_that_never_answers_at_all_is_declared_dead() {
+        // The case is_wedged is named for and could not see: a web process hung
+        // rather than crashed, or a theme callback in an infinite loop. Nothing
+        // ever comes back, so `delivered` is never called, and before `tick`
+        // existed in_flight stayed set, flush returned None on every tick, and
+        // the greeter sat alive in front of a dead login screen forever.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Info, "hello".to_owned());
+        bridge.diff(&model);
+
+        // The pump, faithfully: tick, then flush, and a verdict never arrives.
+        let first = {
+            let mut first = None;
+            let mut ticks = 0u32;
+            while !bridge.is_wedged() {
+                bridge.tick();
+                if let Some(out) = bridge.flush() {
+                    first.get_or_insert(out.epoch);
+                }
+                ticks += 1;
+                assert!(ticks < 10_000, "the greeter never gave up");
+            }
+            first.expect("nothing was ever sent")
+        };
+        assert_eq!(bridge.consecutive_failures(), WEDGED_AFTER);
+
+        // And the verdict that evaluation may still eventually produce cannot
+        // undo it: it describes an attempt already written off, and the
+        // statements it carried have been retransmitted since.
+        bridge.delivered(first, true);
+        assert!(bridge.is_wedged());
+        assert_eq!(bridge.consecutive_failures(), WEDGED_AFTER);
+    }
+
+    #[test]
+    fn a_slow_but_successful_evaluation_is_not_wedged() {
+        // The deadline must be a deadline, not a speed limit. A theme callback
+        // that takes a few hundred milliseconds is slow, not dead, and
+        // declaring it dead would quit the greeter out from under the user.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Info, "hello".to_owned());
+        bridge.diff(&model);
+        let out = bridge.flush().unwrap();
+
+        for _ in 0..VERDICT_DEADLINE - 1 {
+            bridge.tick();
+            assert!(bridge.flush().is_none(), "sent a second evaluation");
+            assert!(!bridge.is_wedged());
+        }
+
+        bridge.delivered(out.epoch, true);
+        assert_eq!(bridge.consecutive_failures(), 0);
+        assert!(!bridge.is_wedged());
+        assert!(bridge.flush().is_none(), "the statement was not drained");
+    }
+
+    #[test]
     fn a_stale_verdict_is_not_counted_as_a_failure() {
         // Otherwise a straggler could push a perfectly healthy page towards
         // the wedged threshold and quit the greeter out from under the user.
         let mut bridge = Bridge::default();
         let mut model = model();
-        model.notice = Some("hello".to_owned());
+        model.push_notice(NoticeKind::Info, "hello".to_owned());
         bridge.diff(&model);
         let stale = bridge.flush().unwrap();
 
@@ -774,6 +1006,29 @@ mod tests {
             let quotes = line.matches('"').count() - line.matches("\\\"").count();
             assert_eq!(quotes % 2, 0, "unbalanced quotes in: {line}");
         }
+    }
+
+    #[test]
+    fn start_session_refuses_to_post_nothing() {
+        // With no sessions installed the fallback to sessions[0] resolves to
+        // undefined, and _post would send ["start_session"] — a message wdm's
+        // own parse refuses, leaving the theme on "Starting session…" with no
+        // exception and no callback. The guard is what makes that visible.
+        let script = api_script(&Model::default());
+        assert!(
+            script.contains("wdm.start_session needs a session id"),
+            "{script}"
+        );
+        // And it is the resolved id that is checked, not the argument: a theme
+        // that passes nothing on a machine that *has* sessions is still fine.
+        assert!(
+            script.contains("const session = id || (this.sessions[0] && this.sessions[0].id);"),
+            "{script}"
+        );
+        assert!(
+            script.contains("this._post('start_session', session);"),
+            "{script}"
+        );
     }
 
     #[test]

@@ -80,12 +80,26 @@ fi
 if [ -x /usr/bin/systemd-tmpfiles ]; then
     /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf || :
 fi
+# systemd-sysusers never modifies an account that already exists, so a machine
+# that installed 0.1.x keeps the greeter's home at /var/lib/wdm forever — the
+# directory root creates and renames files in, which is exactly what the home
+# was moved out of. Guarded on the old value so it is idempotent and so an
+# administrator who chose a different home is left alone.
+if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+    usermod -d /var/empty wdm || :
+fi
 '''
 assets = [
     { source = "target/release/wdm", dest = "/usr/bin/wdm", mode = "755" },
     { source = "packaging/wdm.service", dest = "/usr/lib/systemd/system/wdm.service", mode = "644" },
-    { source = "packaging/pam.d-wdm.fedora", dest = "/etc/pam.d/wdm", mode = "644", config = true },
-    { source = "packaging/wdm.toml.example", dest = "/etc/wdm/wdm.toml", mode = "644", config = true },
+    # `config = "noreplace"` rather than `config = true`: plain %config makes rpm
+    # overwrite a locally modified file on upgrade and leave the admin's version
+    # as .rpmsave, which would silently revert a customised vt, greeter.command
+    # or a PAM stack adapted for fingerprint or smartcard. dpkg conffiles and
+    # pacman's backup= both keep the local file, and %config(noreplace) is what
+    # Fedora's guidelines require for /etc files that are not regenerated.
+    { source = "packaging/pam.d-wdm.fedora", dest = "/etc/pam.d/wdm", mode = "644", config = "noreplace" },
+    { source = "packaging/wdm.toml.example", dest = "/etc/wdm/wdm.toml", mode = "644", config = "noreplace" },
     { source = "packaging/wdm.sysusers", dest = "/usr/lib/sysusers.d/wdm.conf", mode = "644" },
     { source = "packaging/wdm.tmpfiles", dest = "/usr/lib/tmpfiles.d/wdm.conf", mode = "644" },
     { source = "packaging/wdm.1", dest = "/usr/share/man/man1/wdm.1", mode = "644", doc = true },

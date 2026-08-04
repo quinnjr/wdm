@@ -20,6 +20,12 @@
 # session wdm forks stays in wdm's own domain: confined logins (staff_u,
 # guest_u, xguest_u) would be silently unconfined and MCS separation would not
 # apply — on a distribution that ships SELinux enforcing.
+#
+# pam_keyinit is listed after pam_selinux open and pam_namespace, which is where
+# Fedora's own login and sshd stacks put it: the session keyring is created with
+# the exec context already computed. Running it earlier is not known to break
+# anything, but this file cannot be tested from the machine it is written on, so
+# it follows the ordering the distribution ships rather than an improvised one.
 
 auth        substack    system-auth
 -auth       optional    pam_gnome_keyring.so
@@ -33,9 +39,9 @@ password    include     system-auth
 
 session     required    pam_selinux.so close
 session     required    pam_loginuid.so
-session     optional    pam_keyinit.so force revoke
 session     required    pam_selinux.so open
 session     optional    pam_namespace.so
+session     optional    pam_keyinit.so force revoke
 session     include     system-auth
 session     include     postlogin
 -session    optional    pam_gnome_keyring.so auto_start
