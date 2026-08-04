@@ -1,11 +1,10 @@
 //! The wire between wdm and its PAM helper.
 //!
-//! wdm will run PAM in a separate, freshly `exec`'d process, so the
-//! conversation that is today an `mpsc` channel between two threads becomes a
-//! socket between two processes. Nothing runs PAM out of process yet — `auth.rs`
-//! still uses the thread — so this describes where the codec is going, not where
-//! it is. This module is the encoding, and nothing else: no PAM, no I/O policy,
-//! so it can be round-tripped in a test without either side existing.
+//! wdm runs PAM in a separate, freshly `exec`'d process ([`crate::pamhelper`]),
+//! so the conversation that is today an `mpsc` channel between two threads
+//! becomes a socket between two processes. This module is the encoding, and
+//! nothing else: no PAM, no I/O policy, so it can be round-tripped in a test
+//! without either side existing.
 //!
 //! ## Why a hand-rolled codec
 //!
@@ -23,13 +22,6 @@
 //! message to be mistaken for a short one — a peer that writes half a message
 //! writes half a *packet*, which fails to decode rather than blocking the
 //! reader forever waiting for the rest.
-
-// ponytail: nothing sends these yet. The codec is complete and tested on its
-// own, but the two peers that use it — the helper, and the rewritten
-// `AuthHandle` — are not written, so every variant is dead until they are. This
-// allow comes off in the commit that adds `pamhelper`, and if it is still here
-// without one, the wire was built and then abandoned.
-#![allow(dead_code)]
 
 use zeroize::Zeroize;
 
@@ -60,6 +52,26 @@ pub const MAX_MESSAGE: usize = 256 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Msg {
     // ---- wdm -> helper ------------------------------------------------
+    /// Begin an attempt. Always the first message on the socket.
+    ///
+    /// Everything here would be argv on a helper that took arguments, and is
+    /// not, because `--pam-helper` deliberately accepts none: a mode reachable
+    /// only through a file descriptor cannot be reached by accident from a
+    /// shell, and a username on a command line is world-readable in `/proc`.
+    /// The fields are exactly what [`crate::auth`] passes to its thread —
+    /// the user, the tty for `PAM_TTY`, and the seat description pam_systemd
+    /// needs before `pam_open_session`.
+    Start {
+        username: String,
+        tty: String,
+        seat: String,
+        vtnr: u32,
+        /// Provisional `wayland` or `x11`; the [`Msg::Launch`] that follows
+        /// carries the greeter's actual choice and supersedes it.
+        session_type: String,
+        /// Desktop id without the `.desktop` suffix; empty until chosen.
+        desktop: String,
+    },
     /// Answer the prompt with this id.
     Response { id: u32, secret: String },
     /// Open the PAM session and run the user's session.
@@ -113,6 +125,7 @@ impl Drop for Msg {
     }
 }
 
+const TAG_START: u8 = 0;
 const TAG_RESPONSE: u8 = 1;
 const TAG_LAUNCH: u8 = 2;
 const TAG_PROMPT: u8 = 3;
@@ -232,6 +245,22 @@ impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::Start {
+                username,
+                tty,
+                seat,
+                vtnr,
+                session_type,
+                desktop,
+            } => {
+                out.push(TAG_START);
+                put_str(&mut out, username);
+                put_str(&mut out, tty);
+                put_str(&mut out, seat);
+                put_u32(&mut out, *vtnr);
+                put_str(&mut out, session_type);
+                put_str(&mut out, desktop);
+            }
             Self::Response { id, secret } => {
                 out.push(TAG_RESPONSE);
                 put_u32(&mut out, *id);
@@ -297,6 +326,14 @@ impl Msg {
 
         let mut r = Reader::new(bytes);
         let msg = match r.u8()? {
+            TAG_START => Self::Start {
+                username: r.string()?,
+                tty: r.string()?,
+                seat: r.string()?,
+                vtnr: r.u32()?,
+                session_type: r.string()?,
+                desktop: r.string()?,
+            },
             TAG_RESPONSE => Self::Response {
                 id: r.u32()?,
                 secret: r.string()?,
@@ -344,6 +381,14 @@ mod tests {
 
     #[test]
     fn every_message_round_trips() {
+        round_trip(Msg::Start {
+            username: "testuser".to_owned(),
+            tty: "/dev/tty7".to_owned(),
+            seat: "seat0".to_owned(),
+            vtnr: 7,
+            session_type: "wayland".to_owned(),
+            desktop: String::new(),
+        });
         round_trip(Msg::Response {
             id: 7,
             secret: "hunter2".to_owned(),
@@ -434,6 +479,30 @@ mod tests {
             assert!(
                 Msg::decode(&full[..cut]).is_none(),
                 "a message truncated to {cut} bytes decoded anyway"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_start_is_refused() {
+        // Start is the message with the most fields and the only one with a
+        // fixed-width field between two variable-width ones, so it is where a
+        // decoder that read the fields out of order would show up. Every prefix
+        // of it must fail rather than yield a Start with a plausible username.
+        let full = Msg::Start {
+            username: "testuser".to_owned(),
+            tty: "/dev/tty7".to_owned(),
+            seat: "seat0".to_owned(),
+            vtnr: 7,
+            session_type: "wayland".to_owned(),
+            desktop: "sway".to_owned(),
+        }
+        .encode();
+
+        for cut in 1..full.len() {
+            assert!(
+                Msg::decode(&full[..cut]).is_none(),
+                "a Start truncated to {cut} bytes decoded anyway"
             );
         }
     }

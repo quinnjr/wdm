@@ -18,6 +18,13 @@
 //! close, the conversation's `recv` fails, it returns `PAM_CONV_ERR`, and PAM
 //! unwinds on its own. There are no locks and no shared mutable state.
 //!
+//! Several pieces here are `pub(crate)` rather than private — the prompt-id
+//! counter, [`RESPONSE_TIMEOUT`], [`describe`], [`pam_session_env`] and
+//! [`SessionDescription::pam_items`]. [`crate::pamhelper`] runs the same PAM
+//! sequence out of process, and these are the parts where a second copy would
+//! silently drift: an id counter that restarts, a timeout that differs from the
+//! documented one, or an error string that leaks whether an account exists.
+//!
 //! The thread also owns the PAM handle for the lifetime of the user's session,
 //! because `pam_open_session` and `pam_close_session` must be paired on the same
 //! handle. It opens the session, hands the resulting environment to the event
@@ -43,7 +50,7 @@ pub const SERVICE: &str = "wdm";
 /// identify the question it was issued for, which means it may never be reused.
 static NEXT_PROMPT_ID: AtomicU32 = AtomicU32::new(0);
 
-fn next_prompt_id() -> u32 {
+pub(crate) fn next_prompt_id() -> u32 {
     NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -70,7 +77,7 @@ fn next_prompt_id() -> u32 {
 /// here. The cost of being wrong in this direction is one pinned thread for
 /// half an hour; the cost of being wrong in the other direction is a locked-out
 /// account, so the asymmetry decides the value.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// What wdm tells pam_systemd about the seat before opening a session.
 ///
@@ -91,7 +98,7 @@ pub struct SessionDescription {
 }
 
 impl SessionDescription {
-    fn pam_items(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn pam_items(&self) -> Vec<(&'static str, String)> {
         let mut items = vec![
             ("XDG_SEAT", self.seat.clone()),
             ("XDG_VTNR", self.vtnr.to_string()),
@@ -429,7 +436,7 @@ fn run(
 /// An empty value yields no pair at all rather than `KEY=`: a session with no
 /// desktop must leave `XDG_SESSION_DESKTOP` *unset*, because an empty string is
 /// a value logind will happily record and everything reading it will believe.
-fn pam_session_env(session_type: &str, desktop: &str) -> Vec<String> {
+pub(crate) fn pam_session_env(session_type: &str, desktop: &str) -> Vec<String> {
     [
         ("XDG_SESSION_TYPE", session_type),
         ("XDG_SESSION_DESKTOP", desktop),
@@ -451,13 +458,13 @@ fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
 /// The text reaches the greeter, so it must not leak whether an account exists:
 /// PAM already conflates "no such user" and "wrong password" into
 /// `Authentication failure`, and this preserves that.
-fn describe(e: &pam_client2::Error) -> String {
+pub(crate) fn describe(e: &pam_client2::Error) -> String {
     e.message()
         .map(str::to_owned)
         .unwrap_or_else(|| e.to_string())
 }
 
-fn os_to_string(s: &OsStr) -> Option<String> {
+pub(crate) fn os_to_string(s: &OsStr) -> Option<String> {
     match s.to_str() {
         Some(s) => Some(s.to_owned()),
         None => {
