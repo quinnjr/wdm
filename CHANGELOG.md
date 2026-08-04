@@ -5,6 +5,17 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-04
+
+A security and conformance release. **Upgrade if you run 0.3.0**: an
+untouched login screen locked the first user in the list out of their account
+in about three minutes, and the GTK greeter showed passwords in plaintext.
+
+Both were found by running it, not by reading it. Everything below the first
+two entries came from a project-wide audit of 292 units against their stated
+intent, which found 43 gaps — including a secret-misdirection bug introduced
+by the lockout fix itself.
+
 ### Fixed
 
 - **`pam_kwallet5` crashed the compositor mid-login, on NVIDIA.** The user
@@ -487,7 +498,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/quinnjr/wdm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0
 [0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
