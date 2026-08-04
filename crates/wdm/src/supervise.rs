@@ -38,6 +38,26 @@ const BACKOFF_SECS: &[u64] = &[1, 2];
 /// without one.
 pub const RUNTIME_DIR: &str = "/run/wdm";
 
+/// Cache directory for the greeter, pointed at by `XDG_CACHE_HOME`.
+///
+/// The greeter's home is `/var/empty`, which is root-owned and must stay empty,
+/// so `$HOME/.cache` — where every toolkit looks by default — cannot be created.
+/// GTK's Vulkan renderer reacts to that by logging "Failed to create pipeline
+/// cache directory" and recompiling every shader on every start, which cost
+/// this greeter more than ten seconds before it drew anything. A login screen
+/// that is blank for ten seconds reads as a machine that has failed to boot,
+/// and the user reaches for a VT switch or the power button.
+///
+/// Persistent rather than under [`RUNTIME_DIR`] precisely because a tmpfs one
+/// would be empty on every boot, which is the case that matters: the cost is
+/// paid at the login screen, once per boot, in front of someone waiting.
+///
+/// Owned by the greeter account, unlike `/var/lib/wdm`. The distinction is not
+/// an inconsistency: root creates and renames files in `/var/lib/wdm`, so
+/// handing it to an unprivileged account would be a symlink-attack surface,
+/// whereas nothing but the greeter ever touches this one.
+pub const CACHE_DIR: &str = "/var/cache/wdm";
+
 #[derive(Debug, thiserror::Error)]
 pub enum GreeterError {
     #[error("greeter user {0} does not exist")]
@@ -46,6 +66,8 @@ pub enum GreeterError {
     EmptyCommand,
     #[error("preparing {0}: {1}")]
     RuntimeDir(PathBuf, #[source] std::io::Error),
+    #[error("preparing {0}: {1}")]
+    CacheDir(PathBuf, #[source] std::io::Error),
     // No "spawning greeter:" prefix here: callers add their own context, and
     // the give-up screen shows this text verbatim.
     #[error("{0}")]
@@ -139,6 +161,63 @@ fn create_runtime_dir_at(dir: &Path) -> std::io::Result<()> {
     // SAFETY: geteuid cannot fail and touches no memory.
     let root = unsafe { libc::geteuid() };
     std::os::unix::fs::chown(dir, Some(root), None)?;
+
+    Ok(())
+}
+
+/// Create the greeter's cache directory and hand it to the greeter account.
+///
+/// See [`CACHE_DIR`] for why it exists at all. Unlike the runtime directory it
+/// is created and handed over in one step, because nothing is ever placed
+/// inside it by root — there is no window to keep the greeter out of.
+pub fn create_cache_dir(
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+) -> Result<(), GreeterError> {
+    // Unprivileged: the greeter runs as the developer, whose own XDG_CACHE_HOME
+    // is already writable, and /var/cache is not.
+    let Some((uid, gid)) = owner else {
+        return Ok(());
+    };
+    let dir = Path::new(CACHE_DIR);
+    create_cache_dir_at(dir, uid, gid).map_err(|e| GreeterError::CacheDir(dir.to_owned(), e))
+}
+
+fn create_cache_dir_at(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)?;
+
+    // Everything after this point goes through a file descriptor rather than the
+    // path, and the descriptor is opened `O_NOFOLLOW`.
+    //
+    // This directory outlives a boot and is owned by an unprivileged account for
+    // all of it, which the runtime directory on tmpfs is not. A greeter that is
+    // compromised once could replace it with a symlink and wait: the next boot,
+    // root would chmod and chown whatever that symlink pointed at. `O_NOFOLLOW`
+    // turns that into ELOOP here instead, and `recursive(true)` is what makes it
+    // reachable — it returns Ok for an existing path rather than EEXIST, so a
+    // symlink survives the create and has to be caught on the open.
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let fd = handle.as_raw_fd();
+
+    // Reassert both: `recursive(true)` leaves an existing directory's mode and
+    // owner alone, and the greeter account may have been reconfigured since the
+    // directory was made.
+    //
+    // SAFETY: fd is open and owned by `handle` for the whole call.
+    if unsafe { libc::fchmod(fd, 0o700) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fchown(fd, uid, gid) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
 
     Ok(())
 }
@@ -267,6 +346,7 @@ impl Greeter {
         if let Some(credentials) = &self.credentials {
             command
                 .env("XDG_RUNTIME_DIR", RUNTIME_DIR)
+                .env("XDG_CACHE_HOME", CACHE_DIR)
                 .env("HOME", &credentials.home)
                 .current_dir(&credentials.home);
 
@@ -1151,6 +1231,59 @@ mod tests {
             std::os::unix::fs::MetadataExt::uid(&meta),
             unsafe { libc::geteuid() }
         );
+    }
+
+    #[test]
+    fn the_cache_dir_is_created_tight_and_reasserted() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("wdm");
+        // Chowning to ourselves is the one ownership change an unprivileged test
+        // is allowed to make; in production these are the greeter's.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        create_cache_dir_at(&dir, uid, gid).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::mode(&meta) & 0o777, 0o700);
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), uid);
+
+        // Unlike the runtime directory this one persists across boots and is
+        // owned by the greeter throughout, so a second pass must still pull the
+        // mode back rather than trusting what it finds.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        create_cache_dir_at(&dir, uid, gid).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::mode(&meta) & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_symlinked_cache_dir_is_refused_rather_than_followed() {
+        // The attack O_NOFOLLOW exists for: the greeter owns this directory
+        // between boots, so a compromised one can replace it with a symlink and
+        // wait for root to chmod and chown the target on the next boot.
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("someone-elses");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let dir = base.path().join("wdm");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let err = create_cache_dir_at(&dir, uid, gid).unwrap_err();
+        // Either errno is a refusal and that is all this asserts. POSIX says
+        // O_NOFOLLOW reports ELOOP, but Linux reports ENOTDIR when O_DIRECTORY
+        // is also set, and pinning one of them would fail on the other kernel
+        // while the protection was working.
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "a symlink must fail the open, not be followed: {err}"
+        );
+
+        // And the target is untouched — the whole point.
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::mode(&meta) & 0o777, 0o755);
     }
 
     #[test]

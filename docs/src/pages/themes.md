@@ -71,6 +71,26 @@ if (typeof wdm.link_dead !== "undefined" && wdm.link_dead) { /* … */ }
 Calling these out of order throws, so a mistake shows up in your theme as an
 exception rather than as a protocol error that gets the greeter killed.
 
+> **Do not call `authenticate()` at load time.** Call it when the user submits
+> the form, not when the page loads or when the user drop-down changes.
+>
+> A conversation is a login attempt as far as `pam_faillock` is concerned, for
+> its whole duration — including the part where wdm is waiting for an answer.
+> There is no way to end a `pam_authenticate` that is sitting on a prompt
+> without failing it, so a conversation opened on behalf of someone who is not
+> at the keyboard is eventually charged to them as a failed login. A theme that
+> authenticates on load spends one of those every time the greeter is left
+> alone, and enough of them lock the account.
+>
+> The default theme keeps what the user typed in a `pendingAnswer` variable
+> across `authenticate()` and spends it in `show_prompt`, so the password is
+> still typed once and checked immediately. Copy that shape.
+>
+> wdm will not let this spin: a timed-out prompt arrives as a `show_message`
+> with kind `"error"` before the conversation ends, so a theme that retries on
+> failure has something to distinguish a timeout from a wrong password. But the
+> retry loop being closed does not make the first attempt free.
+
 `start_session`'s argument is optional: omitted, it falls back to
 `wdm.sessions[0]`. If neither resolves — no id given and no session installed on
 the machine — it **throws** rather than returning quietly, so a theme cannot

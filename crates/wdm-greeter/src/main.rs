@@ -196,6 +196,12 @@ struct App {
     menu_open: bool,
     prompt: Option<Prompt>,
     answer: String,
+    /// What the user typed before there was a prompt to put it in.
+    ///
+    /// Nothing opens a PAM conversation until the user asks to log in, so the
+    /// first thing they type arrives before PAM has asked for it. Held across
+    /// `create_session` and spent on the first prompt that wants an answer.
+    pending_answer: Option<String>,
     error: Option<String>,
     info: Option<String>,
     launching: bool,
@@ -241,6 +247,7 @@ impl App {
             menu_open: false,
             prompt: None,
             answer: String::new(),
+            pending_answer: None,
             error: None,
             info: None,
             launching: false,
@@ -296,15 +303,19 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Abandon the current conversation and start a new one.
-    fn restart_auth(&mut self) {
+    /// Abandon the current conversation.
+    ///
+    /// It ends the conversation rather than restarting it. Starting one here
+    /// would arm PAM for whoever the user list happens to land on, which is what
+    /// `submit` exists to be the only cause of.
+    fn abandon_auth(&mut self) {
         if let Some(greeter) = &self.greeter {
             greeter.cancel();
         }
         self.authenticating = false;
         self.prompt = None;
         self.answer.clear();
-        self.begin_auth();
+        self.pending_answer = None;
     }
 
     fn cycle_user(&mut self) {
@@ -317,7 +328,7 @@ impl App {
         self.menu_open = false;
         self.error = None;
         // The conversation is per user, so switching users means starting over.
-        self.restart_auth();
+        self.abandon_auth();
     }
 
     /// Open or close the session drop-down.
@@ -389,10 +400,16 @@ impl App {
             return;
         };
         let Some(prompt) = self.prompt.take() else {
-            // Nothing is being asked. Enter restarts a finished attempt, so a
-            // user who just saw an error can simply try again.
+            // Nothing is being asked, because nothing opens a conversation until
+            // this moment: arming PAM on behalf of a user who has not asked to
+            // log in charges `pam_faillock` for the greeter's own patience, and
+            // a conversation cannot be ended without failing it.
+            //
+            // Keep what was typed so the prompt PAM is about to send can be
+            // answered with it, rather than making the user type it twice.
             if !self.authenticating {
-                self.restart_auth();
+                self.pending_answer = Some(std::mem::take(&mut self.answer));
+                self.begin_auth();
             }
             return;
         };
@@ -417,6 +434,23 @@ impl App {
                 self.blocked = true;
             }
             style => {
+                // The answer the user gave before PAM had asked for it. Spent
+                // on the first question that wants one, so from their side they
+                // typed a password, pressed Enter, and it was checked.
+                //
+                // `take()` rather than a peek: it is worth exactly one prompt. A
+                // stack that asks twice must get the second answer from the
+                // user, and silently resending the password would be putting
+                // that secret somewhere it was never typed for.
+                if let (Some(answer), Some(greeter)) =
+                    (self.pending_answer.take(), &self.greeter)
+                {
+                    greeter.respond(id, answer);
+                    self.prompt = None;
+                    self.answer.clear();
+                    self.needs_redraw = true;
+                    return;
+                }
                 self.prompt = Some(Prompt {
                     id,
                     text,
@@ -450,6 +484,9 @@ impl App {
         self.authenticating = false;
         self.prompt = None;
         self.answer.clear();
+        // The conversation it was buffered for is over. It must not survive into
+        // the next one, where it would be spent on a prompt the user never saw.
+        self.pending_answer = None;
         // A conversation that already explained itself keeps its explanation:
         // `pam_prompt` routed PAM's own error text here, and "Authentication
         // failure" is strictly less informative than "account locked, 10
@@ -783,7 +820,10 @@ impl Dispatch<WdmGreeterV1, ()> for App {
                 // are built once here rather than cloned every repaint.
                 state.session_names = state.sessions.iter().map(|s| s.name.clone()).collect();
                 state.select_last_session();
-                state.begin_auth();
+                // No conversation is started here, deliberately: see `submit`.
+                // Opening one costs a PAM attempt on a machine nobody has
+                // touched, and a login screen left alone used to spend those
+                // until `pam_faillock` locked the first user in the list out.
             }
 
             wdm_greeter_v1::Event::Prompt { id, text, style } => match style.into_result() {

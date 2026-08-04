@@ -5,6 +5,55 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **An untouched login screen locked the account out.** This is the serious one:
+  it needed no interaction, no attacker, and no misconfiguration — only a
+  machine left sitting at its greeter.
+
+  Every greeter opened a PAM conversation as soon as a user was selected, which
+  at startup meant before anyone had touched the keyboard. `pam_authenticate`
+  then blocked in the conversation callback, and wdm abandoned the attempt after
+  60 seconds. There is no way to end a `pam_authenticate` that is mid-prompt
+  without failing it, so that abandonment reached `pam_faillock`'s `authfail`
+  arm as a failed login. wdm reported it to the greeter as a bare `auth_failed`,
+  which is indistinguishable from a mistyped password, so the greeter retried —
+  re-arming the timeout. The two spun at roughly one attempt a minute, and on
+  Arch's default `deny=3` the first user in the list was locked out about three
+  minutes after boot.
+
+  Three changes, each of which breaks the loop on its own:
+
+  - **No greeter arms PAM until the user asks to log in.** Selecting a user now
+    ends any conversation rather than starting one, and only submitting the form
+    opens one. What the user typed before PAM asked for it is carried across
+    `create_session` and spent on the first prompt, so the password is still
+    typed once. This is the fix that takes the unattended case to zero attempts
+    rather than merely bounding it.
+  - **A timed-out prompt explains itself before failing**, as a `prompt` event
+    with style `error`. That reaches `Model::push_notice`, which sets `blocked`,
+    which suppresses the automatic retry in every greeter sharing
+    `wdm-greeter-client` — rather than in whichever ones remember to
+    special-case a reason string.
+  - **`RESPONSE_TIMEOUT` is 30 minutes rather than 60 seconds.** It is a guard
+    against a wedged greeter pinning a thread, not a limit on how long a human
+    may take to read a screen. Being wrong in this direction costs one pinned
+    thread; being wrong in the other locked people out of their machines.
+
+  Third-party greeters and webkit themes that call `authenticate()` at load time
+  keep working — the retry loop is closed compositor-side — but they still spend
+  one attempt per unattended greeter. See the theme guide.
+
+- **The greeter recompiled every shader on every boot.** Its home is
+  `/var/empty`, which is root-owned and must stay empty, so GTK could not create
+  `$HOME/.cache` and logged "Failed to create pipeline cache directory". wdm now
+  creates `/var/cache/wdm`, owned by the greeter account and mode `0700`, and
+  points `XDG_CACHE_HOME` at it. The directory is opened `O_NOFOLLOW` before its
+  mode and owner are asserted, because unlike the runtime directory it persists
+  across boots under an unprivileged account — a greeter compromised once could
+  otherwise leave a symlink for root to follow on the next boot. Failing to
+  create it is a warning, not a fatal error: a slow login screen beats none.
+
 ### Changed
 
 - **The Arch packaging is three AUR packages rather than one split package**:

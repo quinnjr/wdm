@@ -85,6 +85,15 @@ pub fn build(
     // with the paths the two calls above operated on.
     crate::supervise::hand_over_runtime_dir(greeter_credentials)?;
 
+    // Not fatal, unlike the runtime directory. A greeter with no cache still
+    // logs in; it just recompiles its shaders on every boot, which is the
+    // slow-blank-login-screen this exists to prevent rather than a broken one.
+    // Refusing to start over it would trade a slow login screen for no login
+    // screen at all.
+    if let Err(e) = crate::supervise::create_cache_dir(greeter_credentials) {
+        log::warn!("{e}; the greeter will start more slowly");
+    }
+
     loop_handle.insert_source(socket, move |stream, _, data| {
         if !greeter_may_connect(peer_uid(&stream), expected_uid) {
             // Dropping the stream closes it.
