@@ -5,6 +5,20 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-04
+
+Hardening of the login screen against account enumeration, and the first
+release whose handoff has actually run on hardware.
+
+`pam_loginuid` now works. It never has before: `proc_loginuid_write` refuses a
+write from any task that is not the thread-group leader, and PAM ran on a
+spawned thread, so every login wdm has ever performed left `loginuid` unset.
+Verified on a real login — the session's `loginuid` reads the user's uid.
+
+`pam_kwallet5` is enabled again in all three PAM stacks, with no compositor
+crash. The hazard is closed rather than worked around: PAM runs in a process
+that never loaded a graphics driver.
+
 ## [0.5.0] — 2026-08-04
 
 wdm no longer runs PAM in its own process. The conversation and the session
@@ -545,7 +559,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/quinnjr/wdm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/quinnjr/wdm/releases/tag/v0.5.0
 [0.4.0]: https://github.com/quinnjr/wdm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
