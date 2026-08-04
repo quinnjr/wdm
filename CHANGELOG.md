@@ -5,6 +5,20 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-04
+
+wdm no longer runs PAM in its own process. The conversation and the session
+move into a freshly `exec`'d, single-threaded helper that forks the user's
+session — the arrangement `login(1)` and `sshd` use, and for the reasons they
+use it.
+
+`pam_kwallet5` is restored to all three PAM stacks: the hazard that made it
+kill the compositor mid-login is closed rather than worked around.
+
+**The reordered handoff has run on no hardware.** `--backend winit` cannot
+exercise DRM, the seat, or the handoff, so the path this release exists to
+change rests on review and on tests that stop at the process boundary.
+
 ### Fixed
 
 - **PAM now runs in its own process, and the user's session is forked from it.**
@@ -531,7 +545,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/quinnjr/wdm/releases/tag/v0.5.0
 [0.4.0]: https://github.com/quinnjr/wdm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0
