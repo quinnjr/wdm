@@ -158,8 +158,23 @@ FakeWdm::~FakeWdm() {
         running_ = false;
     }
     thread_.join();
-    // Destroys the remaining clients and resources, which runs
-    // resourceDestroyed on this thread with no lock held.
+    // Explicitly, and not left to wl_display_destroy: that call destroys the
+    // globals, the sockets and the event loop, and leaves any still-connected
+    // client allocated — libwayland has a separate entry point for clients
+    // precisely because destroying the display does not reach them.
+    //
+    // Nothing else reliably does, either. A client is normally reaped when the
+    // event loop notices its socket at EOF, and the test disconnects the
+    // display only moments before this destructor stops the loop; whether the
+    // final 5 ms dispatch observes the hangup first is a race the thread
+    // scheduler decides. It usually does on an idle machine, which is why this
+    // leaked the wl_client, its wdm_greeter_v1 resource and its connection
+    // buffers on roughly one CI run in six and never once locally.
+    //
+    // After the join, so there is no other thread in libwayland, and before the
+    // display it belongs to. Runs clientDestroyed and resourceDestroyed on this
+    // thread, both of which take the mutex, and neither is held here.
+    wl_display_destroy_clients(display_);
     wl_display_destroy(display_);
     if (clientFd_ >= 0) {
         close(clientFd_);
