@@ -11,10 +11,11 @@ license=('MIT')
 makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
              'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell' 'webkitgtk-6.0')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Stale: this is the v0.2.0 tarball's checksum, and it can only be recomputed
-# once v0.3.0 is tagged and GitHub has generated the archive. Regenerate with
-# `updpkgsums` at release time, before this PKGBUILD is published.
-sha256sums=('10aff2d22a13ca641839714cebb34e74cc16bca6d188ba19977e93642767d464')
+# The published tarball's checksum, not one computed from a local `git archive`:
+# GitHub's generated archives are not byte-reproducible from the repository, so
+# a locally derived value fails integrity checking for everyone else. Regenerate
+# with `updpkgsums` after each tag, before publishing.
+sha256sums=('6bb8ce1ba62c87062ecd2d1e74c9fb1eb1b5b3bf4703efde60fee86fed6b545c')
 
 prepare() {
   cd "$pkgbase-$pkgver"
