@@ -472,18 +472,18 @@ impl ChannelConversation {
 
             // CString rejects interior NUL, which cannot be part of a password
             // PAM could ever verify.
-            // The String is zeroized when `response` drops. The intermediate
-            // Vec is zeroized here explicitly, because CString takes ownership
-            // of a copy and neither it nor libpam's own copy of the answer is
-            // ever scrubbed — so the plaintext survives in freed heap either
-            // way. This narrows the window rather than closing it.
-            let mut bytes = response.secret.as_bytes().to_vec();
-            let result = CString::new(bytes.clone()).map_err(|_| {
+            //
+            // The String is zeroized when `response` drops. The CString this
+            // makes is not, and neither is the copy libpam takes of it, so the
+            // plaintext survives in freed heap until something reuses it. That
+            // is the accepted ceiling: pam_authenticate frees the answer itself
+            // and there is no hook to scrub it first. Copying the bytes only to
+            // zeroize the copy would not narrow anything — it would add a
+            // scrubbed allocation beside the unscrubbed one that matters.
+            return CString::new(response.secret.as_bytes()).map_err(|_| {
                 log::info!("response to prompt {id} contained a NUL byte");
                 ErrorCode::CONV_ERR
             });
-            bytes.zeroize();
-            return result;
         }
     }
 

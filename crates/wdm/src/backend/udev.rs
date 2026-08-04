@@ -32,7 +32,6 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc};
 use smithay::reexports::input::Libinput;
@@ -121,17 +120,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<Wdm> = Display::new()?;
     let loop_handle = event_loop.handle();
 
+    // `build` registers the SIGTERM/SIGINT source, on the long-lived loop handle
+    // rather than per generation: it is what makes `systemctl stop wdm` end the
+    // pump below instead of killing wdm outright and orphaning the greeter.
     let (state, socket_name) = super::setup::build(&mut display, &loop_handle, config, true)?;
     let mut data = LoopData { state, display };
-
-    // Without this the udev backend has exactly one exit — a login handoff — so
-    // `systemctl stop wdm` never runs Greeter's Drop and the greeter is orphaned
-    // until SIGKILL.
-    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
-    loop_handle.insert_source(signals, |event, _, data| {
-        log::info!("caught {:?}, shutting down", event.signal());
-        data.state.running = false;
-    })?;
 
     let vt = data.state.config.vt;
 
@@ -176,7 +169,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let reason =
                             format!("session exited immediately ({status}) after {ran_for:?}");
                         log::error!("{reason}");
-                        data.state.login.set_last_error(Some(reason));
+                        data.state.login.set_last_error(reason);
                     }
                     Ok(status) => log::info!("session for {username} exited: {status}"),
                     Err(e) => log::error!("waiting for session: {e}"),
@@ -185,7 +178,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 let reason = format!("could not start session: {e}");
                 log::error!("{reason}");
-                data.state.login.set_last_error(Some(reason));
+                data.state.login.set_last_error(reason);
                 data.state.login.end_session();
             }
         }
@@ -195,7 +188,26 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // to a connection that is gone, and relying on its destroyed() being
         // dispatched before the next greeter binds is timing, not a guarantee.
         data.state.login.clear_bindings();
-        data.state.running = true;
+
+        // Signals arrive on a signalfd that only event_loop.dispatch reads, and
+        // the loop has not been running for as long as the user's session
+        // lasted — which can be hours. A SIGTERM that arrived in that window is
+        // still pending here, and starting the next generation before reading it
+        // would grab the seat, VT_ACTIVATE back to wdm's VT and flash a greeter
+        // at someone who asked wdm to stop, while systemd waits out
+        // TimeoutStopSec and then SIGKILLs. One non-blocking pass lets the
+        // handler speak first. Sources belonging to the released generation are
+        // gone by now, so this pass sees only the long-lived ones.
+        if let Err(e) = event_loop.dispatch(Some(Duration::ZERO), &mut data) {
+            log::error!("draining pending signals: {e}");
+        }
+        if !data.state.running {
+            // The greeter is already dead and the seat released; Drop does the
+            // rest as `data` goes out of scope.
+            log::info!("shutting down");
+            return Ok(());
+        }
+
         log::info!("taking the seat back");
     }
 }
@@ -238,21 +250,30 @@ fn pump(
     Ok(None)
 }
 
-/// Make `vt` the foreground VT.
+/// Make `vt` the foreground console, going to the kernel rather than the seat.
 ///
-/// Runs before the seat is opened, because seatd binds a client's session to
-/// whichever VT is foreground at that moment (`client->session = seat->cur_vt`)
-/// rather than allocating one. A client that opens the seat on tty1 and then
-/// asks to switch to tty7 does not move its session — it leaves it behind on a
-/// VT that is no longer in front, which deactivates it. An inactive session
-/// holds no DRM master, so every commit fails with EACCES and nothing is ever
-/// drawn. Doing it in this order means seatd registers wdm against the VT the
-/// greeter will actually appear on.
+/// [`Udev::new`] calls this *before* opening the seat, because seatd binds a
+/// client's session to whichever VT is foreground at that moment
+/// (`client->session = seat->cur_vt`) rather than allocating one. A client that
+/// opens the seat on tty1 and then asks to switch to tty7 does not move its
+/// session — it leaves it behind on a VT that is no longer in front, which
+/// deactivates it. An inactive session holds no DRM master, so every commit
+/// fails with EACCES and nothing is ever drawn. Switching first means seatd
+/// registers wdm against the VT the greeter will actually appear on. The other
+/// caller is [`Udev::drain_requests`], where this is the fallback for a VT chord
+/// the seat refused, mid-generation and with the seat still held.
 ///
-/// Deliberately not fatal. A machine where the switch fails still gets a
-/// greeter if it happens to be on the right VT already, and a display manager
-/// that refuses to start because of a VT ioctl is worse than one that tries.
-fn activate_vt(vt: u32) {
+/// `wait` blocks until the switch has completed. Startup needs that — the seat
+/// must not be opened while VT_ACTIVATE is still queued — and the escape-hatch
+/// fallback must not do it: that call runs on the thread serving input and the
+/// greeter, and waiting there for a switch that may never complete would wedge
+/// the compositor in place of the failure it is escaping.
+///
+/// Deliberately not fatal either way. A machine where the switch fails still
+/// gets a greeter if it happens to be on the right VT already, and a display
+/// manager that refuses to start because of a VT ioctl is worse than one that
+/// tries.
+fn activate_vt(vt: u32, wait: bool) {
     // ponytail: ioctls by hand rather than a VT crate — three constants and two
     // calls, and the only alternative worth adding a dependency for would be
     // one that also handled VT_PROCESS signal handshakes, which wdm leaves to
@@ -290,7 +311,7 @@ fn activate_vt(vt: u32) {
         // Waiting matters: VT_ACTIVATE only queues the switch, and opening the
         // seat before it completes would register the session against the VT
         // being left rather than the one being entered.
-        if libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
+        if wait && libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
             log::warn!(
                 "waiting for vt {vt}: {}",
                 std::io::Error::last_os_error()
@@ -299,7 +320,11 @@ fn activate_vt(vt: u32) {
         }
     }
 
-    log::info!("vt {vt} is foreground");
+    if wait {
+        log::info!("vt {vt} is foreground");
+    } else {
+        log::info!("queued a switch to vt {vt}");
+    }
 }
 
 impl Udev {
@@ -316,7 +341,7 @@ impl Udev {
         // Before the seat, not after. seatd hands a new client whatever VT is
         // *currently* foreground — `client->session = seat->cur_vt` — so the
         // only way to end up on wdm's own VT is to be standing on it already.
-        activate_vt(vt);
+        activate_vt(vt, true);
 
         let deadline = Instant::now() + SEAT_RETRY_TIMEOUT;
         let (session, notifier) = loop {
@@ -593,8 +618,6 @@ impl Udev {
                 model: info.interface().as_str().to_owned(),
             },
         );
-        let global = output.create_global::<Wdm>(&data.state.display);
-
         let wl_mode = OutputMode::from(mode);
         let scale = output_config.and_then(|c| c.scale).unwrap_or(1.0);
         let transform = output_config
@@ -622,6 +645,16 @@ impl Udev {
             &elements,
         )?;
 
+        // Last, and deliberately: the `GlobalId` is only reachable from the
+        // `Head` this builds, so anything fallible between creating the global
+        // and storing it would leave a `wl_output` nothing can ever withdraw.
+        // scan_connectors logs a failure here and carries on, so a connector
+        // that fails to initialise every rescan would otherwise hand the greeter
+        // one more bindable output each time. Advertising it now also means the
+        // first bind sees the mode, scale and transform set above rather than
+        // the defaults.
+        let global = output.create_global::<Wdm>(&data.state.display);
+
         device.outputs.insert(
             crtc,
             Head {
@@ -648,7 +681,17 @@ impl Udev {
                 Request::SwitchVt(vt) => {
                     log::info!("switching to vt {vt}");
                     if let Err(e) = self.session.change_vt(vt) {
-                        log::error!("switching to vt {vt}: {e}");
+                        // The chord is the documented way out of a machine
+                        // whose login screen is unusable, so it must not be
+                        // only as reliable as the session layer. libseat can
+                        // refuse — a wedged logind, a session it no longer
+                        // believes is active — and the user pressing it has
+                        // already run out of other options. The kernel's own
+                        // VT_ACTIVATE goes through the same handshake libseat
+                        // would have driven, so the seat still learns it is
+                        // being switched away from.
+                        log::error!("switching to vt {vt} through the seat: {e}; trying the console directly");
+                        activate_vt(vt as u32, false);
                     }
                 }
 

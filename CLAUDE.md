@@ -146,8 +146,9 @@ but are load-bearing:
 - Prompt ids come from a process-global counter and are never reused: per-attempt
   counters restart at 0, so a late `respond` from a cancelled conversation would
   match the next one's first prompt.
-- Environment the greeter supplies is filtered by **key and value** — `LC_*` and
-  `XKB_*` only, rejecting values with `/` (glibc loads a locale from a path;
+- Environment the greeter supplies is filtered by **key and value** — `LANG`,
+  `LANGUAGE`, `LC_*` and `XKB_*` only, rejecting values with `/` (glibc loads a
+  locale from a path;
   libxkbcommon honours `XKB_CONFIG_ROOT`) — and applied *before* wdm's own
   variables so it cannot contradict a fact about the seat.
 - Rate-limited `create_session` is answered **late**, not refused immediately: a

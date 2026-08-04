@@ -32,8 +32,14 @@ scale = 1.5
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `vt` | `7` | Virtual terminal to run on. |
+| `vt` | `7` | Virtual terminal to run on. Must be at least 1. |
 | `default_session` | unset | Session offered to a user with no recorded history. wdm reports it; preselecting is the greeter's policy. |
+
+VT 7 is free on a default systemd install, which is why `wdm.service` ships no
+`Conflicts=getty@…`. **Moving `vt` onto a terminal a getty uses needs a
+`wdm.service` drop-in**, or wdm and the getty contend for the same VT with
+nothing arbitrating and the recovery console goes with it. `wdm(1)` gives the
+drop-in and is the authoritative statement of the rule.
 
 ## `[greeter]`
 

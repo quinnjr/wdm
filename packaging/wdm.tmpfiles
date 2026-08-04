@@ -11,4 +11,11 @@ d /var/lib/wdm 0755 root root -
 # which is a boot with no login screen. Arch and Fedora get /var/empty from
 # their base filesystem package; Debian does not, so it is declared here. It
 # must exist and must stay empty: nothing is ever written to it.
-d /var/empty 0755 root root -
+#
+# Mode and ownership are left as `-`, deliberately. `d` adjusts an existing
+# directory rather than skipping it, so naming them would re-assert wdm's idea
+# of them over the base `filesystem` package's own /var/empty on Arch and
+# Fedora, and would widen one that a distribution shipped tighter. wdm needs the
+# directory to exist and to be chdir-able, nothing more, so this creates it on
+# Debian with the defaults and leaves an existing one entirely alone.
+d /var/empty - - - -

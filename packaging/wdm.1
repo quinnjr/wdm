@@ -1,7 +1,7 @@
 .\" wdm(1) -- Wayland display manager that is its own compositor
-.\" Written for wdm 0.1.3. Section 1 rather than 8 because wdm.service's
+.\" Written for wdm 0.3.0. Section 1 rather than 8 because wdm.service's
 .\" Documentation= already points at man:wdm(1).
-.TH WDM 1 "2026-07-31" "wdm 0.1.3" "User Commands"
+.TH WDM 1 "2026-08-04" "wdm 0.3.0" "User Commands"
 .SH NAME
 wdm \- Wayland display manager that is its own compositor
 .SH SYNOPSIS
@@ -93,6 +93,22 @@ needs no
 .B Conflicts=
 against a getty, and tty1 remains a working text console, which is the recovery
 path when a greeter wedges. Must be at least 1.
+.IP
+.B wdm.service
+ships no
+.B Conflicts=
+because of that default. Setting
+.B vt
+to a terminal a getty uses \(en 1 through 6 \(en requires a drop-in adding
+.BI Conflicts=getty@tty N .service
+and
+.BI After=getty@tty N .service
+for that
+.IR N ,
+or
+.B wdm
+and the getty contend for the same VT with nothing arbitrating between them,
+and the recovery console documented above is gone.
 .TP
 .B default_session
 Session id offered to a user with no recorded last session.
@@ -214,15 +230,26 @@ PAM stack.
 .B Authentication fails until this exists;
 an "Authentication failure" on the greeter with no PAM file installed is
 expected and is not a bug.
+.IP
+The packages keep a locally modified stack across an upgrade rather than
+replacing it, so a changed stack is delivered alongside as
+.I /etc/pam.d/wdm.rpmnew
+or
+.I /etc/pam.d/wdm.dpkg\-dist
+and has no effect until it is merged by hand. Since a change here can be an
+authentication fix, check for one after upgrading.
 .TP
 .I /var/lib/wdm/last-session
 Per\-user record of the last session launched, reported to the greeter so it can
 preselect one.
 .TP
 .I /run/wdm
-Runtime directory, owned by the greeter account and mode 0700. The Wayland
-socket the greeter connects to lives here, mode 0600 and owned by the same
-account; every connection's peer uid is checked against it as well.
+Runtime directory, created root\-owned and mode 0700 by systemd;
+.B wdm
+hands it to the greeter account only after the socket inside it is bound and
+secured. The Wayland socket the greeter connects to lives here, mode 0600 and
+owned by the same account; every connection's peer uid is checked against it as
+well.
 .TP
 .I /usr/lib/wdm/
 Greeter executables.
@@ -255,7 +282,20 @@ holds no DRM master, and cannot commit a frame.
 .PP
 Ctrl+Alt+F\fIn\fR is handled by
 .B wdm
-before the greeter sees it, so a wedged greeter can always be escaped from.
+before the greeter sees it, so a wedged greeter can always be escaped from. The
+chord has to be handled rather than left to the kernel: a graphical session puts
+the console keyboard in
+.BR K_OFF ,
+so the kernel no longer translates it. It is intercepted for every state
+.B wdm
+can be in, including the give-up screen shown after a greeter has failed to
+start repeatedly, and if the seat refuses the switch
+.B wdm
+falls back to
+.B VT_ACTIVATE
+on
+.I /dev/tty0
+so the escape hatch does not depend on the session layer being healthy.
 .SH SEE ALSO
 .BR seatd (1),
 .BR systemd (1),

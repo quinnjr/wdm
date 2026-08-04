@@ -95,6 +95,12 @@ select {
   color: var(--bad);
 }
 
+/* .line — one span per message PAM sent — is deliberately left unstyled.
+   theme.js relies on it staying inline and carries its own leading space inside
+   each span; giving .line `display: block`, a margin or padding here would put a
+   visible indent in front of every message after the first. Style .line.error /
+   .line.info for colour if a theme wants to tell the two apart. */
+
 #message {
   margin: 0.5rem 0 0;
   padding: 0.5rem 0.6rem;

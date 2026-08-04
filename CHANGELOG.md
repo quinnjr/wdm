@@ -5,6 +5,178 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-04
+
+A minor rather than a patch release: `wdm-greeter-client` removes a public field
+and `show_message` changes what a theme has to do with what it is handed. The
+protocol is untouched and `wdm_greeter_v1` stays at version 2, so a greeter
+binary built against 0.2.0 keeps working — but source built against
+`wdm-greeter-client`, and any webkit theme, can need edits, which is not
+something a patch number is allowed to say.
+
+> **Themes must append, not assign.** `show_message` now fires once per PAM
+> message instead of once per attempt, so a theme whose handler *assigns* to an
+> element — `el.textContent = text` — shows only the last message it was sent
+> and drops everything before it, including the explanation the verdict is
+> meaningless without. The shipped default theme's own handler was assign-style
+> until this release, so that is the shape a third-party theme most likely
+> copied. Append instead, and clear on `authenticate()` rather than on each
+> message.
+>
+> **And a callback may now arrive twice, or not at all.** The theme API's
+> obligations grew stricter than 0.2.0's: a theme must tolerate the same
+> callback being delivered more than once *and* a callback it was owed never
+> arriving. A theme that counts `show_message` calls, or toggles state once per
+> call, is wrong in a way it was not before. Write handlers that are idempotent
+> and that do not treat silence as proof PAM said nothing.
+
+### Added
+
+- **`Model::link_dead`** in `wdm-greeter-client`, so a greeter can tell "the
+  compositor went away" from "the attempt failed" and stop offering a retry that
+  cannot reach anything. The field is deliberately the only spelling: a greeter
+  asks `model.link_dead`, a theme asks `wdm.link_dead`, and there is no inverted
+  accessor alongside it for either to disagree with.
+- **`window.wdm.link_dead`** in the webkit greeter, the same fact for a theme:
+  true once the connection to wdm is gone, and it never becomes false again. A
+  theme should stop offering a retry and point at a text console, because
+  nothing sent after that point reaches wdm and the retry typically clears the
+  message explaining the silence. A theme predating the field sees `undefined`,
+  so read it defensively.
+- **`wdm_protocol::GREETER_GAVE_UP_EXIT`**, exit status **69**, now part of the
+  contract for *any* greeter rather than an internal detail of the shipped one.
+  A greeter exiting with it tells wdm it will not recover by being restarted, so
+  wdm counts the exit as a rapid failure however long the process had been up,
+  and the give-up screen is reached instead of a login screen that reloads for
+  ever. The value is `EX_UNAVAILABLE` from `sysexits.h`; a third-party greeter
+  already exiting 69 to mean something else now changes meaning silently and
+  should pick another status.
+- **The webkit greeter heartbeats an idle page.** With nothing queued for it,
+  the greeter injects a statement that does nothing — `void 0;` — into the
+  theme's page roughly every half second, purely so silence has something to be
+  silent about: a theme whose top-level script never returns, or a web process
+  that hangs before the load finishes, queues nothing at all and so previously
+  left the greeter alive in front of a frozen login screen with nothing to time
+  out. A theme author instrumenting `window`, or watching evaluations, will see
+  the greeter originating traffic against an otherwise idle page; it has no
+  observable effect of its own.
+
+### Changed
+
+- **A theme is told PAM's message styles apart.** `show_message` now fires once
+  per message PAM sent, carrying that message's own kind — `"info"` for
+  `PAM_TEXT_INFO`, `"error"` for `PAM_ERROR_MSG` — instead of joining them into
+  one line reported as `"info"` whatever they were. A locked account can be
+  shown in red with the minutes remaining beside it in grey, and the WebKit
+  greeter stops disagreeing with the reference greeter about the same input.
+  The default theme accumulates messages rather than replacing, because PAM
+  routinely splits one explanation in two.
+- **`Model::notice` is now `Model::notices`**, a list of `Notice { kind, text }`
+  rather than one joined string, with `Model::notice_text()` for a greeter that
+  has a single label to put them in. **Breaking** for an out-of-tree greeter:
+  the field is removed, not deprecated, so one reading `notice` needs the
+  one-line change to `notices` or `notice_text()`. **`Model::push_notice` gained
+  a `NoticeKind` first argument** for the same reason — there is now a kind to
+  carry — so a greeter calling it gets an arity error rather than a silent
+  change of behaviour.
+- **`wdm.start_session()` throws when no session resolves.** Called with no
+  argument on a machine where `wdm.sessions` is empty — nothing installed under
+  `wayland-sessions` or `xsessions` — it used to return having done nothing, so
+  a theme reported a login in progress that was never going to happen. It now
+  throws, like every other out-of-order call, and the theme can say so.
+- **The intermediate copy of a PAM answer is no longer zeroized** on the way to
+  the compositor. It never narrowed the window it appeared to: the answer is
+  already in the page, in the protocol buffer and in libwayland's, none of which
+  the greeter can scrub, so wiping one copy of several bought nothing and read
+  as a guarantee that was not being kept.
+- **`pam_keyinit` moved** in the Fedora stack, to after `pam_selinux open` and
+  `pam_namespace`, which is where Fedora's own `login` and `sshd` stacks put it.
+- The AUR `build()` no longer passes `--all-targets`. Nothing installed is a
+  test, example or bench, `check()` builds the test targets itself, and building
+  them twice in release mode on a workspace that links GTK4, WebKitGTK and
+  smithay/EGL is a real cost — as well as making a broken test fail in `build()`
+  rather than in `check()`.
+
+### Fixed
+
+- **Every process the udev backend started ran with `SIGTERM` and `SIGINT`
+  blocked** — which is every process on a real machine. Registering the signal
+  source blocks those signals on the calling thread, and a signal mask survives
+  both `fork` and `exec`, so the greeter and the user's entire session inherited
+  it. `loginctl terminate-session`, `systemctl stop` and systemd's shutdown all
+  degraded to `SIGKILL` after their stop timeouts, Ctrl-C was inert in every
+  terminal in the session, and each login handoff sat out the greeter's full
+  two-second grace period before killing it, because the greeter could not act
+  on the `SIGTERM` asking it to stop drawing. The nested backend registered no
+  signal source at all and so was never affected — it gains one below, and both
+  spawn paths now clear the mask before exec regardless of which registered it.
+- **A greeter that gave up on its own page was restarted for ever.** The webkit
+  greeter takes about half a minute to conclude a silent web process will never
+  answer, which is well past the window in which an exit counts as a failure to
+  start — so each one looked like a healthy greeter that happened to stop, the
+  failure budget reset every time, and the login screen reloaded every thirty
+  seconds instead of reaching the give-up screen.
+- **A `wl_output` global leaked** on every failed connector rescan. The global
+  was created before the fallible part of bringing an output up, so a failure
+  left one advertised that nothing could withdraw — and a greeter that bound it
+  saw defaults rather than the real mode, scale and transform.
+- **A session's failure reason could be lost.** If the greeter died before it
+  bound the protocol, the reason recorded for `last_error` was overwritten with
+  nothing, and the greeter that finally came up showed the unexplained bounce
+  that event exists to prevent.
+- **The reference greeter swallowed `j` and `k` from passwords** while the
+  session drop-down was open: both were bound as vi-style motion with no
+  modifier, and the key router consulted the menu first.
+- **A hung WebKit web process is now detected**, not just a crashed one. An
+  evaluation that never comes back at all counts as a failure after a deadline,
+  so a page that stops answering escalates to the same give-up the greeter
+  already had for one that answers with errors.
+- **The GTK greeter's "nothing to log into" message survived** the next model
+  event. It was written to the widget rather than the model, so anything that
+  triggered a repaint blanked it and left an insensitive form with no text.
+- **An unwaitable greeter is no longer reported as having exited cleanly** on
+  the give-up screen, next to a log line saying `waitpid` failed.
+- **The greeter account's home is actually moved on upgrade.** 0.2.0 changed
+  where the home points for a *new* account and shipped nothing to apply it to
+  an existing one — `systemd-sysusers` never modifies an account that already
+  exists — so every machine that installed 0.1.x kept the greeter's home on
+  `/var/lib/wdm`, the root-owned directory the change exists to move it off. The
+  deb, the rpm and the AUR package now all run a guarded
+  `usermod -d /var/empty wdm`, taking effect only when the home is still the old
+  value and only when `/var/empty` exists. A machine set up by hand should run
+  it too.
+- **The reference greeter says why it is not there.** A compositor advertising
+  neither `wl_compositor` nor `wl_shm` left it running with nothing drawn and
+  nothing logged — a blank screen indistinguishable from a wedge. It now reports
+  the missing global and exits.
+- The nested backend now handles `SIGTERM`/`SIGINT`, so a development wdm no
+  longer orphans its greeter and that greeter's process group.
+- Fedora upgrades no longer revert a customised `/etc/wdm/wdm.toml` or PAM
+  stack: both are marked `%config(noreplace)`, matching what the deb and the
+  Arch package already did.
+- The deb's `postinst` reports a failing `systemd-sysusers` or
+  `systemd-tmpfiles` instead of discarding it — the two failures that decide
+  whether wdm can start at all.
+- The AUR `wdm` package no longer advertises the `wdm-greeter-implementation`
+  virtual it depends on, which defeated the greeter-choice prompt for anything
+  resolving from `.SRCINFO`.
+- Documentation the audit found stale: the greeter-author dependency snippet
+  named a version that cannot resolve now that the crates are unpublished, the
+  man page still identified as 0.1.3, and `/run/wdm`'s ownership was described
+  by its end state rather than the two phases the code actually goes through.
+
+### Known limitations
+
+- **SELinux confinement is not delivered**, despite `pam.d-wdm.fedora`
+  bracketing its session stack with `pam_selinux.so` close/open and joining a
+  session keyring with `pam_keyinit`. Both set **per-thread** state, and wdm runs
+  `pam_open_session` on its PAM thread while forking the session from the main
+  one — `fork()` copies only the calling thread, so neither the armed exec
+  context nor the joined keyring reaches the session. A confined Fedora login
+  (staff_u, guest_u, xguest_u) is therefore still unconfined, and MCS separation
+  does not apply. The modules stay in the file, because they are correct for the
+  day the fork moves; the bracket is marked `ponytail:` with the upgrade path.
+
 ## [0.2.0] — 2026-08-03
 
 A minor rather than a patch release: `wdm_greeter_v1` gains an event and a
@@ -208,7 +380,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0
 [0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
 [0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2

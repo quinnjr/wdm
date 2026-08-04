@@ -170,6 +170,13 @@ impl Launch {
         // forfeit the privilege needed for the other two.
         unsafe {
             command.pre_exec(move || {
+                // First, before anything else. The rule and the reasoning are
+                // shared with the greeter's spawn path, so they live with the
+                // function: see crate::supervise::unblock_signals. A plain
+                // non-generic call allocates nothing, so the constraint this
+                // closure runs under still holds.
+                crate::supervise::unblock_signals()?;
+
                 // A new session and process group, so the session does not
                 // share wdm's and is not killed with it.
                 if libc::setsid() < 0 {

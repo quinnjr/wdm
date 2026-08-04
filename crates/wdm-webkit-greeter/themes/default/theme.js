@@ -35,14 +35,105 @@ const selectPreferredSession = () => {
   el("session").value = wanted || wdm.sessions[0].id;
 };
 
-// Two elements, not one, and this is the whole reason: "Authentication
-// failure" is the verdict, and "the account is locked, 10 minutes left" is the
-// explanation. A theme that puts both in the same place shows the user only
-// the half that says nothing.
-const show = (id, text) => {
+// Two elements, not one, and the split is PAM's own severity: whatever PAM
+// called an error goes in "error", whatever it called info goes in "message".
+// The verdict — "Authentication failure" — arrives through the same
+// show_message with kind "error", so it lands in the error element beside the
+// reason rather than in place of it. That is why the error element *appends*:
+// "the account is locked, 10 minutes left" must not be erased by the verdict
+// that follows it, which on its own says nothing the user can act on.
+
+// Assigns, and hides when there is nothing to say. For the fixed lines a theme
+// owns rather than the running commentary PAM sends.
+const replaceText = (id, text) => {
   const node = el(id);
-  node.textContent = text;
+  node.replaceChildren();
+  if (text) {
+    node.append(text);
+  }
   node.hidden = !text;
+};
+
+// Adds one more message without disturbing the ones already there, because the
+// greeter calls show_message once per message PAM sent and PAM routinely splits
+// one explanation in two. Assigning here would leave the user reading
+// "(10 minutes left to unlock)" with nothing saying what is locked.
+//
+// A child element per message rather than one concatenated string: each keeps
+// its own `kind` so a stylesheet can tell them apart, and — because there is no
+// scrolling on this screen by design — the count can be capped without cutting
+// a message in half. The first is kept whatever happens; it is the one carrying
+// the lockout reason. It is the *second* that is dropped when the line grows
+// too long, so the oldest news the user still needs stays put while the newest
+// arrives.
+//
+// ponytail: more than six messages in one conversation lose the second onward,
+// silently — a stack running pam_faillock, pam_pwquality, a motd and a
+// last-login line can reach that in a single attempt. The screen has no scroll
+// by design, which is what forces a cap at all; a scrollable message region
+// removes the need for one.
+const MAX_MESSAGES = 6;
+const appendText = (id, text, kind) => {
+  // An empty message is not a message. Without this the element would unhide
+  // onto a blank row and push the form down for nothing.
+  if (!text) {
+    return;
+  }
+  const node = el(id);
+  const line = document.createElement("span");
+  line.className = kind === "error" ? "line error" : "line info";
+  // A span is inline and style.css gives .line no rules of its own, so without
+  // this the messages would run together into one word. The separator lives
+  // inside the span rather than beside it so that dropping a span drops its
+  // separator with it, leaving no stray text nodes among node.children.
+  //
+  // childNodes, not children: `children` counts elements only, and replaceText
+  // writes a bare text node. The first append into an element replaceText had
+  // already written — "No users available to log in", then a lost-link notice
+  // on the same element — would otherwise arrive with no space in front of it.
+  // The cap below is right to use `children`: it removes spans.
+  line.textContent = (node.childNodes.length ? " " : "") + text;
+  node.append(line);
+  while (node.children.length > MAX_MESSAGES) {
+    node.children[1].remove();
+  }
+  node.hidden = false;
+};
+
+// The connection to wdm is gone for good. Link errors latch on the greeter
+// side, so nothing sent after this reaches anyone: retrying would clear the one
+// message explaining the silence and post into a socket nobody reads. Say what
+// to do instead and stop. Read through `typeof` because a wdm that predates the
+// field leaves it undefined, and a theme must not die on that.
+const linkDead = () => typeof wdm.link_dead !== "undefined" && wdm.link_dead;
+
+// Wording matches the GTK greeter, which reaches the same state. Appended, not
+// assigned, and only once: whatever PAM managed to say before the link went is
+// still the most useful thing on the screen, and both paths into here can be
+// reached more than once.
+//
+// Named for what it is — terminal and latched, not a pause — to match
+// wdm.link_dead, GREETER_GAVE_UP_EXIT and Disposition::GaveUp, which are the
+// same condition seen from the other side.
+let gaveUp = false;
+const giveUp = () => {
+  if (!gaveUp) {
+    gaveUp = true;
+    appendText(
+      "error",
+      "Connection to wdm lost — switch to a text console",
+      "error",
+    );
+  }
+  el("prompt").textContent = "";
+  // The one clear start() would have done and this path skips. A password typed
+  // just as the link dropped would otherwise sit in a disabled input in the
+  // WebKit web process — a separate address space from the greeter — for as
+  // long as the screen is up, which here is until the machine is rebooted.
+  el("answer").value = "";
+  for (const id of ["user", "session", "answer"]) {
+    el(id).disabled = true;
+  }
 };
 
 const start = () => {
@@ -50,7 +141,7 @@ const start = () => {
   // greeters do. Calling authenticate("") instead would throw from top level
   // and take the rest of this script with it — a blank, dead form.
   if (wdm.users.length === 0 || wdm.sessions.length === 0) {
-    show(
+    replaceText(
       "error",
       wdm.users.length === 0
         ? "No users available to log in"
@@ -63,8 +154,15 @@ const start = () => {
     return;
   }
 
-  show("message", "");
-  show("error", "");
+  // Before the clears below, deliberately: an attempt that cannot be made must
+  // not wipe the text saying why.
+  if (linkDead()) {
+    giveUp();
+    return;
+  }
+
+  replaceText("message", "");
+  replaceText("error", "");
   el("answer").value = "";
   el("prompt").textContent = "Waiting…";
   selectPreferredSession();
@@ -85,8 +183,13 @@ window.show_prompt = (text, kind) => {
 // PAM said something, without asking. This is where a locked account explains
 // itself, so it stays until the user starts another attempt — including past
 // the "Authentication failure" that follows it.
+//
+// One call per message, carrying that message's own style, so the two elements
+// split by severity: "the account is locked" (error) above "10 minutes left to
+// unlock" (info). The verdict arrives the same way and joins the error line,
+// which is why both accumulate — the last thing said must not erase the reason.
 window.show_message = (text, kind) =>
-  show(kind === "error" ? "error" : "message", text);
+  appendText(kind === "error" ? "error" : "message", text, kind);
 
 // The conversation ended, either way.
 window.authentication_complete = () => {
@@ -94,6 +197,14 @@ window.authentication_complete = () => {
     el("prompt").textContent = "Starting session…";
     el("answer").disabled = true;
     wdm.start_session(el("session").value);
+    return;
+  }
+
+  // A conversation can also end because the link did. Inviting a retry then
+  // would be an invitation to a blank screen: start() clears the messages and
+  // sends into a socket nobody reads.
+  if (linkDead()) {
+    giveUp();
     return;
   }
 

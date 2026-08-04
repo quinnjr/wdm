@@ -47,7 +47,12 @@ priority = "optional"
 # Alternatives rather than a bare virtual: apt cannot choose between several
 # providers of one, so `Depends: wdm-greeter-implementation` would be
 # uninstallable. First named is what apt takes by default.
-depends = "libc6, libinput10, libseat1, libsystemd0, libdrm2, libgbm1, libegl1, libxkbcommon0, libpam0g, systemd, wdm-greeter | wdm-gtk-greeter | wdm-webkit-greeter"
+# `passwd` provides usermod, which postinst calls; it is Priority: required, so
+# it is never actually absent, but the rpm side declares shadow-utils for the
+# same call and two packages disagreeing about whether a dependency is worth
+# stating is how one of them later gets it wrong. getent is glibc's and needs no
+# entry.
+depends = "libc6, libinput10, libseat1, libsystemd0, libdrm2, libgbm1, libegl1, libxkbcommon0, libpam0g, systemd, passwd, wdm-greeter | wdm-gtk-greeter | wdm-webkit-greeter"
 conf-files = ["/etc/wdm/wdm.toml", "/etc/pam.d/wdm"]
 maintainer-scripts = "../../packaging/deb"
 assets = [
@@ -73,19 +78,49 @@ license = "MIT"
 # greeter-owned state directory this release stops creating would survive the
 # upgrade that fixes it. Guarded and non-fatal: a container image built with
 # rpm and no systemd must still install.
+# Failures are reported rather than discarded, the same as the deb's postinst
+# and for the same reason: these calls decide whether wdm can start at all, and
+# swallowing them leaves an administrator with a display manager that fails for
+# no visible reason. Non-fatal all the same — an install must not abort.
 post_install_script = '''
 if [ -x /usr/bin/systemd-sysusers ]; then
-    /usr/bin/systemd-sysusers /usr/lib/sysusers.d/wdm.conf || :
+    /usr/bin/systemd-sysusers /usr/lib/sysusers.d/wdm.conf \
+        || echo "wdm: creating the wdm account failed; wdm.service will not start" >&2
 fi
 if [ -x /usr/bin/systemd-tmpfiles ]; then
-    /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf || :
+    /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf \
+        || echo "wdm: creating /var/lib/wdm and /var/empty failed; the greeter will not spawn" >&2
+fi
+# Moves the greeter's home off /var/lib/wdm on a machine that installed 0.1.x.
+# Why, and why both guards, is written out once in packaging/deb/postinst.
+# Absolute paths, as for the systemd- calls above: a scriptlet runs with a PATH
+# rpm chose, not the administrator's.
+if [ "$(/usr/bin/getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+    if [ -d /var/empty ]; then
+        /usr/sbin/usermod -d /var/empty wdm \
+            || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+    else
+        echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+    fi
+fi
+# The flip side of config = "noreplace" below: a customised stack is kept, so a
+# future security fix to the wdm PAM stack lands beside it and never applies
+# until someone merges it by hand.
+if [ -f /etc/pam.d/wdm.rpmnew ]; then
+    echo "wdm: /etc/pam.d/wdm.rpmnew was left beside your PAM stack; it may contain authentication changes that are not in effect until merged" >&2
 fi
 '''
 assets = [
     { source = "target/release/wdm", dest = "/usr/bin/wdm", mode = "755" },
     { source = "packaging/wdm.service", dest = "/usr/lib/systemd/system/wdm.service", mode = "644" },
-    { source = "packaging/pam.d-wdm.fedora", dest = "/etc/pam.d/wdm", mode = "644", config = true },
-    { source = "packaging/wdm.toml.example", dest = "/etc/wdm/wdm.toml", mode = "644", config = true },
+    # `config = "noreplace"` rather than `config = true`: plain %config makes rpm
+    # overwrite a locally modified file on upgrade and leave the admin's version
+    # as .rpmsave, which would silently revert a customised vt, greeter.command
+    # or a PAM stack adapted for fingerprint or smartcard. dpkg conffiles and
+    # pacman's backup= both keep the local file, and %config(noreplace) is what
+    # Fedora's guidelines require for /etc files that are not regenerated.
+    { source = "packaging/pam.d-wdm.fedora", dest = "/etc/pam.d/wdm", mode = "644", config = "noreplace" },
+    { source = "packaging/wdm.toml.example", dest = "/etc/wdm/wdm.toml", mode = "644", config = "noreplace" },
     { source = "packaging/wdm.sysusers", dest = "/usr/lib/sysusers.d/wdm.conf", mode = "644" },
     { source = "packaging/wdm.tmpfiles", dest = "/usr/lib/tmpfiles.d/wdm.conf", mode = "644" },
     { source = "packaging/wdm.1", dest = "/usr/share/man/man1/wdm.1", mode = "644", doc = true },
@@ -102,6 +137,9 @@ mesa-libgbm = "*"
 mesa-libEGL = "*"
 libxkbcommon = "*"
 pam = "*"
+# The post-install scriptlet calls usermod. getent comes from glibc-common and
+# is not what this entry is for.
+shadow-utils = "*"
 # dnf can choose between providers of a virtual, so this one stays as it is in
 # the Arch package.
 wdm-greeter-implementation = "*"

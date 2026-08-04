@@ -209,8 +209,15 @@ impl Login {
     }
 
     /// Record why the previous launch failed, for the next greeter to display.
-    pub fn set_last_error(&mut self, error: Option<String>) {
-        self.last_error = error;
+    ///
+    /// Set only: there is deliberately no way to spell "clear" here. Clearing is
+    /// [`Login::begin_attempt`]'s alone, because that is the one moment where the
+    /// user has visibly moved on from the failure. A caller with nothing to
+    /// report must not call this at all — an overwrite with an empty reason would
+    /// discard why the last session died before anyone had read it, and every
+    /// restart path that has nothing to add reaches here.
+    pub fn set_last_error(&mut self, error: String) {
+        self.last_error = Some(error);
     }
 
     /// Reset conversation state, used when the greeter is restarted.
@@ -898,9 +905,39 @@ mod tests {
     #[test]
     fn starting_an_attempt_clears_the_previous_launch_error() {
         let mut login = login();
-        login.set_last_error(Some("session died".to_owned()));
+        login.set_last_error("session died".to_owned());
         login.begin_attempt();
         assert!(login.last_error.is_none());
+    }
+
+    #[test]
+    fn a_recorded_error_survives_a_restart_that_has_nothing_to_add() {
+        // The restart paths that carry no reason of their own — a greeter that
+        // dies before it ever binds, the "session opened with no session chosen"
+        // path — must leave the recorded reason alone, or the user is bounced
+        // back to a login prompt with no explanation for why their session went
+        // away. The invariant used to live only in backend::restart_greeter's
+        // `if error.is_some()` guard, a file away from the field it protects;
+        // set_last_error now cannot express "clear" at all, and this is the test
+        // that says so from the side that owns the state.
+        let mut login = login();
+        login.set_last_error("session exited immediately".to_owned());
+
+        // Everything a greeter respawn does to this state, short of a new attempt.
+        login.reset();
+        login.clear_bindings();
+
+        assert_eq!(
+            login.last_error.as_deref(),
+            Some("session exited immediately"),
+            "the reason the session died was discarded before anyone saw it"
+        );
+
+        login.begin_attempt();
+        assert!(
+            login.last_error.is_none(),
+            "begin_attempt is the one place that clears it"
+        );
     }
 
     #[test]
@@ -915,5 +952,508 @@ mod tests {
             );
         }
         assert!(*BACKOFF_SECS.last().unwrap() <= 30);
+    }
+
+    /// Enough of the Wayland wire format to bind a global by hand.
+    ///
+    /// wdm depends on `wdm-protocol` with the `server` feature only, so there
+    /// is no client library anywhere in this dependency graph to drive a test
+    /// connection with. The messages a bind needs are few and small, so they
+    /// are encoded here instead: host byte order, an eight byte header of
+    /// object id followed by size and opcode packed into one word, and every
+    /// argument padded to four bytes.
+    ///
+    /// This exists because the version gating and the `already_bound` refusal
+    /// live in `bind` and `send_initial_state`, which no pure function test can
+    /// reach — a regression there would leave every other test in this file
+    /// passing.
+    mod wire {
+        use std::io::{ErrorKind, Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        /// wl_display is always object 1; the other ids are this client's to
+        /// allocate and are fixed because each connection binds exactly once.
+        pub const DISPLAY: u32 = 1;
+        pub const REGISTRY: u32 = 2;
+        pub const GREETER: u32 = 3;
+
+        /// wl_display.error, the event a protocol violation arrives as.
+        pub const DISPLAY_ERROR: u16 = 0;
+        /// wl_registry.global, one per advertised global.
+        pub const REGISTRY_GLOBAL: u16 = 0;
+
+        // Event opcodes are the order the events appear in the XML, which is
+        // why default_session was appended rather than inserted.
+        pub const USER: u16 = 0;
+        pub const DONE: u16 = 4;
+        pub const AUTH_OK: u16 = 6;
+        pub const DEFAULT_SESSION: u16 = 8;
+
+        pub struct Message {
+            pub object: u32,
+            pub opcode: u16,
+            body: Vec<u8>,
+        }
+
+        impl Message {
+            pub fn args(&self) -> Args<'_> {
+                Args {
+                    data: &self.body,
+                    pos: 0,
+                }
+            }
+        }
+
+        pub struct Args<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+
+        impl Args<'_> {
+            pub fn uint(&mut self) -> u32 {
+                assert!(
+                    self.pos + 4 <= self.data.len(),
+                    "message body ended mid-argument: wanted 4 bytes at {}, body is {} bytes",
+                    self.pos,
+                    self.data.len()
+                );
+                let word = self.data[self.pos..self.pos + 4].try_into().unwrap();
+                self.pos += 4;
+                u32::from_ne_bytes(word)
+            }
+
+            pub fn string(&mut self) -> String {
+                // The length counts the terminating NUL, which is not part of
+                // the value; the whole argument is then padded to four bytes.
+                let len = self.uint() as usize;
+                let text = if len == 0 {
+                    String::new()
+                } else {
+                    assert!(
+                        self.pos + len <= self.data.len(),
+                        "message body ended mid-string: declared {len} bytes at {}, body is {} bytes",
+                        self.pos,
+                        self.data.len()
+                    );
+                    String::from_utf8_lossy(&self.data[self.pos..self.pos + len - 1]).into_owned()
+                };
+                self.pos += len.next_multiple_of(4);
+                text
+            }
+        }
+
+        pub struct Client {
+            sock: UnixStream,
+            received: Vec<Message>,
+            /// Set once the server has hung up. Read at EOF is indistinguishable
+            /// from "nothing more to read" at the syscall, but the two mean
+            /// opposite things here: wdm closes the connection when a client
+            /// commits a protocol error, so an unnoticed EOF turns a rejection
+            /// into a missing-event panic several frames later.
+            closed: bool,
+        }
+
+        impl Client {
+            pub fn new(sock: UnixStream) -> Self {
+                // Non-blocking so a read after the server has flushed drains
+                // whatever is there and stops, rather than waiting for an event
+                // that is never coming.
+                sock.set_nonblocking(true).unwrap();
+                Self {
+                    sock,
+                    received: Vec::new(),
+                    closed: false,
+                }
+            }
+
+            fn send(&mut self, object: u32, opcode: u16, body: &[u8]) {
+                let size = 8 + body.len();
+                let mut message = Vec::with_capacity(size);
+                message.extend_from_slice(&object.to_ne_bytes());
+                message.extend_from_slice(&(((size as u32) << 16) | opcode as u32).to_ne_bytes());
+                message.extend_from_slice(body);
+                self.sock.write_all(&message).unwrap();
+            }
+
+            /// wl_display.get_registry.
+            pub fn get_registry(&mut self) {
+                self.send(DISPLAY, 1, &REGISTRY.to_ne_bytes());
+            }
+
+            /// wl_registry.bind, whose new_id is untyped and so carries the
+            /// interface name and the version the client is built against.
+            pub fn bind(&mut self, name: u32, interface: &str, version: u32) {
+                let mut body = Vec::new();
+                body.extend_from_slice(&name.to_ne_bytes());
+                let bytes = interface.as_bytes();
+                body.extend_from_slice(&((bytes.len() + 1) as u32).to_ne_bytes());
+                body.extend_from_slice(bytes);
+                body.push(0);
+                while body.len() % 4 != 0 {
+                    body.push(0);
+                }
+                body.extend_from_slice(&version.to_ne_bytes());
+                body.extend_from_slice(&GREETER.to_ne_bytes());
+                self.send(REGISTRY, 0, &body);
+            }
+
+            /// Drain everything the server has written so far.
+            pub fn pump(&mut self) {
+                let mut chunk = [0u8; 16 * 1024];
+                let mut data = Vec::new();
+                loop {
+                    match self.sock.read(&mut chunk) {
+                        Ok(0) => {
+                            self.closed = true;
+                            break;
+                        }
+                        Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("reading from the compositor: {e}"),
+                    }
+                }
+
+                let mut pos = 0;
+                while pos + 8 <= data.len() {
+                    let object = u32::from_ne_bytes(data[pos..pos + 4].try_into().unwrap());
+                    let word = u32::from_ne_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+                    let size = (word >> 16) as usize;
+                    let opcode = (word & 0xffff) as u16;
+                    // Payloads here are tens of bytes and fit any socket buffer,
+                    // so this cannot fire today. It is here because when a future
+                    // change does push a flush past the buffer, the bare slice
+                    // panicked with a range error three frames away that named
+                    // neither the test nor the truncation.
+                    assert!(
+                        size >= 8 && pos + size <= data.len(),
+                        "truncated wayland message: declared {size} bytes, {} available",
+                        data.len() - pos
+                    );
+                    self.received.push(Message {
+                        object,
+                        opcode,
+                        body: data[pos + 8..pos + size].to_vec(),
+                    });
+                    pos += size;
+                }
+
+                // Each pump parses only what it read, so a message split across
+                // two reads would be dropped rather than reassembled. That is
+                // acceptable while every flush fits the socket buffer, but it
+                // must not be acceptable *silently*.
+                assert_eq!(
+                    pos,
+                    data.len(),
+                    "trailing {} bytes of a partial message",
+                    data.len() - pos
+                );
+            }
+
+            pub fn events(&self) -> &[Message] {
+                &self.received
+            }
+
+            /// Panic if the compositor has hung up.
+            ///
+            /// wdm answers a protocol violation it cannot report on the wire by
+            /// dropping the connection, so every accessor that reads results has
+            /// to distinguish "the server has sent everything it is going to"
+            /// from "the server hung up on us". Both look like an empty read at
+            /// the syscall. Without this, a rejected request surfaces as a
+            /// missing event several frames from the request that caused it.
+            ///
+            /// A hangup preceded by a wl_display.error is not that case: the
+            /// compositor said what it objected to before disconnecting, the
+            /// event is in `received`, and `already_bound` is tested for exactly
+            /// that. Only a silent hangup is unexplained, and only that panics.
+            fn assert_live(&self) {
+                if !self.closed {
+                    return;
+                }
+                assert!(
+                    self.received
+                        .iter()
+                        .any(|m| m.object == DISPLAY && m.opcode == DISPLAY_ERROR),
+                    "the compositor closed the connection without saying why; \
+                     it rejected an earlier request"
+                );
+            }
+
+            /// The registry name of a global, so it can be bound.
+            pub fn global(&self, interface: &str) -> Option<u32> {
+                self.assert_live();
+                self.received
+                    .iter()
+                    .filter(|m| m.object == REGISTRY && m.opcode == REGISTRY_GLOBAL)
+                    .find_map(|m| {
+                        let mut args = m.args();
+                        let name = args.uint();
+                        (args.string() == interface).then_some(name)
+                    })
+            }
+
+            /// Every event the compositor sent to the greeter object.
+            pub fn greeter_events(&self) -> Vec<&Message> {
+                self.assert_live();
+                self.received
+                    .iter()
+                    .filter(|m| m.object == GREETER)
+                    .collect()
+            }
+        }
+    }
+
+    /// A compositor with a real `wayland_server::Display` behind it.
+    ///
+    /// Everything here runs in-process and needs neither root nor a GPU: the
+    /// display never opens a listening socket, and clients are inserted from
+    /// socket pairs.
+    struct Harness {
+        display: smithay::reexports::wayland_server::Display<Wdm>,
+        state: Wdm,
+        /// The event loop the `Login` took its handle from. Never dispatched;
+        /// held only so the handle stays usable.
+        _event_loop: smithay::reexports::calloop::EventLoop<'static, LoopData>,
+        /// The auth channel's receiving half, which a running wdm keeps in its
+        /// event loop. Dropping it would close the channel, so nothing here
+        /// could ever start a conversation.
+        _auth_rx: smithay::reexports::calloop::channel::Channel<AuthEvent>,
+    }
+
+    struct NoClientData;
+    impl smithay::reexports::wayland_server::backend::ClientData for NoClientData {}
+
+    impl Harness {
+        fn new(users: Vec<User>, default_session: Option<&str>) -> Self {
+            let display =
+                smithay::reexports::wayland_server::Display::<Wdm>::new().unwrap();
+            let handle = display.handle();
+
+            let (events, auth_rx) = smithay::reexports::calloop::channel::channel();
+            let event_loop: smithay::reexports::calloop::EventLoop<'static, LoopData> =
+                smithay::reexports::calloop::EventLoop::try_new().unwrap();
+
+            let login = Login::new(
+                users,
+                Vec::new(),
+                default_session.map(str::to_owned),
+                PathBuf::from("/nonexistent/wdm-test"),
+                7,
+                events,
+                event_loop.handle(),
+            );
+
+            let config: crate::config::Config = toml::from_str("").unwrap();
+            let greeter =
+                crate::supervise::Greeter::new("/bin/true", "nobody", "wayland-test", false)
+                    .unwrap();
+            let state = Wdm::new(&handle, config, login, greeter).unwrap();
+            // Advertised separately from the compositor's own globals, exactly
+            // as the backends do it.
+            Login::create_global(&handle);
+
+            Self {
+                display,
+                state,
+                _event_loop: event_loop,
+                _auth_rx: auth_rx,
+            }
+        }
+
+        /// Attach a client to the display and hand back its end of the socket.
+        fn connect(&mut self) -> wire::Client {
+            let (theirs, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            self.display
+                .handle()
+                .insert_client(ours, std::sync::Arc::new(NoClientData))
+                .unwrap();
+            wire::Client::new(theirs)
+        }
+
+        fn dispatch(&mut self) {
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+        }
+
+        /// Connect, bind `wdm_greeter_v1` at `version`, and collect the reply.
+        fn bind_greeter(&mut self, version: u32) -> wire::Client {
+            let mut client = self.connect();
+            client.get_registry();
+            self.dispatch();
+            client.pump();
+
+            let name = client
+                .global("wdm_greeter_v1")
+                .expect("wdm_greeter_v1 was not advertised");
+            client.bind(name, "wdm_greeter_v1", version);
+            self.dispatch();
+            client.pump();
+            client
+        }
+    }
+
+    #[test]
+    fn the_wire_opcodes_still_match_the_generated_bindings() {
+        // `mod wire` hardcodes event opcodes positionally, and the sharpest
+        // assertion in this file is a *negative* one: that no default_session
+        // event reached a version 1 greeter. Insert an event ahead of it in the
+        // XML and that test goes green while checking nothing. The generated
+        // bindings already carry the real table, so pin against it here rather
+        // than trusting the numbers to stay true by themselves.
+        //
+        // The signature is pinned alongside the name because the tests read
+        // arguments *positionally* — `user_last_session` takes the fourth
+        // string. An argument inserted into `user` would move last_session
+        // without moving any opcode, so a name-only check would stay green
+        // while both version-gating tests silently asserted on display_name.
+        use smithay::reexports::wayland_server::backend::protocol::{AllowNull, ArgumentType};
+
+        let str_arg = ArgumentType::Str(AllowNull::No);
+        let events = <WdmGreeterV1 as Resource>::interface().events;
+        for (op, name, signature) in [
+            (
+                wire::USER,
+                "user",
+                &[str_arg, str_arg, str_arg, str_arg][..],
+            ),
+            (wire::DONE, "done", &[][..]),
+            (wire::AUTH_OK, "auth_ok", &[][..]),
+            (wire::DEFAULT_SESSION, "default_session", &[str_arg][..]),
+        ] {
+            let event = events
+                .get(op as usize)
+                .unwrap_or_else(|| panic!("no event at opcode {op}"));
+            assert_eq!(event.name, name, "opcode {op} is no longer {name}");
+            assert_eq!(
+                event.signature, signature,
+                "{name}'s arguments changed; the positional reads in this \
+                 module now name different fields"
+            );
+        }
+    }
+
+    fn test_user(last_session: &str) -> User {
+        User {
+            name: "testuser".to_owned(),
+            display_name: "Test User".to_owned(),
+            avatar_path: String::new(),
+            last_session: last_session.to_owned(),
+        }
+    }
+
+    /// The `last_session` string a bound greeter was told for the only user.
+    fn user_last_session(client: &wire::Client) -> String {
+        let user = client
+            .greeter_events()
+            .into_iter()
+            .find(|m| m.opcode == wire::USER)
+            .expect("no user event");
+        let mut args = user.args();
+        args.string();
+        args.string();
+        args.string();
+        args.string()
+    }
+
+    #[test]
+    fn a_version_2_greeter_is_told_the_default_separately() {
+        // The pure test above says what last_session_for computes; this says
+        // that the enumerate phase actually applies it per resource version,
+        // which is the part a greeter observes.
+        let mut h = Harness::new(vec![test_user("")], Some("river.desktop"));
+        let client = h.bind_greeter(2);
+
+        assert_eq!(
+            user_last_session(&client),
+            "",
+            "history was conflated with the configured default"
+        );
+
+        let events = client.greeter_events();
+        let default = events
+            .iter()
+            .position(|m| m.opcode == wire::DEFAULT_SESSION)
+            .expect("no default_session event");
+        let done = events
+            .iter()
+            .position(|m| m.opcode == wire::DONE)
+            .expect("no done event");
+        assert!(default < done, "default_session arrived after done");
+        assert_eq!(
+            events[default].args().string(),
+            "river.desktop"
+        );
+    }
+
+    #[test]
+    fn a_version_1_greeter_gets_the_default_in_last_session_instead() {
+        // A version 1 peer has no default_session event to learn the
+        // administrator's choice from, so it keeps the old conflated meaning.
+        // Sending the event anyway would be a wire error on that peer.
+        let mut h = Harness::new(vec![test_user("")], Some("river.desktop"));
+        let client = h.bind_greeter(1);
+
+        assert_eq!(user_last_session(&client), "river.desktop");
+        assert!(
+            !client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::DEFAULT_SESSION),
+            "default_session was sent to a version 1 resource"
+        );
+        assert!(
+            client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::DONE),
+            "the enumerate phase never ended"
+        );
+    }
+
+    #[test]
+    fn a_second_bind_is_refused_and_gets_no_initial_state() {
+        // One conversation, one driver: a second object could otherwise cancel
+        // the first's conversation just by destroying itself. The refusal must
+        // also come *before* any state is pushed, or a client that binds twice
+        // walks away with a second copy of the user list.
+        let mut h = Harness::new(vec![test_user("sway.desktop")], None);
+        let first = h.bind_greeter(2);
+        assert!(!first.greeter_events().is_empty());
+
+        let second = h.bind_greeter(2);
+
+        let error = second
+            .events()
+            .iter()
+            .find(|m| m.object == wire::DISPLAY && m.opcode == wire::DISPLAY_ERROR)
+            .expect("the second bind was accepted");
+        let mut args = error.args();
+        assert_eq!(args.uint(), wire::GREETER, "the error named another object");
+        assert_eq!(
+            args.uint(),
+            wdm_greeter_v1::Error::AlreadyBound as u32,
+            "refused with the wrong error code"
+        );
+        assert!(
+            second.greeter_events().is_empty(),
+            "a refused bind was still sent the enumerate phase"
+        );
+
+        // Only the first object is left driving the conversation.
+        assert_eq!(h.state.login.bound.len(), 1);
+
+        // And it still works: a refused rival must not take the live greeter
+        // down with it.
+        let mut first = first;
+        h.state.login.broadcast(|g| g.auth_ok());
+        h.dispatch();
+        first.pump();
+        assert!(
+            first
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::AUTH_OK),
+            "the surviving greeter stopped receiving events"
+        );
     }
 }

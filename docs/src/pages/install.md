@@ -96,6 +96,33 @@ directory to it before exec, so a missing directory is a greeter that never
 spawns. Arch and Fedora ship it in their base filesystem package; Debian does
 not, which is why `packaging/wdm.tmpfiles` declares it.
 
+### Upgrading a machine set up by hand
+
+The greeter account's home moved from `/var/lib/wdm` to `/var/empty` in 0.2.0,
+but an account that already exists is never modified by `useradd` or
+`systemd-sysusers` — the packages run the move from their install scripts, and a
+machine set up by hand has to run it itself:
+
+```bash
+if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+  if [ -d /var/empty ]; then
+    usermod -d /var/empty wdm \
+      || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+  else
+    echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+  fi
+fi
+chown root:root /var/lib/wdm
+```
+
+This is the same shape the deb's `postinst`, the rpm scriptlet and
+`aur/wdm.install` use — nested rather than conjoined, so the two failures say
+different things — and it can be diffed against them line for line. Both guards
+matter: the first leaves an administrator who chose a different home alone, and
+the second keeps `/etc/passwd` from naming a directory that is not there — wdm
+`chdir`s into the greeter's home before exec, so a missing one is a greeter that
+never spawns.
+
 `/var/lib/wdm` — the per-user last-session record — is **root-owned**, not
 owned by `wdm`. Only wdm itself writes there, and it does so as root; giving
 the directory to the unprivileged greeter account would hand that account a
@@ -119,6 +146,11 @@ That leaves **tty1 as a working text console**, which is the recovery path when
 a greeter wedges — Ctrl+Alt+F1, log in, `systemctl restart wdm`. Since wdm hosts
 arbitrary third-party greeters, a guaranteed-good VT is load-bearing rather than
 a nicety.
+
+That the unit ships no `Conflicts=` is a consequence of the default, not an
+invariant. Setting `vt` to a terminal a getty uses needs a `wdm.service`
+drop-in, or wdm and the getty contend for the same VT with nothing arbitrating
+and the recovery console goes with it. See `wdm(1)`, which gives the drop-in.
 
 ## Development
 

@@ -23,7 +23,10 @@
 //!   concatenation. PAM's prompt text reaches JavaScript verbatim otherwise.
 //! - Navigation is refused unless it stays inside the theme directory, which
 //!   makes a theme that links to the internet fail visibly instead of turning
-//!   the login screen into a browser.
+//!   the login screen into a browser. Subresources are held to a looser line —
+//!   local files, any local file — by a content security policy, which is also
+//!   what stops anything at all being fetched from or sent to the network; the
+//!   page is then denied the ability to *read* files it loads.
 //! - The web process gets no persistent storage, no context menu, and no
 //!   developer tools unless `WDM_GREETER_DEBUG` is set.
 
@@ -48,6 +51,7 @@ use webkit6::{NavigationPolicyDecision, PolicyDecisionType, WebView};
 
 use bridge::{Bridge, Request};
 use wdm_greeter_client::{Link, Model, SharedLink};
+use wdm_protocol::GREETER_GAVE_UP_EXIT;
 
 /// The one message that is delivered outside the bridge's queue, and the
 /// invariant that it is delivered at most once.
@@ -136,7 +140,7 @@ const THEME_ROOT: &str = "/usr/share/wdm/webkit-greeter/themes";
 
 /// See `wdm-gtk-greeter`: GDK owns the connection's fd and reads from it, so
 /// the queue is polled rather than watched.
-const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+pub(crate) const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::new().filter("WDM_GREETER_LOG")).init();
@@ -151,15 +155,17 @@ fn main() -> ExitCode {
     log::info!("theme: {}", theme.display());
 
     let app = Application::builder().application_id(APP_ID).build();
-    let failed = Rc::new(std::cell::Cell::new(false));
+    // Zero is success; anything else is the status to exit with, which is how
+    // the wedged case reports itself as something other than plain failure.
+    let failure = Rc::new(std::cell::Cell::new(0u8));
 
     app.connect_activate({
-        let failed = failed.clone();
+        let failure = failure.clone();
         let theme = theme.clone();
         move |app| {
-            if let Err(e) = activate(app, &theme, failed.clone()) {
+            if let Err(e) = activate(app, &theme, failure.clone()) {
                 log::error!("{e}");
-                failed.set(true);
+                failure.set(1);
                 app.quit();
             }
         }
@@ -168,10 +174,10 @@ fn main() -> ExitCode {
     // Arguments are ours, not GTK's — it would try to interpret --theme.
     let status = app.run_with_args::<&str>(&[]);
 
-    if failed.get() || status != glib::ExitCode::SUCCESS {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    match failure.get() {
+        0 if status == glib::ExitCode::SUCCESS => ExitCode::SUCCESS,
+        0 => ExitCode::FAILURE,
+        code => ExitCode::from(code),
     }
 }
 
@@ -241,7 +247,7 @@ fn resolve_theme(name: &str, root: &Path) -> Result<PathBuf, String> {
 fn activate(
     app: &Application,
     theme: &Path,
-    failed: Rc<std::cell::Cell<bool>>,
+    failure: Rc<std::cell::Cell<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let display = gtk4::gdk::Display::default().ok_or("no display")?;
     let (link, model) = Link::connect(&display)?;
@@ -300,8 +306,18 @@ fn activate(
 
             // And any other state the model held before the pump timer saw its
             // first change goes through the normal queue.
+            //
+            // Resynced first, because a reload rewinds one piece of page state
+            // behind the bridge's back: `link_dead` is baked into the
+            // document-start API script, which re-runs with the value frozen at
+            // startup. After a link death both the page's copy and the bridge's
+            // mirror read true, the diff sees no change, and the reloaded
+            // document is left believing the socket is alive — offering a retry
+            // that goes nowhere. See `Bridge::resync`.
             let model = model.borrow();
-            bridge.borrow_mut().diff(&model);
+            let mut bridge = bridge.borrow_mut();
+            bridge.resync();
+            bridge.diff(&model);
         }
     });
 
@@ -309,14 +325,28 @@ fn activate(
 
     let app = app.clone();
     glib::timeout_add_local(PUMP_INTERVAL, move || {
-        // A page that has answered nothing for about a second is not coming
-        // back on its own, and a greeter process that stays alive in front of
-        // a dead login screen is invisible to wdm's supervisor. Exiting with
-        // failure is what turns it into a respawn, or into wdm's give-up
-        // screen.
-        if bridge.borrow().is_wedged() {
+        // Charge the tick against whatever evaluation is outstanding before
+        // asking whether the page is dead. This is the only place a web process
+        // that took the script and never answered gets noticed at all: it
+        // produces no verdict for `evaluate`'s callback to report, so without
+        // this the bridge would wait on it forever.
+        //
+        // A page that has answered nothing for long enough is not coming back
+        // on its own, and a greeter process that stays alive in front of a dead
+        // login screen is invisible to wdm's supervisor. Exiting is what turns
+        // it into a respawn — with [`GREETER_GAVE_UP_EXIT`] rather than plain failure,
+        // because establishing silence takes long enough that the supervisor
+        // would otherwise read the exit as a healthy greeter that happened to
+        // stop, reset its failure count, and reload the same broken theme
+        // forever instead of reaching the give-up screen.
+        let wedged = {
+            let mut bridge = bridge.borrow_mut();
+            bridge.tick();
+            bridge.is_wedged()
+        };
+        if wedged {
             log::error!("the theme has stopped responding; exiting so wdm can respawn the greeter");
-            failed.set(true);
+            failure.set(GREETER_GAVE_UP_EXIT);
             app.quit();
             return glib::ControlFlow::Break;
         }
@@ -408,6 +438,16 @@ fn build_webview(model: &Model, theme: &Path) -> Result<WebView, Box<dyn std::er
     // hand-written files, and everything reaching the page from outside is
     // escaped into string literals by the bridge.
     //
+    // The network half is the whole of what this directive buys. `file:` is a
+    // *scheme*, not a directory, so `<img src="file:///var/…">` outside the
+    // theme is loaded, and being a subresource it never passes through
+    // within_theme. What keeps such a file from becoming something the theme
+    // can read back — and therefore something it could put on screen or hand to
+    // a caller — is the pair of file-access settings below, not this. So the
+    // subresource boundary is "a local file", and confinement of the page is
+    // the navigation policy, this policy and those settings together; no one of
+    // the three is it.
+    //
     // `form-action`, `base-uri` and `frame-ancestors` are spelled out because
     // they are the directives that do *not* fall back to `default-src`. Without
     // them a `<form action="https://…">` is caught only by the navigation
@@ -451,11 +491,21 @@ fn build_webview(model: &Model, theme: &Path) -> Result<WebView, Box<dyn std::er
     Ok(webview)
 }
 
-/// Keep the page inside the theme directory.
+/// Keep the page's *navigation* inside the theme directory.
 ///
 /// A theme is meant to be self-contained. One that navigates elsewhere — a
 /// stray link, a redirect, a mistake — would otherwise replace the login screen
 /// with whatever it reached, on a machine at a login prompt.
+///
+/// It is one of three controls and not the confinement on its own. Only
+/// `NavigationAction` and `NewWindowAction` are inspected here; `Response` and
+/// any decision type WebKit grows later fall through as allowed, which is why
+/// the CSP in [`build_webview`] spells out `form-action`, `base-uri` and
+/// `frame-ancestors` rather than trusting this callback to catch a submission,
+/// and why the file-access settings there are what actually bound what the page
+/// can read. Widening the `matches!` would not fix that: a decision type this
+/// code has never heard of is one it cannot judge, so allowing it and pinning
+/// the guarantee on the CSP is the honest arrangement.
 fn refuse_navigation_outside(webview: &WebView, theme: &Path) {
     let theme = theme.to_owned();
     webview.connect_decide_policy(move |_, decision, kind| {
@@ -561,11 +611,15 @@ fn evaluate(webview: &WebView, bridge: &Rc<RefCell<Bridge>>, outbound: &bridge::
             let error = result.as_ref().err().map(|e| e.to_string());
             let mut bridge = bridge.borrow_mut();
             bridge.delivered(epoch, result.is_ok());
-            // Once, not every tick: a page that never recovers is retried
-            // sixty times a second, and sixty warnings a second in the journal
-            // is how a symptom becomes the whole log.
+            // Once per distinct error, not every tick: a page that never
+            // recovers is retried sixty times a second, and sixty warnings a
+            // second in the journal is how a symptom becomes the whole log.
+            // The bridge is asked rather than its failure count consulted,
+            // because a missed deadline is a failure with no error text to
+            // print and would otherwise spend the budget before this line —
+            // the only one naming the statement that broke — ever ran.
             if let Some(e) = error
-                && bridge.consecutive_failures() == 1
+                && bridge.claim_error_report(&e)
             {
                 log::warn!("theme script: {e}");
             }
@@ -752,14 +806,117 @@ mod tests {
         assert_eq!(error.take(), None);
     }
 
+    /// The default theme with its whole-line comments removed.
+    ///
+    /// The drift check below searches for names that also appear in the theme's
+    /// prose — it explains `wdm.default_session` two lines above using it — and
+    /// a contract check a comment can satisfy checks nothing.
+    fn theme_code() -> String {
+        include_str!("../themes/default/theme.js")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_default_theme_uses_the_api_it_is_shipped_with() {
-        // A drift check, not a JS test. The theme is part of the contract, so
-        // renaming a field of the injected API without updating it must fail
-        // the build rather than the login screen.
-        let theme = include_str!("../themes/default/theme.js");
-        for field in ["wdm.users", "wdm.sessions", "wdm.default_session"] {
-            assert!(theme.contains(field), "the default theme lost {field}");
+        // A drift check, not a JS test. The injected API and the default theme
+        // are both part of the contract themes.md documents, so renaming a
+        // field of one without the other must fail the build rather than the
+        // login screen.
+        //
+        // Asserted against the *generated script* as well as the theme, which
+        // is the half that was missing: searching the theme alone left renaming
+        // `default_session` in api_script — and nowhere else — green, which is
+        // the exact drift this is supposed to catch.
+        let script = bridge::api_script(&Model::default());
+        let theme = theme_code();
+        // The documentation is the third end of the same contract, and the one
+        // that used to be claimed rather than checked: the list below said it
+        // enumerated themes.md's tables while being hardcoded, so renaming a
+        // field in the prose alone passed. Matched on the names themselves, not
+        // on surrounding wording, which is free to change.
+        let doc = include_str!("../../../docs/src/pages/themes.md");
+
+        // Every row of themes.md's two tables. State first, then the methods.
+        for name in [
+            "users",
+            "sessions",
+            "default_session",
+            "authentication_user",
+            "is_authenticated",
+            "in_authentication",
+            "link_dead",
+            // The bridge's own, but documented alongside the rest and read by
+            // the default theme to tell "answer the prompt" from "try again",
+            // so it is contract on all three ends like everything above it.
+            "_prompt",
+        ] {
+            assert!(
+                script.contains(&format!("{name}:")),
+                "the injected API lost wdm.{name}"
+            );
+            assert!(
+                doc.contains(&format!("wdm.{name}")),
+                "themes.md no longer documents wdm.{name}"
+            );
+        }
+        for method in ["authenticate", "respond", "cancel", "start_session"] {
+            assert!(
+                script.contains(&format!("{method}(")),
+                "the injected API lost wdm.{method}()"
+            );
+            assert!(
+                doc.contains(&format!("wdm.{method}(")),
+                "themes.md no longer documents wdm.{method}()"
+            );
+        }
+
+        // And the theme's end of it: what it reads and what it calls. Not the
+        // whole table — a theme is free to ignore `cancel` or
+        // `in_authentication`, and the default one does — but everything it
+        // does touch has to still be there.
+        for used in [
+            "wdm.users",
+            "wdm.sessions",
+            "wdm.default_session",
+            "wdm.is_authenticated",
+            "wdm._prompt",
+            // The one the theme reads defensively — `typeof wdm.link_dead !==
+            // "undefined" && …` — so a rename does not throw, it just makes the
+            // check false forever and the theme goes back to offering a retry
+            // into a socket nobody reads. Nothing else would notice.
+            "wdm.link_dead",
+            "wdm.authenticate(",
+            "wdm.respond(",
+            "wdm.start_session(",
+        ] {
+            assert!(theme.contains(used), "the default theme lost {used}");
+        }
+
+        // The assignment the bridge keeps that field current with, which is a
+        // separate string from the API's key and can drift from it on its own:
+        // renaming one and not the other leaves the theme reading a field that
+        // is never updated, and every check above still passes.
+        let mut bridge = Bridge::default();
+        let mut live = Model::default();
+        live.link_dead = true;
+        bridge.diff(&live);
+        let assignment = bridge.flush().expect("nothing was queued").script;
+        assert!(
+            assignment.contains("window.wdm.link_dead = "),
+            "the bridge stopped assigning wdm.link_dead: {assignment}"
+        );
+
+        // The three callbacks are the other direction: the bridge names them,
+        // and a theme that has stopped defining one goes quiet rather than
+        // failing.
+        for callback in ["show_prompt", "show_message", "authentication_complete"] {
+            assert!(
+                theme.contains(&format!("window.{callback} =")),
+                "the default theme stopped defining {callback}"
+            );
         }
     }
 

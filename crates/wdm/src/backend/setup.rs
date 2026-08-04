@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -85,18 +86,9 @@ pub fn build(
     crate::supervise::hand_over_runtime_dir(greeter_credentials)?;
 
     loop_handle.insert_source(socket, move |stream, _, data| {
-        match peer_uid(&stream) {
-            Ok(uid) if uid == expected_uid => {}
-            Ok(uid) => {
-                // Dropping the stream closes it. Root is refused too: wdm is
-                // root, and a root process has no business posing as the greeter.
-                log::warn!("refusing connection from uid {uid}, expected {expected_uid}");
-                return;
-            }
-            Err(e) => {
-                log::error!("reading peer credentials, refusing connection: {e}");
-                return;
-            }
+        if !greeter_may_connect(peer_uid(&stream), expected_uid) {
+            // Dropping the stream closes it.
+            return;
         }
 
         if let Err(e) = data.display.handle().insert_client(stream, client_state()) {
@@ -120,6 +112,26 @@ pub fn build(
             Ok(PostAction::Continue)
         },
     )?;
+
+    // Both backends, because both own a greeter child. Without this the loop has
+    // exactly one exit — a login handoff under udev, the window closing under
+    // winit — so a `systemctl stop wdm` or a Ctrl-C in a development session
+    // takes the default disposition, never runs Greeter's Drop, and leaves the
+    // greeter and its process group orphaned until SIGKILL.
+    //
+    // Signals::new blocks these signals on the calling thread with
+    // pthread_sigmask, which is how calloop makes the signalfd the only reader.
+    // A blocked mask is inherited by fork *and survives exec*, so every child
+    // wdm spawns from this thread would otherwise start life unable to receive
+    // SIGTERM or SIGINT: the greeter would ignore the handoff's grace period,
+    // and the user's whole session would be unkillable by loginctl, systemd
+    // shutdown, or Ctrl-C. Both pre_exec closures — supervise.rs's greeter
+    // spawn and session.rs's Launch::spawn — clear the mask for this reason.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
+    loop_handle.insert_source(signals, |event, _, data: &mut LoopData| {
+        log::info!("caught {:?}, shutting down", event.signal());
+        data.state.running = false;
+    })?;
 
     // PAM threads report here.
     let (events_tx, events_rx) = smithay::reexports::calloop::channel::channel();
@@ -178,6 +190,35 @@ pub fn start(
 ) {
     log::info!("greeter socket is {socket_name}");
     crate::backend::spawn_greeter(data, loop_handle);
+}
+
+/// Whether a connection whose peer uid resolved to `peer` may speak the
+/// protocol.
+///
+/// The inner half of the trust boundary, and a free function rather than an arm
+/// inside the accept closure so that it can be tested: the socket's mode and
+/// `peer_uid` itself both have tests below, but the comparison between them —
+/// the part that actually refuses anyone — had none while it lived in a closure
+/// that needs a running event loop to reach.
+///
+/// Root is refused along with everyone else. wdm is root, and a root process
+/// has no business posing as the greeter; accepting it would mean the one uid
+/// that can already do anything is also the one uid whose connections are not
+/// checked.
+fn greeter_may_connect(peer: std::io::Result<u32>, expected: u32) -> bool {
+    match peer {
+        Ok(uid) if uid == expected => true,
+        Ok(uid) => {
+            log::warn!("refusing connection from uid {uid}, expected {expected}");
+            false
+        }
+        // Unreadable credentials are a refusal, not a pass: the whole point is
+        // that the kernel vouches for the uid, and it has not.
+        Err(e) => {
+            log::error!("reading peer credentials, refusing connection: {e}");
+            false
+        }
+    }
 }
 
 /// The uid on the other end of a connected unix socket.
@@ -297,6 +338,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+
+    #[test]
+    fn only_the_greeter_account_may_connect() {
+        // The socket's mode and `peer_uid` are covered on their own below and
+        // above; this is the comparison between them, which is what actually
+        // turns anyone away. It lived in the accept closure and so had no test
+        // at all — a closure needing a running event loop to reach is exactly
+        // where a check gets quietly refactored into always returning true.
+        let greeter = 1000;
+
+        assert!(greeter_may_connect(Ok(greeter), greeter));
+        assert!(
+            !greeter_may_connect(Ok(greeter + 1), greeter),
+            "another unprivileged account was let in"
+        );
+        assert!(
+            !greeter_may_connect(Ok(0), greeter),
+            "root was let in; wdm is root, so this is the connection that must not be trusted"
+        );
+        assert!(
+            !greeter_may_connect(Err(std::io::Error::from_raw_os_error(libc::EINVAL)), greeter),
+            "a connection whose credentials could not be read was let in"
+        );
+    }
 
     #[test]
     fn peer_uid_reports_the_connecting_process() {

@@ -119,9 +119,17 @@ fn prepare(data: &mut LoopData, request: LaunchRequest) -> Option<Launch> {
 
 /// Tear down the current greeter and start a fresh one after `delay`.
 ///
-/// `error` is advertised to the new greeter through `last_error`, so a user
-/// whose session failed to start is told why instead of being bounced back to a
-/// login prompt with no explanation.
+/// `error`, when there is one, is advertised to the new greeter through
+/// `last_error`, so a user whose session failed to start is told why instead of
+/// being bounced back to a login prompt with no explanation. `None` means "this
+/// restart has nothing to add", not "forget what was recorded": a greeter that
+/// dies before it ever binds restarts with no error of its own, and overwriting
+/// here would discard the reason the session failed before anyone had seen it.
+/// That is why the `None` arm skips the setter rather than passing it along:
+/// [`crate::login::Login::set_last_error`] takes a `String` and cannot express
+/// "clear". The error is cleared where it has served its purpose —
+/// [`crate::login::Login::begin_attempt`], once the user has moved on to a new
+/// attempt.
 pub fn restart_greeter(
     data: &mut LoopData,
     loop_handle: &LoopHandle<'static, LoopData>,
@@ -132,7 +140,9 @@ pub fn restart_greeter(
     data.state.login.reset();
     // The old greeter's objects belong to a connection that is gone.
     data.state.login.clear_bindings();
-    data.state.login.set_last_error(error);
+    if let Some(error) = error {
+        data.state.login.set_last_error(error);
+    }
     // Surfaces belonging to the dead greeter must go, or they keep being
     // rendered over the new one.
     data.state.layers.clear();
@@ -181,7 +191,11 @@ pub fn spawn_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
         Err(e) => {
             log::error!("spawning greeter: {e}");
             match data.state.greeter.note_spawn_failure(&e.to_string()) {
-                Disposition::Restart(delay) => arm_respawn(data, loop_handle, delay),
+                // The reason is dropped here rather than shown: this path has
+                // not started a greeter, so there is nothing on screen and
+                // nothing that could bind to be told. arm_respawn is the whole
+                // response.
+                Disposition::Restart { delay, .. } => arm_respawn(data, loop_handle, delay),
                 Disposition::GaveUp { reason } => give_up(data, reason),
             }
         }
@@ -240,9 +254,15 @@ pub fn poll_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopD
     };
 
     match disposition {
-        Disposition::Restart(delay) => {
-            log::info!("restarting greeter in {delay:?}");
-            restart_greeter(data, loop_handle, None, delay);
+        Disposition::Restart { delay, reason } => {
+            log::info!("restarting greeter in {delay:?}: {reason}");
+            // Some, not None: a greeter that crashed knows why, and passing None
+            // here meant the user watched the login screen vanish and reappear
+            // twice with no indication anything was wrong, learning the reason
+            // only on the third failure via the give-up screen. The
+            // None-means-preserve contract is for the case with nothing to add —
+            // a greeter that died before it ever bound — not this one.
+            restart_greeter(data, loop_handle, Some(reason), delay);
         }
         Disposition::GaveUp { reason } => give_up(data, reason),
     }

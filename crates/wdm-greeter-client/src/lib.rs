@@ -63,6 +63,116 @@ pub struct Session {
     pub name: String,
 }
 
+/// Which of PAM's two no-answer message styles a [`Notice`] carries.
+///
+/// The protocol's `prompt_style` has four entries; `secret` and `visible`
+/// expect an answer and become a [`Prompt`], so only these two land here.
+///
+/// Non-exhaustive: a fifth `prompt_style` that expects no answer would force a
+/// third variant here, and an out-of-tree greeter must not need a source change
+/// to keep compiling. The cost today is a `_ =>` arm on out-of-tree matches,
+/// which is the arm they want anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NoticeKind {
+    /// `PAM_TEXT_INFO` — an explanation, not a failure.
+    Info,
+    /// `PAM_ERROR_MSG` — PAM saying something went wrong. Distinct from
+    /// [`Model::error`], which is the conversation's verdict rather than a
+    /// message the stack chose to send.
+    Error,
+}
+
+impl NoticeKind {
+    /// The string `show_message` carries as its second argument, which is how a
+    /// WebKit theme learns whether to style a message as an aside or a failure.
+    ///
+    /// Not every greeter uses it: the GTK greeter has one notice label and
+    /// drops the distinction by design. Changing either string breaks every
+    /// theme that branches on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Where one `prompt` event goes.
+///
+/// The whole routing decision, in one value the dispatch arm only switches on.
+/// It was previously split between a pattern in that arm (which styles are
+/// notices) and a `style == Secret` expression beside it (which prompts are
+/// masked), and neither half could be tested without a live compositor: a test
+/// could only restate the pattern, which is true of any pattern, including a
+/// wrong one. With the decision extracted, a test names a style and gets the
+/// answer the compositor would get.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Routed {
+    /// PAM said something and expects no answer; it sticks in
+    /// [`Model::notices`].
+    Notice(NoticeKind),
+    /// PAM asked a question; it becomes [`Model::prompt`].
+    Prompt {
+        /// Whether the answer must be masked.
+        secret: bool,
+    },
+}
+
+/// Written as `From` rather than a bare `route(style)` because it is total and
+/// infallible for every style the crate knows, and the impl block says so
+/// without a reader having to find the function and check its arms.
+impl From<wdm_greeter_v1::PromptStyle> for Routed {
+    fn from(style: wdm_greeter_v1::PromptStyle) -> Self {
+        use wdm_greeter_v1::PromptStyle;
+        match style {
+            // The single place the info/error distinction is made: everything
+            // the two toolkit greeters do with a notice — grey aside or red
+            // failure, and the `"info"`/`"error"` a WebKit theme branches on —
+            // follows from these two arms.
+            PromptStyle::Info => Self::Notice(NoticeKind::Info),
+            PromptStyle::Error => Self::Notice(NoticeKind::Error),
+            PromptStyle::Secret => Self::Prompt { secret: true },
+            PromptStyle::Visible => Self::Prompt { secret: false },
+            // The generated enum is `#[non_exhaustive]`, so this arm is
+            // required; it is spelled out rather than folded into the `Info`
+            // arm because a style added to the protocol later would otherwise
+            // be rendered as an informational aside in both toolkit greeters
+            // and every WebKit theme, with nothing anywhere saying why.
+            //
+            // Treated as a notice rather than a prompt because an unknown style
+            // may well expect no answer, and a greeter waiting for a response
+            // PAM is not asking for hangs the login screen; showing the text
+            // and moving on cannot.
+            other => {
+                log::warn!(
+                    "unrecognised prompt style {other:?}; showing it as an informational notice"
+                );
+                Self::Notice(NoticeKind::Info)
+            }
+        }
+    }
+}
+
+/// One thing PAM said that expects no answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Notice {
+    /// Which of PAM's two no-answer styles sent this; a WebKit theme receives
+    /// it as [`NoticeKind::as_str`]'s `"info"` or `"error"`.
+    pub kind: NoticeKind,
+    /// The message as PAM wrote it, unmodified — it is the only account of
+    /// itself the stack gives the user.
+    pub text: String,
+}
+
+impl Notice {
+    /// One message, ready to push onto [`Model::notices`].
+    pub fn new(kind: NoticeKind, text: String) -> Self {
+        Self { kind, text }
+    }
+}
+
 /// A question PAM is waiting on.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -93,13 +203,39 @@ pub struct Model {
     pub default_session: String,
     pub prompt: Option<Prompt>,
     pub error: Option<String>,
-    /// The last `info` or `error` style message PAM sent.
+    /// The `info` and `error` style messages PAM has sent this conversation.
     ///
-    /// Sticky: it survives the end of a conversation and is cleared only when
-    /// the user deliberately starts another attempt. This is where a lockout
+    /// Sticky: they survive the end of a conversation, and exactly two places
+    /// clear them — [`Model::begin_attempt`], where the user has deliberately
+    /// started another attempt and so has read what was there, and `auth_ok`,
+    /// where the conversation succeeded and there is nothing left to explain.
+    /// Nothing else, and no passage of time, empties this. This is where a lockout
     /// notice arrives ("the account is locked, 10 minutes left"), and it is
     /// precisely the text that must not scroll past.
-    pub notice: Option<String>,
+    ///
+    /// A list rather than one string because PAM sends them one at a time and
+    /// the two styles mean different things — a greeter that can show them
+    /// differently should be able to. One that cannot has
+    /// [`notice_text`](Model::notice_text), which joins them the way a single
+    /// label needs.
+    pub notices: Vec<Notice>,
+    /// Bumped every time `notices` is cleared, so a consumer tracking how many
+    /// it has reported can tell "the list grew" from "the list was replaced".
+    ///
+    /// Comparing lengths cannot answer that question. A consumer that keeps an
+    /// index into `notices` and diffs once per event batch — which is what the
+    /// WebKit bridge does, because `Link::pump` drains the whole batch before
+    /// the diff runs — sees a clear and the pushes that follow it as one step.
+    /// `auth_ok` clears the list, and `pam_open_session` then pushes the
+    /// password-expiry warning, the motd and the last-login line, all in that
+    /// same pump: one notice reported, one notice present, length unchanged,
+    /// and the new ones are silently swallowed. Those are exactly the messages
+    /// a user is meant to read on the way in.
+    ///
+    /// So it is a counter and not a flag: a consumer stores the value it last
+    /// diffed against, and any difference means "start again from index 0",
+    /// however many clears happened in between.
+    pub notices_generation: u64,
     /// Set by `auth_ok`; the UI launches a session in response.
     pub authenticated: bool,
     /// Set only by `auth_failed`, and cleared when a new attempt starts.
@@ -112,6 +248,30 @@ pub struct Model {
     /// Set when PAM sent a notice during this conversation, which suppresses
     /// auto-retry.
     pub blocked: bool,
+    /// Set by [`Model::link_lost`], and never cleared: a Wayland connection
+    /// does not come back.
+    ///
+    /// It lives here rather than being read off [`Link`] so the UI keeps
+    /// drawing from one place, and because it outlives the conversation state
+    /// around it — [`Model::begin_attempt`] clears everything an attempt owns,
+    /// and a dead socket is not one of those things.
+    ///
+    /// Deliberately narrower than it sounds, and named for what it records: it
+    /// is about the socket only, not about whether a retry is *sensible* —
+    /// `blocked`, `conversation_over` and the rate limit are
+    /// [`should_auto_retry`](Model::should_auto_retry)'s business.
+    ///
+    /// The UI ends a conversation by inviting the user to press Enter and try
+    /// again. Once this is set that invitation is a lie: `Link::pump` returns
+    /// early forever after a failure, so nothing the form sends leaves the
+    /// process and the screen never changes again. The greeter says what is
+    /// actually true instead — the session is unreachable from here.
+    ///
+    /// Read as the field, in this polarity, everywhere. It is the name a WebKit
+    /// theme sees as `wdm.link_dead`, and one bit spelled three ways — a field,
+    /// an inverted accessor, and a JS property — was three chances to get the
+    /// polarity wrong.
+    pub link_dead: bool,
     pub revision: u64,
 }
 
@@ -134,14 +294,59 @@ impl Model {
     /// Record one of PAM's explanations.
     ///
     /// PAM often splits a single explanation over two messages ("locked due to
-    /// 3 failed logins" then "10 minutes left"), so they are joined rather than
+    /// 3 failed logins" then "10 minutes left"), so they accumulate rather than
     /// the second replacing the first.
-    pub fn push_notice(&mut self, text: String) {
-        self.notice = Some(match self.notice.take() {
-            Some(prior) => format!("{prior} {text}"),
-            None => text,
-        });
+    pub fn push_notice(&mut self, kind: NoticeKind, text: String) {
+        self.notices.push(Notice::new(kind, text));
         self.blocked = true;
+    }
+
+    /// Empty the notice list, telling anyone tracking it that it was replaced
+    /// rather than appended to.
+    ///
+    /// One method rather than two `notices.clear()` calls so the counter cannot
+    /// be forgotten at a third clear site: a clear that does not bump it is
+    /// invisible to every consumer, and invisible in exactly the case the
+    /// counter exists for. See [`Model::notices_generation`].
+    fn clear_notices(&mut self) {
+        self.notices.clear();
+        self.notices_generation = self.notices_generation.wrapping_add(1);
+    }
+
+    /// Every notice as one string, for a greeter with a single label to put it
+    /// in.
+    ///
+    /// Joined with a space because the pieces are usually one sentence PAM
+    /// split in two, and `None` when there is nothing to say, so a caller can
+    /// hide the label rather than showing an empty one.
+    pub fn notice_text(&self) -> Option<String> {
+        if self.notices.is_empty() {
+            return None;
+        }
+        Some(
+            self.notices
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    /// Record that PAM accepted the user.
+    ///
+    /// A method rather than the body of the `auth_ok` dispatch arm because a
+    /// `Dispatch::event` arm cannot be called from a test — it wants a live
+    /// proxy and a queue handle — and this arm clears the notice list, which is
+    /// the half of [`notices_generation`](Model::notices_generation) a consumer
+    /// most needs to see and the half hardest to reach by hand.
+    pub fn auth_ok(&mut self) {
+        self.authenticated = true;
+        self.conversation_over = false;
+        self.blocked = false;
+        self.prompt = None;
+        self.error = None;
+        self.clear_notices();
+        self.touch();
     }
 
     /// Clear everything belonging to the previous attempt.
@@ -149,7 +354,7 @@ impl Model {
         self.conversation_over = false;
         self.blocked = false;
         self.error = None;
-        self.notice = None;
+        self.clear_notices();
         self.prompt = None;
         self.touch();
     }
@@ -163,9 +368,13 @@ impl Model {
     /// alternative was a log line nobody at a login screen can read, under a
     /// greeter stuck on "Starting session…" forever.
     pub fn link_lost(&mut self, why: &str) {
-        self.push_notice(format!("Lost the connection to wdm: {why}"));
+        self.push_notice(
+            NoticeKind::Error,
+            format!("Lost the connection to wdm: {why}"),
+        );
         self.authenticated = false;
         self.conversation_over = true;
+        self.link_dead = true;
         self.prompt = None;
         self.touch();
     }
@@ -252,7 +461,16 @@ impl Link {
         ))
     }
 
-    /// Deliver any events that have arrived.
+    /// Deliver the events GDK has already read off the connection, and flush
+    /// our own requests.
+    ///
+    /// This dispatches what libwayland has *queued*; it never reads the socket.
+    /// Nothing here owns the fd — GDK does, and its main loop is what turns
+    /// bytes on the wire into queued events for our objects. That is the whole
+    /// reason this crate shares GDK's connection rather than opening its own,
+    /// and it is why a stalled GDK loop shows up here as a `pump` that quietly
+    /// returns false forever rather than as an error. Reading the fd ourselves
+    /// would race the owner of it.
     ///
     /// Returns true when the model changed. A dispatch or flush failure is not
     /// swallowed: a flush that fails has dropped a request on the floor — a
@@ -353,32 +571,26 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
             wdm_greeter_v1::Event::Done => state.touch(),
 
             wdm_greeter_v1::Event::Prompt { id, text, style } => {
-                use wdm_greeter_v1::PromptStyle;
                 match style.into_result() {
-                    // Neither expects an answer. Both are PAM explaining
-                    // itself, so both stick and both stop the auto-retry.
-                    Ok(PromptStyle::Info | PromptStyle::Error) => state.push_notice(text),
-                    Ok(style) => {
-                        state.prompt = Some(Prompt {
-                            id,
-                            text,
-                            secret: style == PromptStyle::Secret,
-                        });
-                    }
+                    // Which of the two this is belongs to `Routed`, not here: a
+                    // decision made in a match arm is a decision no test can
+                    // reach. `Err` is a value outside the enum entirely — a
+                    // compositor sending a style number this crate's protocol
+                    // XML does not define — and there is nothing to show.
+                    Ok(style) => match Routed::from(style) {
+                        // Expects no answer. PAM explaining itself, so it
+                        // sticks and it stops the auto-retry.
+                        Routed::Notice(kind) => state.push_notice(kind, text),
+                        Routed::Prompt { secret } => {
+                            state.prompt = Some(Prompt { id, text, secret });
+                        }
+                    },
                     Err(e) => log::warn!("unknown prompt style: {e}"),
                 }
                 state.touch();
             }
 
-            wdm_greeter_v1::Event::AuthOk => {
-                state.authenticated = true;
-                state.conversation_over = false;
-                state.blocked = false;
-                state.prompt = None;
-                state.error = None;
-                state.notice = None;
-                state.touch();
-            }
+            wdm_greeter_v1::Event::AuthOk => state.auth_ok(),
 
             wdm_greeter_v1::Event::AuthFailed { reason } => {
                 state.authenticated = false;
@@ -418,7 +630,10 @@ mod tests {
         // form under the user, and feeding the lock.
         let model = Model {
             blocked: true,
-            notice: Some("The account is locked due to 3 failed logins.".to_owned()),
+            notices: vec![Notice::new(
+                NoticeKind::Info,
+                "The account is locked due to 3 failed logins.".to_owned(),
+            )],
             ..failed()
         };
         assert!(!model.should_auto_retry());
@@ -457,7 +672,7 @@ mod tests {
     fn a_deliberate_attempt_clears_the_previous_one() {
         let mut model = Model {
             blocked: true,
-            notice: Some("locked".to_owned()),
+            notices: vec![Notice::new(NoticeKind::Info, "locked".to_owned())],
             error: Some("Authentication failure".to_owned()),
             ..failed()
         };
@@ -465,7 +680,7 @@ mod tests {
         model.begin_attempt();
 
         // The user chose to try again, so the explanation has been read.
-        assert!(model.notice.is_none());
+        assert!(model.notices.is_empty());
         assert!(model.error.is_none());
         assert!(!model.blocked);
         assert!(!model.conversation_over);
@@ -486,11 +701,31 @@ mod tests {
 
         // Visible, attributed, and final: the notice carries the reason, the
         // conversation is over, and nothing auto-retries against a dead socket.
-        assert!(model.notice.as_deref().unwrap().contains("broken pipe"));
+        assert!(model.notice_text().unwrap().contains("broken pipe"));
+        // A lost link is PAM-independent, but it is a failure, so it is styled
+        // as one rather than as an aside.
+        assert_eq!(model.notices[0].kind, NoticeKind::Error);
         assert!(!model.authenticated);
         assert!(model.conversation_over);
         assert!(!model.should_auto_retry());
         assert_ne!(model.revision, before, "the UI would never repaint");
+    }
+
+    #[test]
+    fn a_lost_link_leaves_no_retry_to_offer() {
+        // The defect this guards: the form ended a lost link with "Press Enter
+        // to try again", but Link::pump returns early forever once it has
+        // failed, so Enter provably could not reach wdm.
+        let mut model = Model::default();
+        assert!(!model.link_dead, "a live link can be retried");
+
+        model.link_lost("broken pipe");
+        assert!(model.link_dead);
+
+        // And starting an attempt does not resurrect it: begin_attempt clears
+        // what the attempt owned, and the socket is not that.
+        model.begin_attempt();
+        assert!(model.link_dead);
     }
 
     fn model_with_sessions() -> Model {
@@ -547,14 +782,100 @@ mod tests {
         // PAM splits a lockout across two messages; keeping only the last one
         // loses the half that says why.
         let mut model = Model::default();
-        model.push_notice("The account is locked.".to_owned());
-        model.push_notice("(10 minutes left to unlock)".to_owned());
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        model.push_notice(NoticeKind::Info, "(10 minutes left to unlock)".to_owned());
 
-        let notice = model.notice.as_deref().unwrap();
-        assert!(notice.contains("locked"), "{notice}");
-        assert!(notice.contains("10 minutes"), "{notice}");
+        // The exact string, because the separator is the whole point: the two
+        // halves are one sentence and must read as one.
+        let notice = model.notice_text().unwrap();
+        assert_eq!(notice, "The account is locked. (10 minutes left to unlock)");
         // And a notice always suppresses the retry that would scroll it away.
         model.conversation_over = true;
         assert!(!model.should_auto_retry());
+    }
+
+    #[test]
+    fn no_notices_is_none_rather_than_empty() {
+        // The GTK greeter does set_visible(notice.is_some()), so a Some("")
+        // here would show a blank notice row on every screen from boot.
+        assert_eq!(Model::default().notice_text(), None);
+    }
+
+    #[test]
+    fn every_prompt_style_routes_where_pam_meant_it_to() {
+        use wdm_greeter_v1::PromptStyle;
+
+        // All four, against the routing the dispatch arm actually performs —
+        // not against a pattern restated in the test, which the previous
+        // version of this did and which stayed green however the arm was
+        // widened.
+        //
+        // Swapping the first two renders a locked account as a red failure and
+        // "10 minutes left" as a grey aside in both toolkit greeters. Routing
+        // either of the last two to a notice swallows the password box, and
+        // the user faces a login screen with nothing to type into.
+        assert_eq!(
+            Routed::from(PromptStyle::Info),
+            Routed::Notice(NoticeKind::Info),
+        );
+        assert_eq!(
+            Routed::from(PromptStyle::Error),
+            Routed::Notice(NoticeKind::Error),
+        );
+        assert_eq!(
+            Routed::from(PromptStyle::Secret),
+            Routed::Prompt { secret: true },
+        );
+        // Visible is a prompt too, but the answer is echoed: it is PAM asking
+        // for a one-time token or a username, not a password.
+        assert_eq!(
+            Routed::from(PromptStyle::Visible),
+            Routed::Prompt { secret: false },
+        );
+
+        // And these are the strings a WebKit theme branches on; changing either
+        // breaks every theme, so they are pinned here rather than only by a
+        // substring search in another crate.
+        assert_eq!(NoticeKind::Info.as_str(), "info");
+        assert_eq!(NoticeKind::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn clearing_the_notices_is_visible_to_someone_counting_them() {
+        // The defect this guards: the WebKit bridge kept an index into
+        // `notices` and detected a clear by comparing lengths. auth_ok clears
+        // while the phase is still Launching, Link::pump drains the whole
+        // batch before the diff runs, and pam_open_session's messages land in
+        // that same batch — one reported, one present, no change seen, and the
+        // password-expiry warning, the motd and the last-login line all lost.
+        let mut model = Model::default();
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        let start = model.notices_generation;
+
+        // Appending is not a replacement: a consumer's index stays valid.
+        model.push_notice(NoticeKind::Info, "(10 minutes left)".to_owned());
+        assert_eq!(model.notices_generation, start, "a push is not a clear");
+
+        // Both clear sites bump it.
+        model.begin_attempt();
+        let after_attempt = model.notices_generation;
+        assert_ne!(after_attempt, start, "begin_attempt cleared the list");
+
+        // What a consumer has reported at this point: one notice, at this
+        // generation.
+        model.push_notice(NoticeKind::Error, "Authentication failure".to_owned());
+        let reported = (model.notices.len(), model.notices_generation);
+
+        // Then the clear and the refill that lengths cannot tell apart, both
+        // inside one pump.
+        model.auth_ok();
+        model.push_notice(NoticeKind::Info, "Your password expires today.".to_owned());
+
+        assert_eq!(model.notices.len(), reported.0, "the length is no help");
+        assert_ne!(
+            model.notices_generation, reported.1,
+            "the generation is what says the list was replaced, not appended to",
+        );
+        assert_ne!(model.notices_generation, after_attempt);
     }
 }
