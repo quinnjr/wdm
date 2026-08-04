@@ -128,11 +128,12 @@
       <arg name="env" type="array"
            summary="additional NUL-separated KEY=VALUE entries for the session.
                     Filtered, not merged wholesale: only LANG, LANGUAGE, LC_*
-                    and XKB_* are honoured, values containing / or NUL are
-                    rejected, and anything else is dropped silently — no event,
-                    no error. The session runs as the authenticated user through
-                    a login shell, so an unfiltered environment would be code
-                    execution as that user."/>
+                    and XKB_* are honoured, values containing / are rejected, as
+                    are values longer than 64 bytes, and anything else is
+                    dropped silently — no event, no error. The session runs as
+                    the authenticated user through a login shell, so an
+                    unfiltered environment would be code execution as that
+                    user."/>
     </request>
 
     <event name="user">

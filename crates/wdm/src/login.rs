@@ -209,8 +209,15 @@ impl Login {
     }
 
     /// Record why the previous launch failed, for the next greeter to display.
-    pub fn set_last_error(&mut self, error: Option<String>) {
-        self.last_error = error;
+    ///
+    /// Set only: there is deliberately no way to spell "clear" here. Clearing is
+    /// [`Login::begin_attempt`]'s alone, because that is the one moment where the
+    /// user has visibly moved on from the failure. A caller with nothing to
+    /// report must not call this at all — an overwrite with an empty reason would
+    /// discard why the last session died before anyone had read it, and every
+    /// restart path that has nothing to add reaches here.
+    pub fn set_last_error(&mut self, error: String) {
+        self.last_error = Some(error);
     }
 
     /// Reset conversation state, used when the greeter is restarted.
@@ -898,9 +905,39 @@ mod tests {
     #[test]
     fn starting_an_attempt_clears_the_previous_launch_error() {
         let mut login = login();
-        login.set_last_error(Some("session died".to_owned()));
+        login.set_last_error("session died".to_owned());
         login.begin_attempt();
         assert!(login.last_error.is_none());
+    }
+
+    #[test]
+    fn a_recorded_error_survives_a_restart_that_has_nothing_to_add() {
+        // The restart paths that carry no reason of their own — a greeter that
+        // dies before it ever binds, the "session opened with no session chosen"
+        // path — must leave the recorded reason alone, or the user is bounced
+        // back to a login prompt with no explanation for why their session went
+        // away. The invariant used to live only in backend::restart_greeter's
+        // `if error.is_some()` guard, a file away from the field it protects;
+        // set_last_error now cannot express "clear" at all, and this is the test
+        // that says so from the side that owns the state.
+        let mut login = login();
+        login.set_last_error("session exited immediately".to_owned());
+
+        // Everything a greeter respawn does to this state, short of a new attempt.
+        login.reset();
+        login.clear_bindings();
+
+        assert_eq!(
+            login.last_error.as_deref(),
+            Some("session exited immediately"),
+            "the reason the session died was discarded before anyone saw it"
+        );
+
+        login.begin_attempt();
+        assert!(
+            login.last_error.is_none(),
+            "begin_attempt is the one place that clears it"
+        );
     }
 
     #[test]
@@ -974,6 +1011,12 @@ mod tests {
 
         impl Args<'_> {
             pub fn uint(&mut self) -> u32 {
+                assert!(
+                    self.pos + 4 <= self.data.len(),
+                    "message body ended mid-argument: wanted 4 bytes at {}, body is {} bytes",
+                    self.pos,
+                    self.data.len()
+                );
                 let word = self.data[self.pos..self.pos + 4].try_into().unwrap();
                 self.pos += 4;
                 u32::from_ne_bytes(word)
@@ -986,6 +1029,12 @@ mod tests {
                 let text = if len == 0 {
                     String::new()
                 } else {
+                    assert!(
+                        self.pos + len <= self.data.len(),
+                        "message body ended mid-string: declared {len} bytes at {}, body is {} bytes",
+                        self.pos,
+                        self.data.len()
+                    );
                     String::from_utf8_lossy(&self.data[self.pos..self.pos + len - 1]).into_owned()
                 };
                 self.pos += len.next_multiple_of(4);
@@ -1060,6 +1109,16 @@ mod tests {
                     let word = u32::from_ne_bytes(data[pos + 4..pos + 8].try_into().unwrap());
                     let size = (word >> 16) as usize;
                     let opcode = (word & 0xffff) as u16;
+                    // Payloads here are tens of bytes and fit any socket buffer,
+                    // so this cannot fire today. It is here because when a future
+                    // change does push a flush past the buffer, the bare slice
+                    // panicked with a range error three frames away that named
+                    // neither the test nor the truncation.
+                    assert!(
+                        size >= 8 && pos + size <= data.len(),
+                        "truncated wayland message: declared {size} bytes, {} available",
+                        data.len() - pos
+                    );
                     self.received.push(Message {
                         object,
                         opcode,
@@ -1181,6 +1240,32 @@ mod tests {
             self.dispatch();
             client.pump();
             client
+        }
+    }
+
+    #[test]
+    fn the_wire_opcodes_still_match_the_generated_bindings() {
+        // `mod wire` hardcodes event opcodes positionally, and the sharpest
+        // assertion in this file is a *negative* one: that no default_session
+        // event reached a version 1 greeter. Insert an event ahead of it in the
+        // XML and that test goes green while checking nothing. The generated
+        // bindings already carry the real table, so pin against it here rather
+        // than trusting the numbers to stay true by themselves.
+        let events = <WdmGreeterV1 as Resource>::interface().events;
+        for (op, name) in [
+            (wire::USER, "user"),
+            (wire::DONE, "done"),
+            (wire::AUTH_OK, "auth_ok"),
+            (wire::DEFAULT_SESSION, "default_session"),
+        ] {
+            assert_eq!(
+                events
+                    .get(op as usize)
+                    .unwrap_or_else(|| panic!("no event at opcode {op}"))
+                    .name,
+                name,
+                "opcode {op} is no longer {name}"
+            );
         }
     }
 

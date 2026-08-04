@@ -9,10 +9,9 @@ After=systemd-user-sessions.service plymouth-quit-wait.service
 # third-party greeter wedges. Conflicts=getty@tty1.service would stop that getty
 # and take the recovery console away, so it is not shipped even inert.
 #
-# This describes the default, not an invariant: `vt` is a configuration key
-# (/etc/wdm/wdm.toml). Setting it to a VT a getty uses — 1 through 6 — needs a
-# drop-in adding Conflicts=getty@ttyN.service and After=getty@ttyN.service for
-# that N, or wdm and the getty contend for the same VT with nothing arbitrating.
+# That describes the default, not an invariant: `vt` is configurable, and moving
+# wdm onto a getty's VT without the drop-in wdm(1) describes leaves the two
+# contending for it with nothing arbitrating.
 
 # Past the limit wdm stays down rather than flickering forever; tty1 still
 # works. These belong in [Unit] -- systemd ignores them under [Service], which

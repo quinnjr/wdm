@@ -139,7 +139,22 @@ const THEME_ROOT: &str = "/usr/share/wdm/webkit-greeter/themes";
 
 /// See `wdm-gtk-greeter`: GDK owns the connection's fd and reads from it, so
 /// the queue is polled rather than watched.
-const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+pub(crate) const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// The status a greeter exits with when its theme has stopped answering.
+///
+/// Distinct from plain failure because the two need different treatment from
+/// wdm's supervisor. Silence takes `WEDGED_AFTER × VERDICT_DEADLINE` pump ticks
+/// to establish — around half a minute — which is well outside the supervisor's
+/// rapid-failure window, so an exit for this reason looks like a greeter that
+/// ran fine and then stopped, and *resets* the failure count. The give-up
+/// screen is then unreachable and the login screen reloads every half minute
+/// forever.
+///
+/// So: an exit with this status means the greeter is not going to recover by
+/// being restarted, and wdm should count it as a rapid failure regardless of
+/// how long the process had been up.
+const WEDGED_EXIT: u8 = 69;
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::new().filter("WDM_GREETER_LOG")).init();
@@ -154,15 +169,17 @@ fn main() -> ExitCode {
     log::info!("theme: {}", theme.display());
 
     let app = Application::builder().application_id(APP_ID).build();
-    let failed = Rc::new(std::cell::Cell::new(false));
+    // Zero is success; anything else is the status to exit with, which is how
+    // the wedged case reports itself as something other than plain failure.
+    let failure = Rc::new(std::cell::Cell::new(0u8));
 
     app.connect_activate({
-        let failed = failed.clone();
+        let failure = failure.clone();
         let theme = theme.clone();
         move |app| {
-            if let Err(e) = activate(app, &theme, failed.clone()) {
+            if let Err(e) = activate(app, &theme, failure.clone()) {
                 log::error!("{e}");
-                failed.set(true);
+                failure.set(1);
                 app.quit();
             }
         }
@@ -171,10 +188,10 @@ fn main() -> ExitCode {
     // Arguments are ours, not GTK's — it would try to interpret --theme.
     let status = app.run_with_args::<&str>(&[]);
 
-    if failed.get() || status != glib::ExitCode::SUCCESS {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    match failure.get() {
+        0 if status == glib::ExitCode::SUCCESS => ExitCode::SUCCESS,
+        0 => ExitCode::FAILURE,
+        code => ExitCode::from(code),
     }
 }
 
@@ -244,7 +261,7 @@ fn resolve_theme(name: &str, root: &Path) -> Result<PathBuf, String> {
 fn activate(
     app: &Application,
     theme: &Path,
-    failed: Rc<std::cell::Cell<bool>>,
+    failure: Rc<std::cell::Cell<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let display = gtk4::gdk::Display::default().ok_or("no display")?;
     let (link, model) = Link::connect(&display)?;
@@ -320,8 +337,12 @@ fn activate(
         //
         // A page that has answered nothing for long enough is not coming back
         // on its own, and a greeter process that stays alive in front of a dead
-        // login screen is invisible to wdm's supervisor. Exiting with failure is
-        // what turns it into a respawn, or into wdm's give-up screen.
+        // login screen is invisible to wdm's supervisor. Exiting is what turns
+        // it into a respawn — with [`WEDGED_EXIT`] rather than plain failure,
+        // because establishing silence takes long enough that the supervisor
+        // would otherwise read the exit as a healthy greeter that happened to
+        // stop, reset its failure count, and reload the same broken theme
+        // forever instead of reaching the give-up screen.
         let wedged = {
             let mut bridge = bridge.borrow_mut();
             bridge.tick();
@@ -329,7 +350,7 @@ fn activate(
         };
         if wedged {
             log::error!("the theme has stopped responding; exiting so wdm can respawn the greeter");
-            failed.set(true);
+            failure.set(WEDGED_EXIT);
             app.quit();
             return glib::ControlFlow::Break;
         }
@@ -594,11 +615,15 @@ fn evaluate(webview: &WebView, bridge: &Rc<RefCell<Bridge>>, outbound: &bridge::
             let error = result.as_ref().err().map(|e| e.to_string());
             let mut bridge = bridge.borrow_mut();
             bridge.delivered(epoch, result.is_ok());
-            // Once, not every tick: a page that never recovers is retried
-            // sixty times a second, and sixty warnings a second in the journal
-            // is how a symptom becomes the whole log.
+            // Once per run of trouble, not every tick: a page that never
+            // recovers is retried sixty times a second, and sixty warnings a
+            // second in the journal is how a symptom becomes the whole log.
+            // The bridge is asked rather than its failure count consulted,
+            // because a missed deadline is a failure with no error text to
+            // print and would otherwise spend the budget before this line —
+            // the only one naming the statement that broke — ever ran.
             if let Some(e) = error
-                && bridge.consecutive_failures() == 1
+                && bridge.report_error()
             {
                 log::warn!("theme script: {e}");
             }
@@ -811,6 +836,12 @@ mod tests {
         // the exact drift this is supposed to catch.
         let script = bridge::api_script(&Model::default());
         let theme = theme_code();
+        // The documentation is the third end of the same contract, and the one
+        // that used to be claimed rather than checked: the list below said it
+        // enumerated themes.md's tables while being hardcoded, so renaming a
+        // field in the prose alone passed. Matched on the names themselves, not
+        // on surrounding wording, which is free to change.
+        let doc = include_str!("../../../docs/src/pages/themes.md");
 
         // Every row of themes.md's two tables. State first, then the methods.
         for name in [
@@ -820,6 +851,7 @@ mod tests {
             "authentication_user",
             "is_authenticated",
             "in_authentication",
+            "link_dead",
             // Not in themes.md's table — it is the bridge's own — but the
             // default theme reads it to tell "answer the prompt" from "try
             // again", so it is contract in practice.
@@ -829,11 +861,21 @@ mod tests {
                 script.contains(&format!("{name}:")),
                 "the injected API lost wdm.{name}"
             );
+            if name != "_prompt" {
+                assert!(
+                    doc.contains(&format!("wdm.{name}")),
+                    "themes.md no longer documents wdm.{name}"
+                );
+            }
         }
         for method in ["authenticate", "respond", "cancel", "start_session"] {
             assert!(
                 script.contains(&format!("{method}(")),
                 "the injected API lost wdm.{method}()"
+            );
+            assert!(
+                doc.contains(&format!("wdm.{method}(")),
+                "themes.md no longer documents wdm.{method}()"
             );
         }
 

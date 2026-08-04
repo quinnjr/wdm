@@ -10,21 +10,6 @@ url='https://github.com/quinnjr/wdm'
 license=('MIT')
 makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
              'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell' 'webkitgtk-6.0')
-# wdm needs *a* greeter, and either of the two below satisfies it, so pacman
-# prompts for a choice when only `wdm` is requested. The greeters deliberately
-# do not depend on wdm in return: that would make the pair circular.
-#
-# namcap reports "Split PKGBUILD needs additional makedepends
-# ['wdm-greeter-implementation']" for this. It is a false positive — namcap
-# does not resolve a virtual provided by a sibling package of the same split,
-# and adding it to makedepends would make the package unbuildable, since
-# nothing in the repositories provides it.
-#
-# The virtual is declared only in the three greeter package_*() functions, never
-# at pkgbase level. A pkgbase provides= is inherited by every split package, and
-# `unset provides` in package_wdm() cannot be expressed in .SRCINFO — makepkg
-# emits no clearing line — so a helper resolving from .SRCINFO would see `wdm`
-# providing the virtual it depends on and install no greeter at all.
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('10aff2d22a13ca641839714cebb34e74cc16bca6d188ba19977e93642767d464')
 
@@ -55,6 +40,21 @@ check() {
 }
 
 package_wdm() {
+  # wdm needs *a* greeter, and each of the three below provides the virtual, so
+  # pacman prompts for a choice when only `wdm` is requested. The greeters
+  # deliberately do not depend on wdm in return: that would make the pair
+  # circular. The virtual is declared only in the greeter package_*()
+  # functions, never at pkgbase level — a pkgbase provides= is inherited by
+  # every split package, and `unset provides` here cannot be expressed in
+  # .SRCINFO, since makepkg emits no clearing line, so a helper resolving from
+  # .SRCINFO would see `wdm` providing the virtual it depends on and install no
+  # greeter at all.
+  #
+  # namcap reports "Split PKGBUILD needs additional makedepends
+  # ['wdm-greeter-implementation']" for the dependency below. It is a false
+  # positive — namcap does not resolve a virtual provided by a sibling package
+  # of the same split, and adding it to makedepends would make the package
+  # unbuildable, since nothing in the repositories provides it.
   depends=('libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm' 'libxkbcommon'
            'pam' 'wdm-greeter-implementation')
   backup=('etc/pam.d/wdm' 'etc/wdm/wdm.toml')

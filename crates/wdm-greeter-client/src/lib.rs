@@ -67,10 +67,15 @@ pub struct Session {
 ///
 /// The protocol's `prompt_style` has four entries; `secret` and `visible`
 /// expect an answer and become a [`Prompt`], so only these two land here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Non-exhaustive: a fifth `prompt_style` that expects no answer would force a
+/// third variant here, and an out-of-tree greeter must not need a source change
+/// to keep compiling. The cost today is a `_ =>` arm on out-of-tree matches,
+/// which is the arm they want anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NoticeKind {
     /// `PAM_TEXT_INFO` — an explanation, not a failure.
-    #[default]
     Info,
     /// `PAM_ERROR_MSG` — PAM saying something went wrong. Distinct from
     /// [`Model::error`], which is the conversation's verdict rather than a
@@ -79,8 +84,12 @@ pub enum NoticeKind {
 }
 
 impl NoticeKind {
-    /// The name a greeter shows this under, and the string the WebKit greeter
-    /// hands a theme as `show_message`'s second argument.
+    /// The string `show_message` carries as its second argument, which is how a
+    /// WebKit theme learns whether to style a message as an aside or a failure.
+    ///
+    /// Not every greeter uses it: the GTK greeter has one notice label and
+    /// drops the distinction by design. Changing either string breaks every
+    /// theme that branches on it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
@@ -89,15 +98,40 @@ impl NoticeKind {
     }
 }
 
+/// Which style a no-answer `prompt` becomes.
+///
+/// A free function rather than an `if` buried in the dispatch arm because this
+/// is the single place the info/error distinction is made: everything the two
+/// toolkit greeters do with a notice — grey aside or red failure, and the
+/// `"info"`/`"error"` a WebKit theme branches on — follows from this one
+/// mapping, and it was previously untestable without a live compositor.
+///
+/// Only the two no-answer styles reach it; the dispatch arm sends `secret` and
+/// `visible` to [`Model::prompt`] before ever calling this, so the fallback
+/// exists to satisfy the generated enum's `#[non_exhaustive]` and is never the
+/// answer to a question anyone asked.
+fn notice_kind(style: wdm_greeter_v1::PromptStyle) -> NoticeKind {
+    use wdm_greeter_v1::PromptStyle;
+    match style {
+        PromptStyle::Error => NoticeKind::Error,
+        _ => NoticeKind::Info,
+    }
+}
+
 /// One thing PAM said that expects no answer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Notice {
+    /// Which of PAM's two no-answer styles sent this; a WebKit theme receives
+    /// it as [`NoticeKind::as_str`]'s `"info"` or `"error"`.
     pub kind: NoticeKind,
+    /// The message as PAM wrote it, unmodified — it is the only account of
+    /// itself the stack gives the user.
     pub text: String,
 }
 
 impl Notice {
+    /// One message, ready to push onto [`Model::notices`].
     pub fn new(kind: NoticeKind, text: String) -> Self {
         Self { kind, text }
     }
@@ -135,8 +169,11 @@ pub struct Model {
     pub error: Option<String>,
     /// The `info` and `error` style messages PAM has sent this conversation.
     ///
-    /// Sticky: they survive the end of a conversation and are cleared only when
-    /// the user deliberately starts another attempt. This is where a lockout
+    /// Sticky: they survive the end of a conversation, and exactly two places
+    /// clear them — [`Model::begin_attempt`], where the user has deliberately
+    /// started another attempt and so has read what was there, and `auth_ok`,
+    /// where the conversation succeeded and there is nothing left to explain.
+    /// Nothing else, and no passage of time, empties this. This is where a lockout
     /// notice arrives ("the account is locked, 10 minutes left"), and it is
     /// precisely the text that must not scroll past.
     ///
@@ -205,14 +242,13 @@ impl Model {
         if self.notices.is_empty() {
             return None;
         }
-        let mut joined = String::new();
-        for notice in &self.notices {
-            if !joined.is_empty() {
-                joined.push(' ');
-            }
-            joined.push_str(&notice.text);
-        }
-        Some(joined)
+        Some(
+            self.notices
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 
     /// Clear everything belonging to the previous attempt.
@@ -245,14 +281,19 @@ impl Model {
         self.touch();
     }
 
-    /// Whether another attempt could still reach wdm.
+    /// Whether the Wayland connection is still usable.
+    ///
+    /// Deliberately narrower than it sounds, and named for what it checks: it
+    /// asks about the socket only, not about whether a retry is *sensible* —
+    /// `blocked`, `conversation_over` and the rate limit are
+    /// [`should_auto_retry`](Model::should_auto_retry)'s business.
     ///
     /// The UI ends a conversation by inviting the user to press Enter and try
     /// again. After a lost link that invitation is a lie: `Link::pump` returns
     /// early forever once it has failed, so nothing the form sends leaves the
     /// process and the screen never changes again. The greeter says what is
     /// actually true instead — the session is unreachable from here.
-    pub fn retry_is_possible(&self) -> bool {
+    pub fn link_is_alive(&self) -> bool {
         !self.link_dead
     }
 
@@ -453,12 +494,7 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
                     // Neither expects an answer. Both are PAM explaining
                     // itself, so both stick and both stop the auto-retry.
                     Ok(style @ (PromptStyle::Info | PromptStyle::Error)) => {
-                        let kind = if style == PromptStyle::Error {
-                            NoticeKind::Error
-                        } else {
-                            NoticeKind::Info
-                        };
-                        state.push_notice(kind, text);
+                        state.push_notice(notice_kind(style), text);
                     }
                     Ok(style) => {
                         state.prompt = Some(Prompt {
@@ -607,15 +643,15 @@ mod tests {
         // to try again", but Link::pump returns early forever once it has
         // failed, so Enter provably could not reach wdm.
         let mut model = Model::default();
-        assert!(model.retry_is_possible(), "a live link can be retried");
+        assert!(model.link_is_alive(), "a live link can be retried");
 
         model.link_lost("broken pipe");
-        assert!(!model.retry_is_possible());
+        assert!(!model.link_is_alive());
 
         // And starting an attempt does not resurrect it: begin_attempt clears
         // what the attempt owned, and the socket is not that.
         model.begin_attempt();
-        assert!(!model.retry_is_possible());
+        assert!(!model.link_is_alive());
     }
 
     fn model_with_sessions() -> Model {
@@ -675,11 +711,56 @@ mod tests {
         model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
         model.push_notice(NoticeKind::Info, "(10 minutes left to unlock)".to_owned());
 
+        // The exact string, because the separator is the whole point: the two
+        // halves are one sentence and must read as one.
         let notice = model.notice_text().unwrap();
-        assert!(notice.contains("locked"), "{notice}");
-        assert!(notice.contains("10 minutes"), "{notice}");
+        assert_eq!(notice, "The account is locked. (10 minutes left to unlock)");
         // And a notice always suppresses the retry that would scroll it away.
         model.conversation_over = true;
         assert!(!model.should_auto_retry());
+    }
+
+    #[test]
+    fn no_notices_is_none_rather_than_empty() {
+        // The GTK greeter does set_visible(notice.is_some()), so a Some("")
+        // here would show a blank notice row on every screen from boot.
+        assert_eq!(Model::default().notice_text(), None);
+    }
+
+    #[test]
+    fn no_answer_styles_carry_pams_own_styling() {
+        use wdm_greeter_v1::PromptStyle;
+
+        // The one place the info/error distinction is made. Swapping the two
+        // arms renders a locked account as a red failure and "10 minutes left"
+        // as a grey aside in both toolkit greeters, and until this test existed
+        // the whole workspace still passed.
+        assert_eq!(notice_kind(PromptStyle::Info), NoticeKind::Info);
+        assert_eq!(notice_kind(PromptStyle::Error), NoticeKind::Error);
+
+        // And these are the strings a WebKit theme branches on; changing either
+        // breaks every theme, so they are pinned here rather than only by a
+        // substring search in another crate.
+        assert_eq!(NoticeKind::Info.as_str(), "info");
+        assert_eq!(NoticeKind::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn answer_styles_become_a_prompt_and_never_a_notice() {
+        use wdm_greeter_v1::PromptStyle;
+
+        // Mirrors the dispatch arm's pattern: notice_kind is reached only for
+        // the two no-answer styles, so secret and visible must fall through to
+        // state.prompt. If someone widens that pattern to catch them, this
+        // fails rather than the greeter quietly swallowing the password box.
+        for (style, masked) in [(PromptStyle::Secret, true), (PromptStyle::Visible, false)] {
+            assert!(
+                !matches!(style, PromptStyle::Info | PromptStyle::Error),
+                "{style:?} would be routed to notice_kind",
+            );
+            // And of the two, only secret is masked — the handler's `secret:`
+            // expression, which shares this fall-through arm.
+            assert_eq!(style == PromptStyle::Secret, masked, "{style:?}");
+        }
     }
 }

@@ -16,15 +16,29 @@ if [ "$1" = configure ]; then
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf \
         || echo "wdm: creating /var/lib/wdm and /var/empty failed; the greeter will not spawn" >&2
 
+    # The authoritative statement of why this runs. The rpm scriptlet in
+    # crates/wdm/Cargo.toml and aur/wdm.install do the same thing and point
+    # here rather than repeating it.
+    #
     # systemd-sysusers never modifies an account that already exists, so a
     # machine that installed 0.1.x keeps the greeter's home at /var/lib/wdm
     # forever — the directory root creates and renames files in, which is
     # exactly what the home was moved out of. Guarded on the old value so it is
     # idempotent and so an administrator who chose a different home is left
     # alone.
+    #
+    # Guarded on the destination existing as well, because usermod is not given
+    # -m and does not check: if the tmpfiles call above failed, moving the home
+    # anyway would leave /etc/passwd naming a directory that is not there, and
+    # wdm chdirs into it before exec, so the greeter would never spawn — while
+    # usermod itself succeeded and said nothing.
     if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
-        usermod -d /var/empty wdm \
-            || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+        if [ -d /var/empty ]; then
+            usermod -d /var/empty wdm \
+                || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+        else
+            echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+        fi
     fi
 
     # Make the freshly installed unit visible to systemd, so that a

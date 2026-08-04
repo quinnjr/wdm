@@ -73,20 +73,34 @@ license = "MIT"
 # greeter-owned state directory this release stops creating would survive the
 # upgrade that fixes it. Guarded and non-fatal: a container image built with
 # rpm and no systemd must still install.
+# Failures are reported rather than discarded, the same as the deb's postinst
+# and for the same reason: these calls decide whether wdm can start at all, and
+# swallowing them leaves an administrator with a display manager that fails for
+# no visible reason. Non-fatal all the same — an install must not abort.
 post_install_script = '''
 if [ -x /usr/bin/systemd-sysusers ]; then
-    /usr/bin/systemd-sysusers /usr/lib/sysusers.d/wdm.conf || :
+    /usr/bin/systemd-sysusers /usr/lib/sysusers.d/wdm.conf \
+        || echo "wdm: creating the wdm account failed; wdm.service will not start" >&2
 fi
 if [ -x /usr/bin/systemd-tmpfiles ]; then
-    /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf || :
+    /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/wdm.conf \
+        || echo "wdm: creating /var/lib/wdm and /var/empty failed; the greeter will not spawn" >&2
 fi
-# systemd-sysusers never modifies an account that already exists, so a machine
-# that installed 0.1.x keeps the greeter's home at /var/lib/wdm forever — the
-# directory root creates and renames files in, which is exactly what the home
-# was moved out of. Guarded on the old value so it is idempotent and so an
-# administrator who chose a different home is left alone.
+# Moves the greeter's home off /var/lib/wdm on a machine that installed 0.1.x.
+# Why, and why both guards, is written out once in packaging/deb/postinst.
 if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
-    usermod -d /var/empty wdm || :
+    if [ -d /var/empty ]; then
+        usermod -d /var/empty wdm \
+            || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+    else
+        echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+    fi
+fi
+# The flip side of config = "noreplace" below: a customised stack is kept, so a
+# future security fix to the wdm PAM stack lands beside it and never applies
+# until someone merges it by hand.
+if [ -f /etc/pam.d/wdm.rpmnew ]; then
+    echo "wdm: /etc/pam.d/wdm.rpmnew was left beside your PAM stack; it may contain authentication changes that are not in effect until merged" >&2
 fi
 '''
 assets = [
@@ -116,6 +130,8 @@ mesa-libgbm = "*"
 mesa-libEGL = "*"
 libxkbcommon = "*"
 pam = "*"
+# The post-install scriptlet calls getent and usermod.
+shadow-utils = "*"
 # dnf can choose between providers of a virtual, so this one stays as it is in
 # the Arch package.
 wdm-greeter-implementation = "*"

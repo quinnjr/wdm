@@ -84,8 +84,15 @@ the launch fails the greeter is relaunched and told why through `last_error`.
 
 `env` is a `wl_array` of NUL-separated `NAME=VALUE` entries. It is **filtered**:
 only `LANG`, `LANGUAGE`, `LC_*` and `XKB_*` are honoured, values containing `/`
-or NUL are rejected, and everything the greeter supplies is applied *before*
-wdm's own session variables so it cannot contradict a fact about the seat.
+are rejected, as are values longer than 64 bytes, and everything that survives
+is applied *before* wdm's own session variables so the greeter cannot contradict
+a fact about the seat.
+
+Filtering is **silent, and not an error**. An entry that is well formed but does
+not survive the filter is dropped with no event and no protocol error —
+`invalid_env` is about the array being malformed, not about its contents being
+unwelcome. A greeter cannot tell which of its entries were kept, so it should
+not depend on any of them arriving.
 
 A greeter is unprivileged but the session runs as the authenticated user through
 a login shell, so an unfiltered environment would be arbitrary code execution as
@@ -99,7 +106,7 @@ that user.
 | `no_auth` | `respond` or `start_session` outside an authenticated state. |
 | `stale_prompt` | `respond` carried an id that is not the pending prompt. |
 | `invalid_session` | `start_session` named a session that was never advertised. |
-| `invalid_env` | The `env` array is malformed. |
+| `invalid_env` | The `env` array is not NUL-separated `NAME=VALUE` entries with `NAME` matching `[A-Za-z0-9_]+`. A well-formed entry the filter drops is **not** an error. |
 | `already_bound` | A second `wdm_greeter_v1` object was bound while one is still alive. |
 
 ## Output ranking

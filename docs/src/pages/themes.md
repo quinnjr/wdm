@@ -41,16 +41,41 @@ works and there is no ready callback to wait for.
 | `wdm.authentication_user` | who the current conversation is for, or `null` |
 | `wdm.is_authenticated` | whether the last conversation succeeded |
 | `wdm.in_authentication` | whether one is in progress |
+| `wdm.link_dead` | true once the connection to wdm is gone; it never becomes false again |
+| `wdm._prompt` | the pending prompt's text, or `null` — the underscore marks it as owned by the bridge rather than part of the API's shape, but a theme may read it |
+
+`wdm._prompt` is what lets a theme tell "answer the question on screen" from
+"start again": the default theme reads it to decide whether Enter should submit
+a response or restart the conversation. It is asserted by a drift test, so it is
+contract even though it is spelled as private.
+
+`wdm.link_dead` latches. When it is true, nothing a theme sends reaches wdm —
+`respond` and `start_session` post into a dead socket and are silently lost —
+so a theme should stop offering a retry and say where to go instead: the shipped
+theme's wording is "Connection to wdm lost — switch to a text console", matching
+the GTK greeter. Retrying is worse than useless here, because the retry
+typically clears the very message that explains the silence. A theme written
+before the field existed sees `undefined`, so read it defensively:
+
+```js
+if (typeof wdm.link_dead !== "undefined" && wdm.link_dead) { /* … */ }
+```
 
 | Method | |
 |---|---|
 | `wdm.authenticate(username)` | start a conversation, ending any live one |
 | `wdm.respond(text)` | answer the pending prompt |
 | `wdm.cancel()` | abandon the conversation |
-| `wdm.start_session(id)` | log in; only valid once authenticated |
+| `wdm.start_session(id?)` | log in; only valid once authenticated |
 
 Calling these out of order throws, so a mistake shows up in your theme as an
 exception rather than as a protocol error that gets the greeter killed.
+
+`start_session`'s argument is optional: omitted, it falls back to
+`wdm.sessions[0]`. If neither resolves — no id given and no session installed on
+the machine — it **throws** rather than returning quietly, so a theme cannot
+show a login in progress that was never going to happen. Catch it and say the
+machine has nothing to log into.
 
 ## The callbacks
 
@@ -73,8 +98,19 @@ them one at a time and often splits one explanation across two — "the account 
 locked" as an error, "10 minutes left to unlock" as info — so they arrive as
 separate calls rather than one joined line. A theme that wants to style them
 differently can; one that does not can ignore `kind` and append them all to the
-same element. The verdict of the attempt is reported separately, as `"error"`,
-after every message belonging to it.
+same element.
+
+The verdict of the attempt arrives through **the same callback**, as one more
+`show_message` with kind `"error"`, after every message belonging to the
+attempt. There is no separate channel for it. This is why a handler that
+*assigns* — `el.textContent = text` — rather than appending loses the
+explanation: the verdict is the last message sent, it overwrites everything
+before it, and "Authentication failure" on its own tells the user nothing they
+can act on.
+
+Callbacks may be delivered **more than once** for the same event. The greeter
+re-delivers when a page is slow to answer, so a theme must tolerate a repeat
+rather than counting calls or toggling state on each one.
 
 ## What a theme is responsible for
 

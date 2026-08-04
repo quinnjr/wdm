@@ -125,8 +125,11 @@ fn prepare(data: &mut LoopData, request: LaunchRequest) -> Option<Launch> {
 /// restart has nothing to add", not "forget what was recorded": a greeter that
 /// dies before it ever binds restarts with no error of its own, and overwriting
 /// here would discard the reason the session failed before anyone had seen it.
-/// The error is cleared where it has served its purpose — [`crate::login::Login::begin_attempt`],
-/// once the user has moved on to a new attempt.
+/// That is why the `None` arm skips the setter rather than passing it along:
+/// [`crate::login::Login::set_last_error`] takes a `String` and cannot express
+/// "clear". The error is cleared where it has served its purpose —
+/// [`crate::login::Login::begin_attempt`], once the user has moved on to a new
+/// attempt.
 pub fn restart_greeter(
     data: &mut LoopData,
     loop_handle: &LoopHandle<'static, LoopData>,
@@ -137,7 +140,7 @@ pub fn restart_greeter(
     data.state.login.reset();
     // The old greeter's objects belong to a connection that is gone.
     data.state.login.clear_bindings();
-    if error.is_some() {
+    if let Some(error) = error {
         data.state.login.set_last_error(error);
     }
     // Surfaces belonging to the dead greeter must go, or they keep being

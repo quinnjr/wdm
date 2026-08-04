@@ -169,7 +169,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let reason =
                             format!("session exited immediately ({status}) after {ran_for:?}");
                         log::error!("{reason}");
-                        data.state.login.set_last_error(Some(reason));
+                        data.state.login.set_last_error(reason);
                     }
                     Ok(status) => log::info!("session for {username} exited: {status}"),
                     Err(e) => log::error!("waiting for session: {e}"),
@@ -178,7 +178,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 let reason = format!("could not start session: {e}");
                 log::error!("{reason}");
-                data.state.login.set_last_error(Some(reason));
+                data.state.login.set_last_error(reason);
                 data.state.login.end_session();
             }
         }
@@ -188,7 +188,26 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // to a connection that is gone, and relying on its destroyed() being
         // dispatched before the next greeter binds is timing, not a guarantee.
         data.state.login.clear_bindings();
-        data.state.running = true;
+
+        // Signals arrive on a signalfd that only event_loop.dispatch reads, and
+        // the loop has not been running for as long as the user's session
+        // lasted — which can be hours. A SIGTERM that arrived in that window is
+        // still pending here, and starting the next generation before reading it
+        // would grab the seat, VT_ACTIVATE back to wdm's VT and flash a greeter
+        // at someone who asked wdm to stop, while systemd waits out
+        // TimeoutStopSec and then SIGKILLs. One non-blocking pass lets the
+        // handler speak first. Sources belonging to the released generation are
+        // gone by now, so this pass sees only the long-lived ones.
+        if let Err(e) = event_loop.dispatch(Some(Duration::ZERO), &mut data) {
+            log::error!("draining pending signals: {e}");
+        }
+        if !data.state.running {
+            // The greeter is already dead and the seat released; Drop does the
+            // rest as `data` goes out of scope.
+            log::info!("shutting down");
+            return Ok(());
+        }
+
         log::info!("taking the seat back");
     }
 }

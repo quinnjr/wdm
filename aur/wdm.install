@@ -15,14 +15,16 @@ post_install() {
 }
 
 post_upgrade() {
-	# systemd-sysusers never modifies an account that already exists, so a
-	# machine that installed 0.1.x keeps the greeter's home at /var/lib/wdm
-	# forever — the directory root creates and renames files in, which is
-	# exactly what the home was moved out of. Guarded on the old value so it
-	# is idempotent and so an administrator who chose a different home is
-	# left alone.
+	# Moves the greeter's home off /var/lib/wdm on a machine that installed
+	# 0.1.x. Why, and why both guards, is written out once in
+	# packaging/deb/postinst.
 	if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
-		usermod -d /var/empty wdm || :
+		if [ -d /var/empty ]; then
+			usermod -d /var/empty wdm \
+				|| echo "wdm: could not move the wdm account's home to /var/empty" >&2
+		else
+			echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+		fi
 	fi
 
 	post_install

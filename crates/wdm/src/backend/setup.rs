@@ -127,6 +127,15 @@ pub fn build(
     // winit — so a `systemctl stop wdm` or a Ctrl-C in a development session
     // takes the default disposition, never runs Greeter's Drop, and leaves the
     // greeter and its process group orphaned until SIGKILL.
+    //
+    // Signals::new blocks these signals on the calling thread with
+    // pthread_sigmask, which is how calloop makes the signalfd the only reader.
+    // A blocked mask is inherited by fork *and survives exec*, so every child
+    // wdm spawns from this thread would otherwise start life unable to receive
+    // SIGTERM or SIGINT: the greeter would ignore the handoff's grace period,
+    // and the user's whole session would be unkillable by loginctl, systemd
+    // shutdown, or Ctrl-C. Both pre_exec closures — supervise.rs's greeter
+    // spawn and session.rs's Launch::spawn — clear the mask for this reason.
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
     loop_handle.insert_source(signals, |event, _, data: &mut LoopData| {
         log::info!("caught {:?}, shutting down", event.signal());

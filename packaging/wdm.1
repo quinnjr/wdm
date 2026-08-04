@@ -230,6 +230,14 @@ PAM stack.
 .B Authentication fails until this exists;
 an "Authentication failure" on the greeter with no PAM file installed is
 expected and is not a bug.
+.IP
+The packages keep a locally modified stack across an upgrade rather than
+replacing it, so a changed stack is delivered alongside as
+.I /etc/pam.d/wdm.rpmnew
+or
+.I /etc/pam.d/wdm.dpkg\-dist
+and has no effect until it is merged by hand. Since a change here can be an
+authentication fix, check for one after upgrading.
 .TP
 .I /var/lib/wdm/last-session
 Per\-user record of the last session launched, reported to the greeter so it can

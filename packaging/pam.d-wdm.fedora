@@ -16,16 +16,24 @@
 # login-capable Fedora service brackets its own. `close` runs first and resets
 # any exec context inherited from wdm; `open` computes the context the user's
 # session should run in and arms setexeccon(3) for the exec that follows, so it
-# has to come before system-auth rather than after. Without the pair, the
-# session wdm forks stays in wdm's own domain: confined logins (staff_u,
-# guest_u, xguest_u) would be silently unconfined and MCS separation would not
-# apply — on a distribution that ships SELinux enforcing.
+# has to come before system-auth rather than after.
 #
 # pam_keyinit is listed after pam_selinux open and pam_namespace, which is where
 # Fedora's own login and sshd stacks put it: the session keyring is created with
 # the exec context already computed. Running it earlier is not known to break
 # anything, but this file cannot be tested from the machine it is written on, so
 # it follows the ordering the distribution ships rather than an improvised one.
+#
+# ponytail: the bracket is inert as wdm currently forks. Both pam_selinux open
+# and pam_keyinit set *per-thread* state — the armed exec context and the joined
+# session keyring — and wdm runs pam_open_session on its PAM thread while
+# forking the session from the main one. fork(2) copies only the calling thread,
+# so neither reaches the session: a confined login (staff_u, guest_u, xguest_u)
+# is still unconfined and MCS separation does not apply, on a distribution that
+# ships SELinux enforcing. The modules stay because they are correct for the day
+# that changes. The upgrade path is either to fork the session from the PAM
+# thread, or to re-apply setexeccon(3) and keyctl_join_session_keyring(3) in the
+# forking thread after pam_open_session returns.
 
 auth        substack    system-auth
 -auth       optional    pam_gnome_keyring.so

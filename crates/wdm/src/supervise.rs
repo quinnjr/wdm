@@ -16,6 +16,20 @@ use uzers::os::unix::UserExt;
 /// rather than as a long-running greeter that happened to crash.
 const RAPID_FAILURE: Duration = Duration::from_secs(10);
 
+/// Exit status a greeter uses to say it gave up on its own page rather than
+/// failing to start.
+///
+/// It is counted against the restart budget whatever the uptime, because the
+/// thing it reports takes longer to detect than [`RAPID_FAILURE`] allows: the
+/// webkit greeter waits about half a minute before deciding a silent web
+/// process is never going to answer, and a greeter that respawned into the same
+/// wedge every thirty seconds would look like a healthy one restarting rather
+/// than a machine nobody can log into. Without this, the give-up screen is
+/// unreachable on that path.
+///
+/// Kept in step with `WEDGED_EXIT` in `wdm-webkit-greeter`.
+const GAVE_UP_EXIT: i32 = 69;
+
 /// Consecutive rapid failures before wdm stops trying.
 ///
 /// Restarting forever would leave a flickering black screen with no indication
@@ -243,9 +257,26 @@ impl Greeter {
         // its pid doubles as its process group id and kill() can signal the
         // whole group — greeters fork helpers (WebKit web processes, wrapper
         // scripts) that must not outlive the greeter into the user's session.
-        // SAFETY: runs in the forked child; a single libc call, no allocation.
+        // SAFETY: runs in the forked child; only libc calls on stack data, no
+        // allocation.
         unsafe {
             command.pre_exec(|| {
+                // First, before anything else: calloop's signal source blocks
+                // SIGTERM and SIGINT on wdm's thread so its signalfd is the only
+                // reader, and a blocked mask is inherited across both fork and
+                // exec. A greeter started with them blocked cannot receive the
+                // SIGTERM kill() sends before the handoff, so every login would
+                // burn the full grace period and end in SIGKILL — while wdm is
+                // dropping DRM master.
+                let mut empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                // pthread_sigmask returns the error number rather than setting
+                // errno, so it is reported directly.
+                let rc = libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                if rc != 0 {
+                    return Err(std::io::Error::from_raw_os_error(rc));
+                }
+
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -314,7 +345,18 @@ impl Greeter {
     pub fn poll(&mut self) -> Option<Disposition> {
         let child = self.child.as_mut()?;
 
-        match child.try_wait() {
+        // waitpid can be interrupted by a signal, and wdm takes signals — the
+        // VT-switch chord and calloop's signalfd both arrive asynchronously.
+        // EINTR says nothing about the greeter, so retrying once keeps a
+        // transient interruption from being charged to the restart budget as a
+        // rapid failure. One retry, not a loop: a handle that is genuinely
+        // unwaitable must still reach the branch below rather than spin.
+        let waited = match child.try_wait() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => child.try_wait(),
+            other => other,
+        };
+
+        match waited {
             Ok(Some(status)) => {
                 self.child = None;
                 // A crashed greeter leaves its helpers behind just as surely as
@@ -324,24 +366,37 @@ impl Greeter {
                 Some(self.note_exit(status))
             }
             Ok(None) => None,
-            Err(e) => {
-                // The child is unwaitable, which means the handle is useless.
-                // Treat it as an exit so wdm does not wait on it forever.
-                //
-                // Not routed through note_exit with a fabricated status: there
-                // is no status, and inventing a successful one would put
-                // "greeter exited cleanly" on the give-up screen, contradicting
-                // the error logged beside it. Like note_spawn_failure, this
-                // counts as a rapid failure whatever the greeter's uptime was —
-                // an unwaitable handle says nothing about how long the process
-                // lived, so the elapsed time is discarded rather than trusted.
-                log::error!("waiting on greeter: {e}");
-                self.child = None;
-                self.sweep_group();
-                self.started = None;
-                Some(self.record_failure(true, format!("could not be waited for: {e}")))
-            }
+            Err(e) => Some(self.note_unwaitable(&e)),
         }
+    }
+
+    /// Record a greeter whose handle can no longer be waited on.
+    ///
+    /// Treated as an exit so wdm does not wait on it forever, but deliberately
+    /// not routed through [`Self::note_exit`] with a fabricated status: there is
+    /// no status, and inventing a successful one would put "greeter exited
+    /// cleanly" on the give-up screen, contradicting the error logged beside it.
+    /// Like [`Self::note_spawn_failure`], this counts as a rapid failure
+    /// whatever the greeter's uptime was — an unwaitable handle says nothing
+    /// about how long the process lived, so the elapsed time is discarded
+    /// rather than trusted.
+    ///
+    /// A seam of its own rather than an arm of `poll`, because the Err arm
+    /// cannot be provoked from a test with a real child, and an inlined arm is
+    /// a branch nothing can pin.
+    fn note_unwaitable(&mut self, e: &std::io::Error) -> Disposition {
+        log::error!("waiting on greeter: {e}");
+        let child = self.child.take();
+        self.sweep_group();
+        // sweep_group has already SIGKILLed the group, so this cannot block for
+        // long, and it is what keeps the leader from sitting as a zombie for the
+        // rest of wdm's life — dropping the handle never reaps. Same reasoning
+        // as the wait() after the escalation in kill().
+        if let Some(mut child) = child {
+            let _ = child.wait();
+        }
+        self.started = None;
+        self.record_failure(true, format!("could not be waited for: {e}"))
     }
 
     /// SIGKILL whatever is left of the greeter's process group after the leader
@@ -370,7 +425,8 @@ impl Greeter {
     /// Record an exit and decide whether to restart.
     fn note_exit(&mut self, status: ExitStatus) -> Disposition {
         let ran_for = self.started.take().map(|t| t.elapsed());
-        let rapid = ran_for.is_none_or(|d| d < RAPID_FAILURE);
+        let rapid = status.code() == Some(GAVE_UP_EXIT)
+            || ran_for.is_none_or(|d| d < RAPID_FAILURE);
 
         log::warn!(
             "greeter exited ({}) after {:?}",
@@ -654,21 +710,102 @@ mod tests {
 
     #[test]
     fn an_unwaitable_greeter_is_not_reported_as_a_clean_exit() {
-        // poll()'s Err arm cannot be provoked without an unwaitable child, so
-        // this pins the message construction it routes through instead. The
-        // give-up screen shows this text verbatim, and the bug being guarded
-        // against was a fabricated exit status making it read "exited cleanly"
-        // right next to a logged waitpid error.
+        // poll()'s Err arm cannot be provoked with a real child, so it is a seam
+        // of its own and this calls that seam — not a message the test builds
+        // itself, which would pass even with the fix reverted. The bug being
+        // guarded against was a fabricated exit status making the give-up screen
+        // read "exited cleanly" right next to a logged waitpid error.
         let mut g = greeter("/bin/true");
-        let reason = format!("could not be waited for: {}", std::io::Error::from_raw_os_error(libc::ECHILD));
-        g.record_failure(true, reason.clone());
-        g.record_failure(true, reason.clone());
-        let Disposition::GaveUp { reason } = g.record_failure(true, reason) else {
+        let error = std::io::Error::from_raw_os_error(libc::ECHILD);
+
+        // A greeter that has been running for a while: the elapsed time must be
+        // discarded, not trusted, because an unwaitable handle says nothing
+        // about how long the process lived.
+        g.started = Some(Instant::now() - RAPID_FAILURE - Duration::from_secs(1));
+        assert_eq!(
+            g.note_unwaitable(&error),
+            Disposition::Restart(Duration::from_secs(1))
+        );
+        assert!(g.started.is_none(), "started must be cleared");
+        assert_eq!(g.rapid_failures, 1, "must count as a rapid failure");
+
+        g.note_unwaitable(&error);
+        let Disposition::GaveUp { reason } = g.note_unwaitable(&error) else {
             panic!("expected give-up");
         };
         assert!(reason.contains("could not be waited for"), "{reason}");
         assert!(!reason.contains("exited cleanly"), "{reason}");
         assert!(reason.contains("tty1"), "{reason}");
+    }
+
+    /// The signal mask a process has blocked, read from /proc as the child's
+    /// parent cannot otherwise observe it.
+    fn blocked_mask(pid: u32) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("SigBlk:"))
+            .expect("SigBlk in /proc status");
+        u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap()
+    }
+
+    #[test]
+    fn spawned_children_do_not_inherit_a_blocked_signal_mask() {
+        // calloop's Signals source blocks SIGTERM and SIGINT on wdm's thread so
+        // its signalfd is the only reader, and a blocked mask is inherited by
+        // fork *and survives exec*. Without the pthread_sigmask in spawn()'s
+        // pre_exec, the greeter cannot receive the SIGTERM kill() sends before
+        // the handoff — every login would burn the full grace period and end in
+        // SIGKILL — and a user session would be unkillable by loginctl or
+        // systemd shutdown for the same reason.
+        //
+        // Blocking happens on this thread rather than through calloop, and the
+        // child is /bin/sh reporting its own mask rather than a real greeter,
+        // because the property under test is a property of the pre_exec closure
+        // Greeter::spawn installs, which needs neither root nor a compositor.
+
+        // SAFETY: sigaddset/pthread_sigmask on a stack-local set; the mask is
+        // restored below before the test returns.
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGTERM);
+            libc::sigaddset(&mut blocked, libc::SIGINT);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous),
+                0
+            );
+        }
+
+        // Built directly rather than through greeter(): new() splits on
+        // whitespace, which cannot express a quoted `sh -c` script. The child
+        // sleeps so its /proc entry can be read while it is still alive.
+        let mut g = Greeter {
+            argv: vec!["/bin/sleep".to_owned(), "60".to_owned()],
+            credentials: None,
+            socket: "wayland-test".to_owned(),
+            child: None,
+            pgid: None,
+            started: None,
+            rapid_failures: 0,
+            gave_up: false,
+        };
+
+        g.spawn().unwrap();
+        let pid = g.child.as_ref().unwrap().id();
+        let mask = blocked_mask(pid);
+        g.kill();
+
+        // SAFETY: restoring the mask captured above.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
+
+        assert_eq!(
+            mask, 0,
+            "child inherited blocked signals: SigBlk {mask:016x}"
+        );
     }
 
     #[test]
@@ -683,6 +820,42 @@ mod tests {
             describe_exit(ExitStatus::from_raw(9)),
             "killed by signal 9"
         );
+    }
+
+    #[test]
+    fn a_greeter_that_gave_up_counts_against_the_budget_however_long_it_ran() {
+        // The webkit greeter takes about half a minute to conclude a silent web
+        // process is never going to answer — well past RAPID_FAILURE. Judged on
+        // uptime alone each of those exits looks like a healthy greeter that
+        // happened to stop, `rapid_failures` resets to 1 every time, and the
+        // give-up screen is unreachable: the login screen just reloads for ever.
+        let mut g = greeter("/bin/true");
+        let long_enough_to_look_healthy = Instant::now() - (RAPID_FAILURE * 3);
+
+        for _ in 0..MAX_RAPID_FAILURES {
+            g.started = Some(long_enough_to_look_healthy);
+            if let Disposition::GaveUp { reason } =
+                g.note_exit(ExitStatus::from_raw(GAVE_UP_EXIT << 8))
+            {
+                assert!(reason.contains("tty1"), "{reason}");
+                return;
+            }
+        }
+        panic!("a greeter that gave up never reached the give-up screen");
+    }
+
+    #[test]
+    fn a_long_running_greeter_that_merely_crashed_still_gets_a_fresh_budget() {
+        // The counterpart: only the give-up status bypasses the uptime rule, so
+        // an ordinary crash after hours of use is still a first failure.
+        let mut g = greeter("/bin/true");
+        for _ in 0..MAX_RAPID_FAILURES * 2 {
+            g.started = Some(Instant::now() - (RAPID_FAILURE * 3));
+            assert!(
+                !matches!(g.note_exit(ExitStatus::from_raw(0x100)), Disposition::GaveUp { .. }),
+                "an occasional crash was treated as a failure to start"
+            );
+        }
     }
 
     #[test]

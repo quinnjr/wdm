@@ -11,8 +11,15 @@ bindings — not on wdm itself.
 
 ```toml
 [dependencies]
-wdm-protocol = { version = "0.1", features = ["client"] }
+wdm-protocol = { git = "https://github.com/quinnjr/wdm", tag = "v0.2.0", features = ["client"] }
 ```
+
+Every crate here sets `publish = false`, so there is no registry version to
+resolve: wdm ships as distribution packages, and taking the protocol as a git or
+path dependency is what keeps it and the compositor implementing it on one
+version. A greeter resolving `wdm-protocol` independently from a registry is the
+mismatch `since` gating exists to survive, not one worth inviting. Pin the tag
+you built against.
 
 ## Layer shell is mandatory
 

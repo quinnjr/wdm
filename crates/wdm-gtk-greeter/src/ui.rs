@@ -300,13 +300,14 @@ impl Ui {
         self.entry.set_sensitive(reason.is_none());
         self.submit.set_sensitive(reason.is_none());
         if let Some(text) = reason {
-            // Into the model as well as onto the label, for the reason spelled
-            // out in `launch()`: refresh() re-derives the label from
-            // `model.error` on every revision, so a widget-only message is
-            // wiped by the next event — leaving a permanently insensitive form
-            // with nothing on it to explain why. The borrow is scoped and
-            // dropped before the widget calls below.
-            self.model.borrow_mut().error = Some(text.to_owned());
+            // Painted here only so the very first frame — before any revision
+            // has reached `refresh` — is not an insensitive form with nothing on
+            // it. Keeping it there is `refresh`'s job, not this one's: it
+            // re-derives the same reason from the lists on every revision, so
+            // writing it into `model.error` here would be both dead (the
+            // notify::selected this function's `set_model` fires reaches
+            // `begin_attempt`, which clears `error` before anyone reads it) and
+            // wrong — `error` belongs to an attempt, not to the machine.
             self.error.set_label(text);
             self.error.set_visible(true);
         }
@@ -470,13 +471,7 @@ impl Ui {
             )
         };
 
-        // `model.error` when there is one, and otherwise the reason there is
-        // nothing on this machine to log into. The second is not redundant with
-        // what `reload_lists` wrote: `begin_attempt` clears `error` because it
-        // belongs to an attempt, while an empty user or session list is a fact
-        // about the machine that outlives every attempt, so it is re-derived
-        // here rather than being allowed to blank itself.
-        let error = error.or_else(|| unusable.map(str::to_owned));
+        let error = error_label(error, unusable);
 
         self.error.set_label(error.as_deref().unwrap_or(""));
         self.error.set_visible(error.is_some());
@@ -526,11 +521,9 @@ impl Ui {
     /// `refresh()`'s "PAM explained itself" branch and `launch()`'s no-session
     /// fallback — so the state they leave behind cannot drift apart.
     ///
-    /// "Try again" is offered only while there is something to try against. One
-    /// of the states that reaches here is a lost connection, and after that
-    /// `Link::pump` returns early forever: Enter would send nothing, change
-    /// nothing, and leave the user pressing a key at a screen that cannot
-    /// answer. Saying so points them at the console instead.
+    /// What that prompt says is [`wait_prompt`]'s decision — one of the states
+    /// that reaches here is a lost connection, and there is nothing to try
+    /// against after that.
     ///
     /// Sensitivity is deliberately not touched: only `reload_lists` turns the
     /// form off, and it does so because there is nothing on this machine to log
@@ -539,14 +532,10 @@ impl Ui {
     fn wait_for_user(&self) {
         // Scoped, and released before any widget call: every path into a widget
         // from here can re-enter and borrow the model again.
-        let retry_possible = self.model.borrow().retry_is_possible();
+        let link_alive = self.model.borrow().link_is_alive();
 
         self.attempting.set(false);
-        self.prompt.set_label(if retry_possible {
-            "Press Enter to try again"
-        } else {
-            "Connection to wdm lost — switch to a text console"
-        });
+        self.prompt.set_label(wait_prompt(link_alive));
         self.entry.set_text("");
     }
 
@@ -568,12 +557,17 @@ impl Ui {
             // matches wdm-greeter and the default webkit theme.
             drop(model);
             log::error!("authenticated but no session is selected");
+            // One binding for both writes: the helper exists so this wording
+            // cannot drift from the other two places, and spelling the literal
+            // twice here would be the drift it was extracted to prevent.
+            let reason = unusable_reason(false, true)
+                .expect("no_sessions is true, so there is always a reason");
             {
                 let mut m = self.model.borrow_mut();
-                m.error = Some("No sessions installed".to_owned());
+                m.error = Some(reason.to_owned());
                 m.authenticated = false;
             }
-            self.error.set_label("No sessions installed");
+            self.error.set_label(reason);
             self.error.set_visible(true);
             self.wait_for_user();
             return;
@@ -600,11 +594,17 @@ fn refs(items: &[String]) -> Vec<&str> {
 /// Why this machine has nothing to log into, if it has nothing.
 ///
 /// A free function so the choice of message can be checked without a display,
-/// and so the two places that need it — `reload_lists`, which turns the form
-/// off, and `refresh`, which re-derives the label every revision — cannot
-/// disagree about the wording. Missing users are reported ahead of missing
-/// sessions because a machine with neither is first of all a machine with
-/// nobody to be. Wording matches wdm-greeter and the default webkit theme.
+/// and so the three places that need it — `reload_lists`, which turns the form
+/// off; `refresh`, which re-derives the label every revision; and `launch`'s
+/// no-session fallback — cannot disagree about the wording. Missing users are
+/// reported ahead of missing sessions because a machine with neither is first
+/// of all a machine with nobody to be.
+///
+/// wdm-greeter and the default webkit theme say the same two things in their
+/// own languages. Those copies cannot share this constant across the crate and
+/// language boundary and nothing checks them against it, so changing a string
+/// here means changing `crates/wdm-greeter/src/main.rs` and
+/// `crates/wdm-webkit-greeter/themes/default/theme.js` by hand.
 fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
     if no_users {
         Some("No users available to log in")
@@ -612,6 +612,32 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
         Some("No sessions installed")
     } else {
         None
+    }
+}
+
+/// What the error line says, given the attempt's verdict and the machine's.
+///
+/// The attempt's error wins while there is one, because it is the newer news.
+/// The fallback is what keeps an unusable machine explained: `begin_attempt`
+/// clears `error` because it belongs to an attempt, while an empty user or
+/// session list is a fact about the machine that outlives every attempt — so
+/// without this the form goes permanently insensitive with nothing on it
+/// saying why.
+fn error_label(model_error: Option<String>, unusable: Option<&'static str>) -> Option<String> {
+    model_error.or_else(|| unusable.map(str::to_owned))
+}
+
+/// What to tell the user when an attempt has ended and none has replaced it.
+///
+/// "Try again" is offered only while there is something to try against: after
+/// `Link::pump` latches dead, Enter would send nothing and change nothing, and
+/// the user would be pressing a key at a screen that cannot answer. Wording
+/// matches the default webkit theme.
+fn wait_prompt(link_alive: bool) -> &'static str {
+    if link_alive {
+        "Press Enter to try again"
+    } else {
+        "Connection to wdm lost — switch to a text console"
     }
 }
 
@@ -694,22 +720,55 @@ mod tests {
     }
 
     #[test]
+    fn an_attempts_verdict_wins_over_the_machines() {
+        // Both are true at once on a machine with no sessions whose PAM stack
+        // still refused the password. What the user just did is the newer news.
+        assert_eq!(
+            error_label(
+                Some("Authentication failure".to_owned()),
+                Some("No sessions installed")
+            )
+            .as_deref(),
+            Some("Authentication failure")
+        );
+    }
+
+    #[test]
     fn the_unusable_reason_outlives_an_attempt() {
-        // The defect this guards: the message was written onto the label only,
-        // and refresh() re-derives that label from `model.error` on every
-        // revision — so the next event left a permanently insensitive form with
-        // nothing on it to say why. Deriving it from the lists instead means no
-        // revision can blank it.
+        // The regression this guards: `begin_attempt` clears `error` because it
+        // belongs to an attempt, and refresh() re-derives the label from
+        // `error` on every revision — so without the fallback the next event
+        // left a permanently insensitive form with nothing on it to say why.
+        // Delete the fallback in `error_label` and this is the test that fails.
         let mut model = Model::default();
         model.error = Some(unusable_reason(true, true).unwrap().to_owned());
-
         model.begin_attempt();
         assert!(model.error.is_none(), "an attempt clears `error` as it must");
 
-        // What refresh() falls back to once it has.
+        let unusable = unusable_reason(model.users.is_empty(), model.sessions.is_empty());
         assert_eq!(
-            unusable_reason(model.users.is_empty(), model.sessions.is_empty()),
+            error_label(model.error.clone(), unusable).as_deref(),
             Some("No users available to log in")
+        );
+    }
+
+    #[test]
+    fn a_usable_machine_between_attempts_says_nothing() {
+        assert_eq!(error_label(None, None), None);
+    }
+
+    #[test]
+    fn a_dead_link_does_not_invite_a_retry() {
+        // Driven off a real model rather than a bare bool, so the branch is
+        // pinned to what `Link::pump` actually latches: once it is dead it
+        // stays dead, and Enter would send into a socket nobody reads.
+        let mut m = Model::default();
+        assert_eq!(wait_prompt(m.link_is_alive()), "Press Enter to try again");
+
+        m.link_lost("broken pipe");
+        assert_eq!(
+            wait_prompt(m.link_is_alive()),
+            "Connection to wdm lost — switch to a text console"
         );
     }
 }
