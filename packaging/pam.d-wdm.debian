@@ -7,7 +7,7 @@
 # stack is split across the pam-auth-update managed common-* fragments, pulled
 # in with @include as the other Debian display managers do. common-session is
 # what brings in pam_systemd, which creates the logind session and
-# XDG_RUNTIME_DIR that wdm passes to the launched session; without it most
+# XDG_RUNTIME_DIR that the session inherits; without it most
 # desktops will not start. pam_loginuid is not in any common-* fragment, so it
 # is listed here the way sddm and gdm list it.
 #
@@ -38,7 +38,7 @@ auth        required    pam_env.so readenv=1
 auth        required    pam_env.so readenv=1 envfile=/etc/default/locale
 @include common-auth
 -auth       optional    pam_gnome_keyring.so
-#-auth      optional    pam_kwallet5.so
+-auth       optional    pam_kwallet5.so
 
 @include common-account
 
@@ -48,22 +48,25 @@ session     required    pam_loginuid.so
 session     required    pam_limits.so
 @include common-session
 -session    optional    pam_gnome_keyring.so auto_start
-# pam_kwallet5 is deliberately NOT started here. It forks inside
-# pam_sm_open_session and, on the error path, calls exit() in the child rather
-# than exec'ing. wdm still holds DRM and a live EGL context at that point, so
-# the child runs the graphics driver's atexit handlers against GPU state it
-# shares with the parent. On NVIDIA that faults wdm's own channel
-# (NVRM: Xid 31 ... name=wdm) and takes the compositor down mid-login: the user
-# authenticates successfully and then loses the display manager. pam_gnome_keyring
-# forks too but execs, which resets the inherited state, so it is safe and stays.
+# pam_kwallet5 is started again as of 0.5.0. It was removed in 0.4.0 because it
+# forks inside pam_sm_open_session and, on its error path, calls exit() in the
+# child rather than exec'ing: wdm held DRM and a live EGL context at that point,
+# so the child ran the graphics driver's atexit handlers against GPU state it
+# shared with the parent. On NVIDIA that faulted wdm's own channel
+# (NVRM: Xid 31 ... name=wdm) and took the compositor down mid-login — the user
+# authenticated successfully and then lost the display manager.
 #
-# The `-auth` line above is commented out for the same reason, one step earlier:
-# pam_kwallet5's auth module does nothing but stash the password in a pipe for
-# the session module to read, so with the session line gone it does work whose
-# result nothing collects. The two go and come back together — leaving the auth
-# line live would make re-enabling kwallet two half-edits instead of one.
+# That hazard is closed, and not by treating this one module. wdm no longer runs
+# PAM in the process that owns the display at all. `wdm --pam-helper` is a
+# freshly exec'd copy of wdm's own binary with no graphics driver ever loaded
+# into it, and wdm releases the DRM device, the renderer, libinput and the
+# libseat session *before* it tells the helper to open the session. So there is
+# no EGL context anywhere for a forking module to inherit, whatever it does with
+# it — which is the point: any module that forks and exits during open_session
+# reproduced this, not just pam_kwallet5.
 #
-# Re-enable both only once wdm runs the PAM session somewhere that holds no
-# graphics state. Until then the session line is a crash on any machine with a
-# driver whose atexit handlers touch the GPU.
-#-session    optional    pam_kwallet5.so auto_start
+# The two lines go and come back together. pam_kwallet5's auth module does
+# nothing but stash the password in a pipe for the session module to read, so
+# either both are live or neither is; leaving one behind is work whose result
+# nothing collects.
+-session    optional    pam_kwallet5.so auto_start

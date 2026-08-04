@@ -150,9 +150,6 @@ pub struct Wdm {
     /// The greeter process and its restart policy.
     pub greeter: Greeter,
 
-    /// The running user session, once one has been launched.
-    pub session: Option<std::process::Child>,
-
     /// A scheduled greeter respawn, kept so it can be cancelled. A timer left
     /// armed across a login fires in the next generation and starts a second
     /// greeter beside the first.
@@ -255,7 +252,6 @@ impl Wdm {
             popups: PopupManager::default(),
             login,
             greeter,
-            session: None,
             respawn_token: None,
             pending_actions: std::collections::VecDeque::new(),
             requests: Vec::new(),
