@@ -1,6 +1,6 @@
 //! The login form.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
@@ -8,7 +8,7 @@ use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, DropDown, Entry,
     InputPurpose, Label, Orientation, StringList,
 };
-use gtk4_layer_shell::{Edge, Layer, LayerShell, KeyboardMode};
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use wdm_greeter_client::{Model, Shared, SharedLink};
 
@@ -75,8 +75,13 @@ pub struct Ui {
     /// True once `start_session` has been sent; the compositor tears this
     /// process down shortly afterwards.
     launched: Cell<bool>,
-    /// Guards the automatic retry, so a user switch mid-flight does not stack
-    /// conversations.
+    /// Whether a conversation is in flight.
+    ///
+    /// Guards `begin_auth` against re-entry, so a second `submit` while PAM is
+    /// still working does not open a conversation on top of the live one, and
+    /// makes the end-of-conversation reset in `refresh` fire once on the
+    /// transition rather than on every later revision — which would clear the
+    /// entry under someone already typing their next attempt.
     attempting: Cell<bool>,
     /// The user and session lists arrive exactly once, in the enumerate phase
     /// Link::connect already waited for, so loading them is a latch. Asking the
@@ -87,6 +92,14 @@ pub struct Ui {
     /// Nesting depth of `flush`, which reaches `refresh`, which can flush again.
     /// See [`Ui::flush`].
     depth: Cell<u32>,
+    /// What the user typed before there was a prompt to put it in.
+    ///
+    /// The greeter no longer opens a PAM conversation until the user submits
+    /// something, so the first thing they type arrives before PAM has asked for
+    /// it. Held here across `create_session`, then handed to the first prompt
+    /// that wants an answer — otherwise the user would type a password, watch
+    /// the field clear, and have to type it again.
+    pending_answer: RefCell<Option<String>>,
 }
 
 /// Build the window and wire it up.
@@ -133,16 +146,43 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
         users: DropDown::new(None::<StringList>, None::<gtk4::Expression>),
         sessions: DropDown::new(None::<StringList>, None::<gtk4::Expression>),
         prompt: Label::builder().halign(Align::Start).build(),
-        entry: Entry::builder().activates_default(true).build(),
+        // Masked from the very first frame. `refresh` sets this from
+        // `prompt.secret` when PAM asks, but PAM is no longer asked until the
+        // user submits — so the state the login screen sits in, and the one they
+        // type their password into, is this one. Defaulting to visible put the
+        // password on screen in plaintext.
+        //
+        // Secret is the right default rather than merely the safe one: every
+        // PAM stack that reaches a greeter opens with a password. A stack whose
+        // first question is a username or a token unmasks it on arrival, which
+        // is the direction that can be corrected on screen — the other cannot.
+        entry: Entry::builder()
+            .activates_default(true)
+            .visibility(false)
+            .input_purpose(InputPurpose::Password)
+            .build(),
+        // Both start hidden. A GTK widget is visible on construction, and these
+        // two are only ever hidden by `refresh`, which runs when the model's
+        // revision changes — so on a greeter nobody has touched it does not run
+        // at all, and the labels sat there empty. Their CSS gives them a
+        // background, so an empty `error` is a small blank red box under the
+        // entry: an alarm with nothing behind it, on a screen whose whole job is
+        // to be trustworthy.
+        //
+        // Hidden is also what `refresh` itself decides for them —
+        // `set_visible(error.is_some())` — so this is the same rule applied one
+        // frame earlier rather than a second opinion about it.
         error: Label::builder()
             .halign(Align::Start)
             .wrap(true)
+            .visible(false)
             .css_classes(["error"])
             .build(),
         notice: Label::builder()
             .halign(Align::Start)
             .wrap(true)
             .xalign(0.0)
+            .visible(false)
             .css_classes(["notice"])
             .build(),
         submit: Button::with_label("Log in"),
@@ -153,6 +193,7 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
         attempting: Cell::new(false),
         lists_loaded: Cell::new(false),
         depth: Cell::new(0),
+        pending_answer: RefCell::new(None),
     });
 
     window.set_child(Some(&layout(&ui)));
@@ -160,20 +201,27 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
 
     // The enumerate phase can carry `last_error` — the compositor's account of
     // why the previous session ended, e.g. a session that crashed straight back
-    // to the greeter. Both `begin_auth` below and the notify::selected handler
-    // that `reload_lists` fires call `begin_attempt`, which clears `error` for
-    // a fresh conversation — wiping the one message the user most needs before
-    // it is ever painted. Snapshot it now and put it back afterwards.
+    // to the greeter. The notify::selected handler that `reload_lists` fires can
+    // reach `begin_attempt`, which clears `error` for a fresh conversation —
+    // wiping the one message the user most needs before it is ever painted.
+    // Snapshot it now and put it back afterwards.
     //
-    // These four statements — snapshot, reload_lists, begin_auth, restore — are
-    // what `an_enumerate_phase_error_survives_the_automatic_first_attempt`
-    // stands in for; it cannot drive them directly because reload_lists and
-    // begin_auth need a display. Change the order here and change it there.
+    // These three statements — snapshot, reload_lists, restore — are what
+    // `an_enumerate_phase_error_survives_the_first_paint` stands in for; it
+    // cannot drive them directly because reload_lists needs a display. Change
+    // the order here and change it there.
     let enumerate_error = ui.model.borrow().error.clone();
 
     // Populate from the enumerate phase that Link::connect already collected.
+    //
+    // No conversation is started here, deliberately. Opening one costs a PAM
+    // attempt for a user who has not touched the machine, and there is no way to
+    // end a `pam_authenticate` that is waiting on a prompt without failing it —
+    // so an unattended login screen was charging `pam_faillock` for its own
+    // patience and locking the account out. `submit` is now the only thing that
+    // arms PAM. See `Ui::begin_auth`.
     ui.reload_lists();
-    ui.begin_auth();
+    ui.wait_for_user();
 
     restore_enumerate_error(&mut ui.model.borrow_mut(), enumerate_error.clone());
     if let Some(text) = &enumerate_error {
@@ -249,15 +297,19 @@ fn connect(ui: &Rc<Ui>) {
         move |_| ui.submit()
     });
 
-    // Switching user restarts the conversation: PAM's is per user, and a
-    // half-answered one for someone else is not reusable. This is a deliberate
-    // restart, so the in-flight guard is cleared before asking.
+    // Switching user ends the conversation: PAM's is per user, and a
+    // half-answered one for someone else is not reusable.
+    //
+    // It ends it rather than restarting it. Starting one here would arm PAM for
+    // whoever the list happens to land on — including at startup, where
+    // `reload_lists`'s `set_model` fires this handler before the user has
+    // touched anything. That is how an untouched machine used to lock its first
+    // user out. `submit` arms PAM now; this only tears down.
     ui.users.connect_selected_notify({
         let ui = ui.clone();
         move |_| {
             ui.select_preferred_session();
-            ui.attempting.set(false);
-            ui.begin_auth();
+            ui.abandon_attempt();
         }
     });
 }
@@ -324,7 +376,37 @@ impl Ui {
         self.sessions.set_selected(index as u32);
     }
 
+    /// End any conversation in flight and drop the form back to "your move".
+    ///
+    /// Cancelling is what keeps PAM's attempt counter honest across a user
+    /// switch: the conversation belongs to the account it was opened for, and
+    /// leaving it open would let it time out later against a name the user has
+    /// already moved on from.
+    fn abandon_attempt(&self) {
+        {
+            let model = self.model.borrow();
+            let Some(greeter) = &model.greeter else {
+                return;
+            };
+            if self.launched.get() {
+                return;
+            }
+            greeter.cancel();
+        }
+
+        self.attempting.set(false);
+        *self.pending_answer.borrow_mut() = None;
+        self.model.borrow_mut().prompt = None;
+        self.wait_for_user();
+    }
+
     /// Start a fresh conversation for the selected user.
+    ///
+    /// The only thing that arms PAM, and reached only from `submit`. Everything
+    /// from here to `auth_ok` or `auth_failed` counts as a login attempt as far
+    /// as `pam_faillock` is concerned, including the part where wdm is waiting
+    /// for an answer — a conversation cannot be ended without failing it. So it
+    /// must not be entered on behalf of a user who has not asked to log in.
     fn begin_auth(&self) {
         let model = self.model.borrow();
         let Some(greeter) = &model.greeter else {
@@ -336,12 +418,17 @@ impl Ui {
         if self.launched.get() {
             return;
         }
-        // Idempotent while an attempt is in flight. `reload_lists` emits
-        // notify::selected, whose handler starts a conversation, and build()
-        // then asks for one itself — without this the greeter opens two before
-        // the user has touched anything, burning a rate-limit slot and making
-        // PAM do every attempt twice. The paths that restart deliberately
-        // (user switch, auto-retry) clear the flag first.
+        // Idempotent while an attempt is in flight, which is what makes a second
+        // `submit` harmless: between `create_session` and PAM's first question
+        // there is no prompt to answer, so another Enter — or a click on the
+        // button — takes the "start an attempt" branch again, and without this
+        // the greeter would open a second conversation, burning a rate-limit
+        // slot and making PAM do every attempt twice. `submit` tests the same
+        // flag before it gets here; this is the assertion that `begin_auth`
+        // itself is safe to call twice, so that guard is an optimisation and not
+        // the only thing standing between a fast typist and a doubled attempt.
+        // `abandon_attempt`, the one path that deliberately starts over, clears
+        // the flag first.
         if self.attempting.get() {
             return;
         }
@@ -385,27 +472,54 @@ impl Ui {
 
         let text = self.entry.text().to_string();
 
-        let pending = {
+        // Only the id is read under the borrow, so `text` is moved into whichever
+        // branch consumes it rather than cloned into both. Cloning would leave a
+        // second copy of the password in the heap for no reason; the one copy
+        // that must exist is discussed at length in wdm's own conversation code.
+        let pending_id = {
             let model = self.model.borrow();
-            let Some(greeter) = &model.greeter else {
+            if model.greeter.is_none() {
                 return;
-            };
-
-            match &model.prompt {
-                Some(prompt) => {
-                    greeter.respond(prompt.id, text);
-                    true
-                }
-                None => false,
             }
+            model.prompt.as_ref().map(|prompt| prompt.id)
         };
 
-        if pending {
+        if let Some(id) = pending_id {
+            {
+                let model = self.model.borrow();
+                if let Some(greeter) = &model.greeter {
+                    greeter.respond(id, text);
+                }
+            }
             self.entry.set_text("");
             self.model.borrow_mut().prompt = None;
             self.prompt.set_label("Checking…");
             self.flush();
         } else if !self.attempting.get() {
+            // Enter on an empty field is not a login attempt, and must not cost
+            // one. Opening a conversation here would run the whole PAM stack
+            // against an empty password, fail, and charge `pam_faillock` for it
+            // — so three stray presses of Enter on a login screen would lock the
+            // account. Someone brushing the keyboard is not a failed login.
+            //
+            // Refused with a sentence rather than silently: an Enter that does
+            // nothing at all reads as a wedged greeter.
+            //
+            // Only the *first* prompt is guarded this way. Once a conversation
+            // is underway an empty answer is a real choice — a stack that asks
+            // for an optional token accepts one — and it is answered above.
+            if text.is_empty() {
+                self.prompt.set_label("Enter your password");
+                self.entry.grab_focus();
+                return;
+            }
+
+            // No prompt yet, because no conversation is open until right now.
+            // Keep what was typed so the prompt PAM is about to send can be
+            // answered with it: `begin_auth` clears the entry, and asking the
+            // user to type their password a second time because the greeter
+            // asked PAM a fraction of a second too late is not a login screen.
+            *self.pending_answer.borrow_mut() = Some(text);
             self.begin_auth();
             self.flush();
         }
@@ -418,15 +532,27 @@ impl Ui {
     /// for the next 16ms tick to show it is a needless frame of staleness — so
     /// refresh here, after every borrow is released.
     ///
-    /// That makes flush -> refresh -> flush a cycle: refresh's auto-retry branch
-    /// calls begin_auth and flushes again. The revision guard does *not* bound
-    /// it — begin_auth ends in begin_attempt, which bumps the revision, so the
-    /// guard never fires on the nested call. In practice it stops because a
-    /// request flushed a microsecond ago has no reply to dispatch yet and `pump`
-    /// returns false, which is a property of the Wayland round-trip rather than
-    /// anything this code enforces. `depth` enforces it: past a handful of
-    /// nested entries the retry is abandoned and the timer in main.rs picks the
-    /// model up on its next tick, 16ms later.
+    /// That makes flush -> refresh -> flush a cycle. The one branch that closes
+    /// it today is the buffered answer: `refresh` spends `pending_answer` on the
+    /// prompt that just arrived, sends `respond`, and flushes to get it moving
+    /// rather than waiting for the next tick.
+    ///
+    /// Two things bound that, and neither is `depth`. The buffer is spent with
+    /// `take()`, so the branch cannot be entered twice for one answer; and the
+    /// branch does not call `begin_attempt`, so it does not bump the revision —
+    /// which means `refresh`'s `applied` guard is live on the nested call and
+    /// returns immediately unless the pump genuinely delivered something new.
+    /// (This is where the old auto-retry differed: it went through
+    /// `begin_attempt`, bumped the revision itself, and walked straight past the
+    /// guard on every nested entry.)
+    ///
+    /// `depth` is still load-bearing, because both of those bounds are
+    /// properties of the branches that happen to exist rather than of this
+    /// function. Any future path that changes the model and flushes — the
+    /// auto-retry was exactly that — re-arms the recursion, and a login screen
+    /// that overflows its stack is a machine nobody can log into. Past a handful
+    /// of nested entries the flush is abandoned and the timer in main.rs picks
+    /// the model up on its next tick, 16ms later.
     fn flush(&self) {
         const MAX_DEPTH: u32 = 4;
 
@@ -469,7 +595,7 @@ impl Ui {
         // that is what becomes `notice` — while the secret it is waiting on is
         // still pending. The "wait for the user" branch below would otherwise
         // clear the half-typed answer and pretend the attempt had ended.
-        let (prompt, error, notice, authenticated, conversation_over, auto_retry, unusable) = {
+        let (prompt, error, notice, authenticated, conversation_over, unusable) = {
             let model = self.model.borrow();
             (
                 model.prompt.clone(),
@@ -481,7 +607,6 @@ impl Ui {
                 model.notice_text(),
                 model.authenticated,
                 model.conversation_over,
-                model.should_auto_retry(),
                 unusable_reason(model.users.is_empty(), model.sessions.is_empty()),
             )
         };
@@ -504,7 +629,43 @@ impl Ui {
 
         if let Some(prompt) = &prompt {
             self.attempting.set(true);
+
+            // The answer the user gave before PAM had asked. Spend it on the
+            // first question that wants one and show nothing — from the user's
+            // side they typed a password, pressed Enter, and it was checked.
+            //
+            // `take()` rather than a peek: it is worth exactly one prompt. A
+            // stack that asks twice must get the second answer from the user,
+            // and a password silently resubmitted to a second question would be
+            // the same secret sent somewhere it was never typed for.
+            //
+            // Which is enforced, not merely intended: see [`spend_buffered`].
+            // The buffer is emptied either way and only ever answers a masked
+            // question, because it was typed into an entry this greeter builds
+            // masked and an echo-on prompt is a different question.
+            let buffered = spend_buffered(self.pending_answer.borrow_mut().take(), prompt.secret);
+            if let Some(answer) = buffered {
+                {
+                    let model = self.model.borrow();
+                    if let Some(greeter) = &model.greeter {
+                        greeter.respond(prompt.id, answer);
+                    }
+                }
+                self.model.borrow_mut().prompt = None;
+                self.entry.set_text("");
+                self.prompt.set_label("Checking…");
+                self.flush();
+                return;
+            }
+
             self.prompt.set_label(&prompt.text);
+            // Whatever is already in the entry was typed while it was masked,
+            // so it is a password. Unmasking it for an echo-on question would
+            // put it on screen — the same hazard `spend_buffered` refuses the
+            // buffer for, one field along.
+            if !prompt.secret {
+                self.entry.set_text("");
+            }
             // PAM decides whether the answer is a secret; a token or a username
             // prompt is echoed, a password is not.
             self.entry.set_visibility(!prompt.secret);
@@ -521,16 +682,22 @@ impl Ui {
             return;
         }
 
-        // Restarting is safe: the compositor defers its refusal until the rate
-        // limit expires, so this waits rather than spinning. It is suppressed
-        // when PAM explained itself — see Model::should_auto_retry.
-        if auto_retry {
-            self.attempting.set(false);
-            self.prompt.set_label("");
-            self.begin_auth();
-            self.flush();
-        } else if conversation_over && notice.is_some() && !authenticated {
-            // Waiting on the user instead. Say so, or the form looks stuck.
+        // Every ended conversation lands the same way: back at the user, with
+        // the form live and the verdict on screen.
+        //
+        // This used to restart the attempt by itself whenever PAM had not
+        // explained its refusal, which read as "a mistyped password, so put the
+        // prompt back up". The flaw was that a timeout is indistinguishable from
+        // a mistyped password at this level, and restarting re-armed the timeout
+        // — one `pam_faillock` entry per turn, until the account locked, with
+        // nobody at the keyboard. Now nothing but `submit` opens a conversation,
+        // so a wrong password costs the user one keystroke more and an
+        // unattended greeter costs them nothing.
+        //
+        // Guarded on `attempting` rather than on the model, so it fires once on
+        // the transition. Running it on every later revision would clear the
+        // entry under someone already typing their next attempt.
+        if conversation_over && !authenticated && self.attempting.get() {
             self.wait_for_user();
         }
     }
@@ -538,9 +705,17 @@ impl Ui {
     /// Drop the form back to "your move": no attempt in flight, the entry live
     /// again, and a prompt that says what to do next.
     ///
-    /// Shared by the two places that end an attempt without starting another —
-    /// `refresh()`'s "PAM explained itself" branch and `launch()`'s no-session
-    /// fallback — so the state they leave behind cannot drift apart.
+    /// The one description of that state, shared by everything that arrives at
+    /// it, so they cannot drift apart: `build()` on first paint, since nothing
+    /// opens a conversation on the user's behalf any more; `abandon_attempt()`
+    /// when the user switches account; `submit()` when the link is dead and the
+    /// attempt cannot be made at all; `refresh()` when a conversation has ended
+    /// without authenticating; and `launch()`'s no-session fallback.
+    ///
+    /// First paint reaching here is why [`wait_prompt`] takes `attempted`: the
+    /// idle state and the state after a refusal are the same widgets in the same
+    /// configuration, and the only thing that differs is whether there is
+    /// anything to try *again*.
     ///
     /// What that prompt says is [`wait_prompt`]'s decision — one of the states
     /// that reaches here is a lost connection, and there is nothing to try
@@ -552,23 +727,52 @@ impl Ui {
     /// which is exactly the state the no-session fallback is in.
     ///
     /// It is turned *off* here for the one state that is terminal rather than
-    /// merely idle. A lost link reaches this through `refresh`'s "PAM explained
-    /// itself" branch — `link_lost` pushes a notice and ends the conversation —
-    /// so this is where the transition is observed, and an entry the user can
+    /// merely idle. A lost link reaches this through `refresh`'s
+    /// end-of-conversation branch — `link_lost` pushes a notice and sets
+    /// `conversation_over` — or through `submit`'s dead-link guard, whichever
+    /// the user hits first, so this is where the transition is observed on every
+    /// path into it, and an entry the user can
     /// still type into is an invitation to an attempt `submit` will only refuse.
     /// The default webkit theme disables the same controls in `giveUp`.
     fn wait_for_user(&self) {
         // Scoped, and released before any widget call: every path into a widget
         // from here can re-enter and borrow the model again.
-        let link_alive = !self.model.borrow().link_dead;
+        //
+        // `conversation_over` is what separates the first paint from a retry:
+        // it is false until an attempt has actually ended, and this is now
+        // reached on startup as well as after a failure.
+        let (link_alive, attempted) = {
+            let model = self.model.borrow();
+            (!model.link_dead, model.conversation_over)
+        };
 
         self.attempting.set(false);
-        self.prompt.set_label(wait_prompt(link_alive));
+        // The conversation it was buffered for is over, whatever the verdict. It
+        // must not survive into the next one, where it would be spent on a
+        // prompt the user never saw.
+        *self.pending_answer.borrow_mut() = None;
+        self.prompt.set_label(wait_prompt(link_alive, attempted));
         self.entry.set_text("");
+        // Back to masked. A previous attempt may have ended on a prompt PAM said
+        // was echoable — a username, a token — and leaving the entry unmasked
+        // would put the next password on screen in plaintext.
+        self.entry.set_visibility(false);
+        self.entry.set_input_purpose(InputPurpose::Password);
         if !link_alive {
             self.entry.set_sensitive(false);
             self.submit.set_sensitive(false);
+            return;
         }
+
+        // Focus the entry, because nothing else will.
+        //
+        // `refresh` grabs focus when a prompt arrives, and there used to always
+        // be a prompt: the greeter opened a conversation before the user
+        // arrived. Now that nothing arms PAM until they ask, this is the state
+        // the login screen actually sits in, and without the grab the first
+        // keystroke goes to whichever widget GTK focused first — the user
+        // drop-down, where Return opens the list instead of logging in.
+        self.entry.grab_focus();
     }
 
     fn launch(&self) {
@@ -648,6 +852,21 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
     }
 }
 
+/// What a buffered answer may be spent on: a masked prompt, and nothing else.
+///
+/// The buffer holds what was typed into an entry this greeter builds masked and
+/// keeps masked between attempts, so it is a password. wdm forwards
+/// `PAM_PROMPT_ECHO_ON` as a non-secret prompt, and a stack whose first
+/// answerable question is echo-on — pam_oath's token, a username re-prompt —
+/// would otherwise be handed that password as the answer to a question it was
+/// never typed for, where the stack's own failure logging records it in the
+/// clear. So an echo-on prompt gets nothing and is put on screen for the user
+/// to answer, and the buffer is dropped rather than held for a later question:
+/// it was typed for the one that did not arrive.
+fn spend_buffered(buffered: Option<String>, secret: bool) -> Option<String> {
+    buffered.filter(|_| secret)
+}
+
 /// What to tell the user when an attempt has ended and none has replaced it.
 ///
 /// "Try again" is offered only while there is something to try against: after
@@ -656,21 +875,25 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
 /// why `submit` refuses outright rather than starting an attempt that erases
 /// this line. Wording matches the default webkit theme, and that it still does
 /// is checked by `the_other_greeters_spell_these_messages_the_same_way`.
-fn wait_prompt(link_alive: bool) -> &'static str {
-    if link_alive {
-        "Press Enter to try again"
-    } else {
-        "Connection to wdm lost — switch to a text console"
+fn wait_prompt(link_alive: bool, attempted: bool) -> &'static str {
+    match (link_alive, attempted) {
+        (false, _) => "Connection to wdm lost — switch to a text console",
+        // The first paint reaches here too, now that nothing opens a
+        // conversation on the user's behalf: there is no PAM prompt to display
+        // because PAM has not been asked anything yet. "Try again" would be a
+        // lie on a login screen nobody has touched.
+        (true, false) => "Password",
+        (true, true) => "Press Enter to try again",
     }
 }
 
 /// Put the enumerate-phase `last_error` back after the first attempt cleared it.
 ///
 /// `begin_attempt` rightly wipes `error` when the *user* starts over — they
-/// have read the message and chosen to move on. The attempt `build()` opens is
-/// automatic, though: nobody has read anything yet, so the compositor's account
-/// of why the last session ended must survive it. A message the model has since
-/// replaced wins over the snapshot, because it is newer.
+/// have read the message and chosen to move on. Anything `build()` reaches on
+/// its own is not that: nobody has read anything yet, so the compositor's
+/// account of why the last session ended must survive it. A message the model
+/// has since replaced wins over the snapshot, because it is newer.
 fn restore_enumerate_error(model: &mut Model, snapshot: Option<String>) {
     if model.error.is_none() {
         model.error = snapshot;
@@ -686,16 +909,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_enumerate_phase_error_survives_the_automatic_first_attempt() {
+    fn an_enumerate_phase_error_survives_the_first_paint() {
         // The defect this guards: build() ran reload_lists() and begin_auth(),
         // and begin_auth ends in begin_attempt(), which sets error = None — so
         // a user whose session crashed was bounced back to the prompt with no
         // explanation of why.
         //
+        // build() no longer calls begin_auth at all — nothing arms PAM until the
+        // user submits — but the snapshot is still load-bearing: reload_lists
+        // fires notify::selected, and any path from there that reaches
+        // begin_attempt clears `error` just the same.
+        //
         // This replays build()'s snapshot -> begin_attempt -> restore sequence
-        // by hand, because reload_lists and begin_auth need a display and so
-        // build() itself cannot run here. What it pins is that begin_attempt
-        // still clears `error` (the reason the snapshot exists at all) and that
+        // by hand, because reload_lists needs a display and so build() itself
+        // cannot run here. What it pins is that begin_attempt still clears
+        // `error` (the reason the snapshot exists at all) and that
         // restore_enumerate_error puts it back; the ordering in build() is
         // pinned only by the comment there.
         let mut model = Model::default();
@@ -704,7 +932,10 @@ mod tests {
         let snapshot = model.error.clone();
         // What begin_auth does on the way to the first conversation.
         model.begin_attempt();
-        assert!(model.error.is_none(), "begin_attempt no longer clears error");
+        assert!(
+            model.error.is_none(),
+            "begin_attempt no longer clears error"
+        );
 
         restore_enumerate_error(&mut model, snapshot);
 
@@ -725,6 +956,26 @@ mod tests {
         restore_enumerate_error(&mut model, Some("session ended: crashed".to_owned()));
 
         assert_eq!(model.error.as_deref(), Some("Authentication failure"));
+    }
+
+    #[test]
+    fn a_buffered_password_is_only_spent_on_a_masked_prompt() {
+        // The defect this guards: `refresh` took the buffer for any prompt at
+        // all. The entry is masked while it is typed into, so the buffer is a
+        // password; an echo-on first question — pam_oath, a username re-prompt
+        // — was answered with it, putting the password into the PAM stack's
+        // failure logging in the clear.
+        assert_eq!(
+            spend_buffered(Some("hunter2".to_owned()), true).as_deref(),
+            Some("hunter2"),
+            "the masked prompt is the one the buffer exists for"
+        );
+        // Dropped rather than kept: it was typed for the question that did not
+        // arrive, so the next one must be answered by the user. `refresh` then
+        // falls through and displays the prompt, which is the widget half and
+        // needs a display to observe.
+        assert_eq!(spend_buffered(Some("hunter2".to_owned()), false), None);
+        assert_eq!(spend_buffered(None, true), None);
     }
 
     #[test]
@@ -765,7 +1016,10 @@ mod tests {
         let mut model = Model::default();
         model.error = Some(unusable_reason(true, true).unwrap().to_owned());
         model.begin_attempt();
-        assert!(model.error.is_none(), "an attempt clears `error` as it must");
+        assert!(
+            model.error.is_none(),
+            "an attempt clears `error` as it must"
+        );
 
         let unusable = unusable_reason(model.users.is_empty(), model.sessions.is_empty());
         assert_eq!(
@@ -791,11 +1045,20 @@ mod tests {
         // pinned to what `Link::pump` actually latches: once it is dead it
         // stays dead, and Enter would send into a socket nobody reads.
         let mut m = Model::default();
-        assert_eq!(wait_prompt(!m.link_dead), "Press Enter to try again");
+        assert_eq!(
+            wait_prompt(!m.link_dead, m.conversation_over),
+            "Password",
+            "a login screen nobody has touched must not offer to try again"
+        );
+        m.conversation_over = true;
+        assert_eq!(
+            wait_prompt(!m.link_dead, m.conversation_over),
+            "Press Enter to try again"
+        );
 
         m.link_lost("broken pipe");
         assert_eq!(
-            wait_prompt(!m.link_dead),
+            wait_prompt(!m.link_dead, m.conversation_over),
             "Connection to wdm lost — switch to a text console"
         );
     }
@@ -821,7 +1084,7 @@ mod tests {
         );
         // The guard's whole action: re-assert the wording and stop.
         assert_eq!(
-            wait_prompt(!guarded.link_dead),
+            wait_prompt(!guarded.link_dead, guarded.conversation_over),
             "Connection to wdm lost — switch to a text console"
         );
 
@@ -841,32 +1104,58 @@ mod tests {
         // wdm-webkit-greeter's `the_default_theme_uses_the_api_it_is_shipped_with`.
         // The reference greeter paints these in Rust of its own and the default
         // theme writes them in JavaScript, so neither can share the constants
-        // above; what they can do is fail the build when one of the three is
-        // changed alone. Matched on the message text only — the code around it
-        // in either file is free to change.
+        // above; what they can do is fail the build when one of them is changed
+        // alone. Matched on the message text only — the code around it in either
+        // file is free to change.
+        //
+        // Everything the three greeters say to the user in words of their own
+        // belongs here: the two `unusable_reason` values, all four states of
+        // `wait_prompt`, and the empty-submit refusal. A message that is not in
+        // this test is a message the default theme can be left behind on, and
+        // the way that is discovered is a user reading two different sentences
+        // for the same condition on two machines.
         let reference = include_str!("../../wdm-greeter/src/main.rs");
         let theme = include_str!("../../wdm-webkit-greeter/themes/default/theme.js");
 
-        for reason in [
+        // What all three say. The last is the empty-submit refusal, which the
+        // reference greeter writes into `self.error` and this greeter writes
+        // straight onto the prompt label; it is spelled out rather than read
+        // from a constant because `submit` inlines it, and extracting it would
+        // be a helper with one caller when the literal is the thing that drifts.
+        for shared in [
             unusable_reason(true, false).unwrap(),
             unusable_reason(false, true).unwrap(),
+            "Enter your password",
         ] {
             assert!(
-                reference.contains(reason),
-                "wdm-greeter no longer says {reason:?}"
+                reference.contains(shared),
+                "wdm-greeter no longer says {shared:?}"
             );
             assert!(
-                theme.contains(reason),
-                "the default theme no longer says {reason:?}"
+                theme.contains(shared),
+                "the default theme no longer says {shared:?}"
             );
         }
 
-        // Only the theme is checked for this one: the reference greeter has no
-        // wording for a lost link at all — it ends when its dispatch does.
-        let lost = wait_prompt(false);
-        assert!(
-            theme.contains(lost),
-            "the default theme no longer says {lost:?}"
-        );
+        // Only the theme is checked for the idle-state wording: the reference
+        // greeter has no line of its own for any of these. It shows PAM's
+        // prompt verbatim and "Waiting…" when there is none, and it has no
+        // wording for a lost link at all — it ends when its dispatch does. So
+        // this is a two-way check where the loop above is three-way, and that
+        // is a fact about the reference greeter rather than an oversight.
+        //
+        // Every arm, not just the terminal one: `wait_prompt` gained "Password"
+        // when the greeter stopped opening a conversation before the user asked,
+        // and that arm is what the login screen sits in for as long as nobody
+        // touches the machine — the most-seen string in the whole greeter, and
+        // the one that was unchecked.
+        for (link_alive, attempted) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let line = wait_prompt(link_alive, attempted);
+            assert!(
+                theme.contains(line),
+                "the default theme no longer says {line:?}"
+            );
+        }
     }
 }

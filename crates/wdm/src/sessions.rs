@@ -153,10 +153,7 @@ fn load(
     if let Some(try_exec) = entry.try_exec()
         && !binary_exists(try_exec)
     {
-        log::debug!(
-            "skipping {}: TryExec {try_exec} not found",
-            path.display()
-        );
+        log::debug!("skipping {}: TryExec {try_exec} not found", path.display());
         return Ok(None);
     }
 
@@ -196,9 +193,7 @@ fn binary_exists(try_exec: &str) -> bool {
         return path.is_file();
     }
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join(try_exec).is_file())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(try_exec).is_file()))
         .unwrap_or(false)
 }
 
@@ -243,7 +238,10 @@ mod tests {
         assert_eq!(strip_field_codes("Hyprland"), "Hyprland");
         assert_eq!(strip_field_codes("sway %U"), "sway");
         assert_eq!(strip_field_codes("foo %f bar %U baz"), "foo bar baz");
-        assert_eq!(strip_field_codes("gnome-session --mode %i"), "gnome-session --mode");
+        assert_eq!(
+            strip_field_codes("gnome-session --mode %i"),
+            "gnome-session --mode"
+        );
     }
 
     #[test]
@@ -273,12 +271,14 @@ mod tests {
 
     #[test]
     fn missing_directories_are_not_an_error() {
-        assert!(scan_dir(
-            Path::new("/nonexistent/wdm-test-sessions"),
-            SessionType::Wayland,
-            &[]
-        )
-        .is_empty());
+        assert!(
+            scan_dir(
+                Path::new("/nonexistent/wdm-test-sessions"),
+                SessionType::Wayland,
+                &[]
+            )
+            .is_empty()
+        );
     }
 
     #[test]

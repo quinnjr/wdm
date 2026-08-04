@@ -456,6 +456,18 @@ impl Bridge {
     ///
     /// One evaluation at a time: sending more while one is unresolved would
     /// mean not knowing which statements a later failure lost.
+    ///
+    /// The join is redone from scratch on every retransmission rather than
+    /// cached, which against a page refusing everything is one rebuild per pump
+    /// tick. Deliberately: `Outbound::script` is an owned `String` the caller
+    /// hands to WebKit as a `&str`, so a cache would still have to be cloned
+    /// into it — the allocation and the copy of the whole script stay, and all
+    /// that is saved is the intermediate `Vec` and the walk over a queue capped
+    /// at [`PENDING_LIMIT`]. Trading that for an invalidation obligation on
+    /// every one of the five places that touch `pending` is a bad bargain: a
+    /// missed one sends the page a stale script, which is a wrong login screen
+    /// rather than a slow one. The whole run is bounded anyway — [`WEDGED_AFTER`]
+    /// ticks and the greeter exits to be respawned.
     pub fn flush(&mut self) -> Option<Outbound> {
         if self.in_flight.is_some() || self.pending.is_empty() {
             return None;

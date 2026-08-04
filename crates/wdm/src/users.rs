@@ -124,7 +124,10 @@ pub fn is_login_shell(shell: &Path) -> bool {
         // default. Treat as loginable.
         return shell.as_os_str().is_empty();
     };
-    !matches!(name, "nologin" | "false" | "true" | "sync" | "shutdown" | "halt")
+    !matches!(
+        name,
+        "nologin" | "false" | "true" | "sync" | "shutdown" | "halt"
+    )
 }
 
 /// GECOS is comma-separated; the first field is the human readable name.
@@ -169,9 +172,7 @@ pub fn discover(range: UidRange, last_sessions: &LastSessions) -> Vec<User> {
             let avatar_path = avatar_for(&name, u.home_dir());
             let last_session = last_sessions.get(&name).unwrap_or_default().to_owned();
             Some(User {
-                display_name: display_name_from_gecos(
-                    u.gecos().to_str().unwrap_or_default(),
-                ),
+                display_name: display_name_from_gecos(u.gecos().to_str().unwrap_or_default()),
                 avatar_path,
                 last_session,
                 name,
@@ -234,8 +235,7 @@ impl LastSessions {
     }
 
     pub fn set(&mut self, user: &str, session_id: &str) {
-        self.entries
-            .insert(user.to_owned(), session_id.to_owned());
+        self.entries.insert(user.to_owned(), session_id.to_owned());
     }
 
     /// Serialise to the on-disk format, sorted so the file does not churn.
@@ -384,10 +384,15 @@ mod tests {
 
     #[test]
     fn parses_login_defs() {
-        let range = UidRange::parse_login_defs(
-            "# comment\nUID_MIN\t\t 500\nUID_MAX 60000\nGID_MIN 1000\n",
+        let range =
+            UidRange::parse_login_defs("# comment\nUID_MIN\t\t 500\nUID_MAX 60000\nGID_MIN 1000\n");
+        assert_eq!(
+            range,
+            UidRange {
+                min: 500,
+                max: 60_000
+            }
         );
-        assert_eq!(range, UidRange { min: 500, max: 60_000 });
     }
 
     #[test]
@@ -429,7 +434,10 @@ mod tests {
 
     #[test]
     fn uid_range_is_inclusive() {
-        let range = UidRange { min: 1000, max: 2000 };
+        let range = UidRange {
+            min: 1000,
+            max: 2000,
+        };
         assert!(!range.contains(999));
         assert!(range.contains(1000));
         assert!(range.contains(2000));

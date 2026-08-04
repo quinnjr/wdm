@@ -5,6 +5,98 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pam_kwallet5` crashed the compositor mid-login, on NVIDIA.** The user
+  authenticated successfully and then lost the display manager. It is no longer
+  started from the shipped PAM stacks.
+
+  `pam_kwallet5` forks inside `pam_sm_open_session` and, on its error path,
+  calls `exit()` in the child rather than exec'ing. wdm still holds DRM and a
+  live EGL context at that point — `pam_open_session` runs before the display is
+  released, deliberately — so the child ran the graphics driver's `atexit`
+  handlers against GPU state it shares with the parent. On NVIDIA that faulted
+  wdm's own channel (`NVRM: Xid 31 ... name=wdm`), after which every frame was
+  rejected with "Device is currently paused" and wdm died. `pam_gnome_keyring`
+  forks too but execs, which resets the inherited state, so it is safe and
+  stays.
+
+  Commenting the module out is a workaround, not the fix: **any** PAM module
+  that forks and exits during `pam_open_session` can do this. The fix is for wdm
+  to run the PAM session somewhere that holds no graphics state, and until that
+  lands the shipped stacks do not start one that is known to.
+
+- **An empty password cost a login attempt.** Pressing Enter on an empty field
+  ran the whole PAM stack, failed, and was recorded by `pam_faillock` — so three
+  stray presses of Enter locked the account. All three greeters now refuse to
+  open a conversation for an empty first answer and say "Enter your password"
+  instead. Only the first answer is guarded: once a conversation is underway an
+  empty answer is a real choice, and is still sent.
+
+- **The GTK greeter showed passwords in plaintext.** Its entry was masked by
+  `refresh` when a prompt arrived, and with nothing arming PAM until the user
+  submits there is no longer a prompt at startup — which is exactly the state
+  the password is typed into. The entry is now built masked and re-masked after
+  every attempt. The reference greeter (`is_none_or(|p| p.secret)`) and the
+  webkit theme (`<input type="password">`) already defaulted to masked.
+
+- **The GTK greeter showed an empty red error box.** Its error and notice labels
+  are hidden by `refresh`, which only runs when the model's revision changes —
+  so on a greeter nobody had touched it never ran, and both labels sat visible
+  and empty. Their CSS gives them a background, so this was a blank alarm under
+  the password field. Both are now built hidden.
+
+- Prompts are logged at debug level (`WDM_LOG=wdm=debug`), which is what makes
+  "the greeter is showing something odd" answerable. The prompt text only —
+  responses are the one thing in that file that must never reach a log.
+
+- **An untouched login screen locked the account out.** This is the serious one:
+  it needed no interaction, no attacker, and no misconfiguration — only a
+  machine left sitting at its greeter.
+
+  Every greeter opened a PAM conversation as soon as a user was selected, which
+  at startup meant before anyone had touched the keyboard. `pam_authenticate`
+  then blocked in the conversation callback, and wdm abandoned the attempt after
+  60 seconds. There is no way to end a `pam_authenticate` that is mid-prompt
+  without failing it, so that abandonment reached `pam_faillock`'s `authfail`
+  arm as a failed login. wdm reported it to the greeter as a bare `auth_failed`,
+  which is indistinguishable from a mistyped password, so the greeter retried —
+  re-arming the timeout. The two spun at roughly one attempt a minute, and on
+  Arch's default `deny=3` the first user in the list was locked out about three
+  minutes after boot.
+
+  Three changes, each of which breaks the loop on its own:
+
+  - **No greeter arms PAM until the user asks to log in.** Selecting a user now
+    ends any conversation rather than starting one, and only submitting the form
+    opens one. What the user typed before PAM asked for it is carried across
+    `create_session` and spent on the first prompt, so the password is still
+    typed once. This is the fix that takes the unattended case to zero attempts
+    rather than merely bounding it.
+  - **A timed-out prompt explains itself before failing**, as a `prompt` event
+    with style `error`. That reaches `Model::push_notice`, which sets `blocked`,
+    which suppresses the automatic retry in every greeter sharing
+    `wdm-greeter-client` — rather than in whichever ones remember to
+    special-case a reason string.
+  - **`RESPONSE_TIMEOUT` is 30 minutes rather than 60 seconds.** It is a guard
+    against a wedged greeter pinning a thread, not a limit on how long a human
+    may take to read a screen. Being wrong in this direction costs one pinned
+    thread; being wrong in the other locked people out of their machines.
+
+  Third-party greeters and webkit themes that call `authenticate()` at load time
+  keep working — the retry loop is closed compositor-side — but they still spend
+  one attempt per unattended greeter. See the theme guide.
+
+- **The greeter recompiled every shader on every boot.** Its home is
+  `/var/empty`, which is root-owned and must stay empty, so GTK could not create
+  `$HOME/.cache` and logged "Failed to create pipeline cache directory". wdm now
+  creates `/var/cache/wdm`, owned by the greeter account and mode `0700`, and
+  points `XDG_CACHE_HOME` at it. The directory is opened `O_NOFOLLOW` before its
+  mode and owner are asserted, because unlike the runtime directory it persists
+  across boots under an unprivileged account — a greeter compromised once could
+  otherwise leave a symlink for root to follow on the next boot. Failing to
+  create it is a warning, not a fatal error: a slow login screen beats none.
+
 ### Changed
 
 - **The Arch packaging is three AUR packages rather than one split package**:

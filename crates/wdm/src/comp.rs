@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::keyboard::{KeyboardHandle, XkbConfig};
@@ -28,13 +28,13 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
     with_surface_tree_downward,
 };
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
 use smithay::wayland::input_method::{
     InputMethodHandler, InputMethodManagerState, PopupSurface as ImePopupSurface,
@@ -57,10 +57,10 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_fractional_scale,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
     delegate_input_method_manager, delegate_layer_shell, delegate_output, delegate_presentation,
-    delegate_dmabuf, delegate_seat, delegate_shm, delegate_text_input_manager,
-    delegate_viewporter, delegate_xdg_shell,
+    delegate_seat, delegate_shm, delegate_text_input_manager, delegate_viewporter,
+    delegate_xdg_shell,
 };
 
 use smithay::desktop::{
@@ -345,6 +345,9 @@ impl Wdm {
 
         self.login.set_output_ranks(&self.outputs);
         self.configure_layers();
+        // After the reassignment above, so a surface moved to a differently
+        // scaled monitor is told before it draws its next frame.
+        self.send_preferred_scales();
         // The primary output may have changed, which changes which surface
         // should hold the keyboard. Without this the caret and the input target
         // can end up on different screens after a hotplug.
@@ -534,10 +537,55 @@ impl Wdm {
     /// toolkit — renders once and then freezes.
     pub fn send_frames(&self, time_ms: u32) {
         for layer in &self.layers {
-            send_frames_surface_tree(layer.surface.wl_surface(), time_ms);
+            let parent = layer.surface.wl_surface();
+
+            // Popups are walked separately, mirroring `elements()`: an
+            // `xdg_popup` is its own surface, not a subsurface, so the parent's
+            // tree does not reach it. Without this an open GTK drop-down gets
+            // exactly one frame callback and then never another — hover
+            // highlights stop following the mouse and the list will not scroll,
+            // while the rest of the greeter keeps animating.
+            for (popup, _) in PopupManager::popups_for_surface(parent) {
+                send_frames_surface_tree(popup.wl_surface(), time_ms);
+            }
+
+            send_frames_surface_tree(parent, time_ms);
         }
     }
 
+    /// The output a layer surface was assigned, looked up by its `wl_surface`.
+    ///
+    /// Popups and input-method surfaces are parented to a layer surface, so this
+    /// is how anything hanging off the greeter finds the screen it is on. With
+    /// per-connector `scale` in the config, assuming the primary output here is
+    /// wrong for every surface on a secondary one.
+    fn output_of(&self, surface: &WlSurface) -> Option<&Output> {
+        self.layers
+            .iter()
+            .find(|l| l.surface.wl_surface() == surface)
+            .and_then(|l| l.output.as_ref())
+    }
+
+    /// Tell every layer surface the scale of the output it is actually on.
+    ///
+    /// [`FractionalScaleHandler::new_fractional_scale`] can only guess, because
+    /// the surface has no output when the fractional-scale object is created.
+    /// This is the correction, and it has to run again on hotplug: a surface
+    /// reassigned from a 1x monitor to a 2x one that is never told renders at
+    /// half resolution and is upscaled for the rest of the session.
+    fn send_preferred_scales(&self) {
+        for layer in &self.layers {
+            let Some(output) = layer.output.as_ref() else {
+                continue;
+            };
+            let scale = output.current_scale().fractional_scale();
+            smithay::wayland::compositor::with_states(layer.surface.wl_surface(), |states| {
+                smithay::wayland::fractional_scale::with_fractional_scale(states, |fractional| {
+                    fractional.set_preferred_scale(scale);
+                });
+            });
+        }
+    }
 }
 
 /// Reorder `connected` to follow `ranked`, dropping anything unranked.
@@ -678,6 +726,20 @@ fn to_physical(offset: Point<i32, Logical>, scale: f64) -> Point<i32, Physical> 
     offset.to_f64().to_physical(scale).to_i32_round()
 }
 
+/// The rectangle a popup is unconstrained against, in its *parent surface's*
+/// coordinate space.
+///
+/// smithay documents the target as relative to the parent's geometry. For a
+/// popup hanging off the fullscreen layer surface that is the output at the
+/// origin, but for a nested popup — a submenu, or a combo inside a menu — the
+/// parent sits at some offset inside the layer surface, so the output rectangle
+/// has to be shifted back by it. Passing the unshifted output means a submenu
+/// near the bottom of the screen is told it fits when the part below the fold
+/// does not, and it opens off-screen where nothing can click it.
+fn unconstrain_rect(output: (i32, i32), offset: Point<i32, Logical>) -> Rectangle<i32, Logical> {
+    Rectangle::new((-offset.x, -offset.y).into(), output.into())
+}
+
 /// An output's size in logical pixels, which is what a client is configured with.
 fn logical_size(output: &Output) -> Option<(i32, i32)> {
     let mode = output.current_mode()?;
@@ -754,10 +816,17 @@ impl WlrLayerShellHandler for Wdm {
             .filter(|o| self.outputs.contains(o))
             .or_else(|| self.primary_output().cloned());
 
-        log::debug!("new layer surface {namespace:?} on {:?}", output.as_ref().map(Output::name));
+        log::debug!(
+            "new layer surface {namespace:?} on {:?}",
+            output.as_ref().map(Output::name)
+        );
 
         self.layers.push(MappedLayer { surface, output });
         self.configure_layers();
+        // The output is only known now, so this is the first point at which the
+        // scale sent from new_fractional_scale — the primary's, as a guess — can
+        // be corrected for a surface that asked for a secondary output.
+        self.send_preferred_scales();
         self.update_focus();
     }
 
@@ -852,21 +921,23 @@ impl Wdm {
     /// A popup positioned past the edge of the screen is invisible and
     /// unreachable; the positioner's own rules say what to do about it.
     fn unconstrain_popup(&self, surface: &PopupSurface) {
-        let Some(output) = self.primary_output() else {
-            return;
-        };
-        let Some((w, h)) = logical_size(output) else {
+        let popup = PopupKind::Xdg(surface.clone());
+
+        // The popup's own output, not the primary: with per-connector `scale`
+        // and per-connector modes, a drop-down on a secondary monitor would
+        // otherwise be unconstrained against a screen of the wrong size — and on
+        // a smaller secondary it would be told it fits when it does not.
+        let output = smithay::desktop::find_popup_root_surface(&popup)
+            .ok()
+            .and_then(|root| self.output_of(&root).cloned())
+            .or_else(|| self.primary_output().cloned());
+
+        let Some(size) = output.as_ref().and_then(logical_size) else {
             return;
         };
 
-        // smithay documents the target rectangle as relative to the *parent
-        // surface's* geometry. For a popup hanging off the fullscreen layer
-        // surface that is the output at the origin, but for a nested popup — a
-        // submenu, or a combo inside a menu — the parent sits at some offset, so
-        // the output has to be shifted back by it. Without this a submenu near
-        // the bottom of the screen is told it fits when it does not.
-        let offset = get_popup_toplevel_coords(&PopupKind::Xdg(surface.clone()));
-        let target = Rectangle::new((-offset.x, -offset.y).into(), (w, h).into());
+        let offset = get_popup_toplevel_coords(&popup);
+        let target = unconstrain_rect(size, offset);
 
         surface.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
@@ -893,7 +964,12 @@ impl DmabufHandler for Wdm {
         self.dmabuf_state.get_or_insert_with(DmabufState::new)
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, _dmabuf: Dmabuf, notifier: ImportNotifier) {
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
         // ponytail: accepted without a trial import, because the renderer lives
         // in the backend and is not reachable from here. The advertised formats
         // come from that same renderer, so a client using one of them will
@@ -918,6 +994,12 @@ impl FractionalScaleHandler for Wdm {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
         // Tell the client the scale of the output its surface will appear on, so
         // a greeter on a HiDPI panel renders sharp instead of upscaled.
+        //
+        // The primary's scale is a *guess*: this fires when the client creates
+        // the fractional-scale object, which is before the surface has a role
+        // and therefore before it has an output. `send_preferred_scales`
+        // corrects it from `new_layer_surface`, once the output is known, and
+        // again from `set_outputs` on hotplug.
         let scale = self
             .primary_output()
             .map(|o| o.current_scale().fractional_scale())
@@ -949,11 +1031,13 @@ impl InputMethodHandler for Wdm {
 
     fn popup_repositioned(&mut self, _surface: ImePopupSurface) {}
 
-    fn parent_geometry(&self, _parent: &WlSurface) -> Rectangle<i32, Logical> {
+    fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical> {
         // The greeter is always fullscreen on its output, so the parent's
-        // geometry is the output's. Returning a zero rectangle would pin every
-        // popup to the top-left corner.
-        self.primary_output()
+        // geometry is the output's — the one that surface is actually on, since
+        // outputs may differ in mode and configured scale. Returning a zero
+        // rectangle would pin every popup to the top-left corner.
+        self.output_of(parent)
+            .or_else(|| self.primary_output())
             .and_then(logical_size)
             .map(|size| Rectangle::from_size(size.into()))
             .unwrap_or_default()
@@ -1074,6 +1158,30 @@ mod tests {
         let single = to_physical(offset, 1.0);
         let double = to_physical(offset, 2.0);
         assert!(double.x > single.x && double.y > single.y);
+    }
+
+    #[test]
+    fn a_popup_on_the_layer_surface_is_unconstrained_against_the_whole_output() {
+        // Offset zero is the drop-down hanging straight off the fullscreen
+        // greeter: the target is the output at the origin.
+        let target = unconstrain_rect((1920, 1080), Point::from((0, 0)));
+        assert_eq!(target.loc, Point::from((0, 0)));
+        assert_eq!(target.size, Size::from((1920, 1080)));
+    }
+
+    #[test]
+    fn a_nested_popup_shifts_the_output_back_by_its_parent_offset() {
+        // A submenu whose parent menu already sits 300px down the screen has
+        // only 780 logical pixels of headroom below it. The positioner works in
+        // the parent's coordinates, so the rectangle it is given must start at
+        // -300 — passing (0,0) tells it the screen extends 300px further than it
+        // does and the submenu opens off the bottom edge, where it cannot be
+        // clicked and cannot be dismissed by clicking away from it.
+        let target = unconstrain_rect((1920, 1080), Point::from((200, 300)));
+        assert_eq!(target.loc, Point::from((-200, -300)));
+        assert_eq!(target.size, Size::from((1920, 1080)));
+        // The far edge in parent coordinates is what the positioner clamps to.
+        assert_eq!(target.loc.y + target.size.h, 780);
     }
 
     #[test]
