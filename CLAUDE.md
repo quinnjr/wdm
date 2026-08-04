@@ -201,9 +201,15 @@ but are load-bearing:
 - The rate limit is a **deadline that survives `Login::reset()`**, because a
   greeter can reach reset by destroying its object or by exiting to be
   respawned. Phase alone would be resettable at will.
-- Prompt ids come from a process-global counter and are never reused: per-attempt
-  counters restart at 0, so a late `respond` from a cancelled conversation would
-  match the next one's first prompt.
+- Prompt ids are never reused, and since PAM moved out of process that takes two
+  parts. wdm reserves a **block** of ids per attempt from a process-global
+  counter and sends its base on `Msg::Start`; the helper counts up from there.
+  A counter the helper owned outright would restart at 0 every login — it is a
+  fresh `exec` per attempt — so a late `respond(0, …)` from a cancelled
+  conversation would answer the next attempt's first prompt, feeding one user's
+  secret to another user's PAM stack. wdm also `fetch_max`es every id it
+  forwards, so a helper that spilled past its block still cannot push the next
+  attempt onto a used id.
 - Environment the greeter supplies is filtered by **key and value** — `LANG`,
   `LANGUAGE`, `LC_*` and `XKB_*` only, rejecting values with `/` (glibc loads a
   locale from a path;

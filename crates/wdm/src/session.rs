@@ -135,7 +135,7 @@ impl Launch {
         username: &str,
         vt: u32,
         pam_env: Vec<(String, String)>,
-        extra_env: Vec<(String, String)>,
+        extra_env: &[(String, String)],
     ) -> Result<Self, LaunchError> {
         // Again, in the process that will do the exec. wdm checked this before
         // it released the display, but wdm is not what runs setuid a moment
@@ -365,9 +365,13 @@ fn build_env(
     shell: &std::path::Path,
     vt: u32,
     pam_env: Vec<(String, String)>,
-    extra_env: Vec<(String, String)>,
+    extra_env: &[(String, String)],
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
+    // O(n²): a linear scan per insert. Deliberate, and only defensible here —
+    // this runs once per login over a few dozen `pam_env` entries, and a Vec
+    // keeps the insertion order the exec needs while a map would not. Do not
+    // copy the shape onto anything that runs more than once.
     let mut set = |key: &str, value: String| {
         if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
             slot.1 = value;
@@ -389,8 +393,8 @@ fn build_env(
     // Applied before wdm's own facts, and filtered, so a greeter can localise a
     // session but cannot influence how it loads code or who it runs as.
     for (key, value) in extra_env {
-        if greeter_may_set(&key, &value) {
-            set(&key, value);
+        if greeter_may_set(key, value) {
+            set(key, value.clone());
         } else {
             log::warn!("ignoring environment variable {key} requested by the greeter");
         }
@@ -475,7 +479,7 @@ mod tests {
             Path::new("/bin/zsh"),
             7,
             Vec::new(),
-            Vec::new(),
+            &[],
         );
 
         assert_eq!(env_of(&env, "USER").as_deref(), Some("testuser"));
@@ -500,7 +504,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            Vec::new(),
+            &[],
         );
         assert_eq!(env_of(&env, "XDG_SESSION_TYPE").as_deref(), Some("x11"));
     }
@@ -515,7 +519,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
-            Vec::new(),
+            &[],
         );
         assert_eq!(
             env_of(&env, "XDG_RUNTIME_DIR").as_deref(),
@@ -533,7 +537,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             vec![("XDG_VTNR".to_owned(), "1".to_owned())],
-            Vec::new(),
+            &[],
         );
         assert_eq!(env_of(&env, "XDG_VTNR").as_deref(), Some("7"));
     }
@@ -547,7 +551,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            vec![
+            &[
                 ("LANG".to_owned(), "de_DE.UTF-8".to_owned()),
                 ("LC_TIME".to_owned(), "en_GB.UTF-8".to_owned()),
                 ("XKB_DEFAULT_LAYOUT".to_owned(), "de".to_owned()),
@@ -595,10 +599,10 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            dangerous
+            &dangerous
                 .iter()
                 .map(|k| ((*k).to_owned(), "/tmp/evil".to_owned()))
-                .collect(),
+                .collect::<Vec<_>>(),
         );
 
         assert!(env_of(&env, "LD_PRELOAD").is_none());
@@ -659,7 +663,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            vec![("XDG_SESSION_TYPE".to_owned(), "x11".to_owned())],
+            &[("XDG_SESSION_TYPE".to_owned(), "x11".to_owned())],
         );
         assert_eq!(env_of(&env, "XDG_SESSION_TYPE").as_deref(), Some("wayland"));
     }
@@ -673,7 +677,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             vec![("PATH".to_owned(), "/pam".to_owned())],
-            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
+            &[("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
         );
 
         for key in ["PATH", "LANG", "HOME"] {
@@ -697,14 +701,8 @@ mod tests {
         // And build refuses it too. The split put validate in wdm, one process
         // and one socket away from the process that runs setuid; a check the
         // exec path does not make is a check something can be routed around.
-        let err = Launch::build(
-            &session(SessionType::Wayland),
-            "root",
-            7,
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap_err();
+        let err =
+            Launch::build(&session(SessionType::Wayland), "root", 7, Vec::new(), &[]).unwrap_err();
         assert!(
             matches!(err, LaunchError::NotLoginable(_) | LaunchError::NoShell(_)),
             "build let root through: {err:?}"
@@ -722,7 +720,7 @@ mod tests {
             Path::new("/bin/sh"),
             7,
             Vec::new(),
-            Vec::new(),
+            &[],
         );
         assert!(env_of(&env, "WAYLAND_DISPLAY").is_none());
     }
@@ -754,7 +752,7 @@ mod tests {
             "definitely-not-a-user-on-this-box",
             7,
             Vec::new(),
-            Vec::new(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, LaunchError::NoSuchUser(_)), "{err:?}");
@@ -792,7 +790,7 @@ mod tests {
         let err = Launch::validate(&s, &name).unwrap_err();
         assert!(matches!(err, LaunchError::EmptyCommand(_)), "{err:?}");
 
-        let err = Launch::build(&s, &name, 7, Vec::new(), Vec::new()).unwrap_err();
+        let err = Launch::build(&s, &name, 7, Vec::new(), &[]).unwrap_err();
         assert!(matches!(err, LaunchError::EmptyCommand(_)), "{err:?}");
     }
 
@@ -823,7 +821,7 @@ mod tests {
             &name,
             7,
             vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
-            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
+            &[("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
         )
         .expect("a valid account and session failed to build");
 

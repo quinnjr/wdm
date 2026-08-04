@@ -187,10 +187,25 @@ fn create_cache_dir_at(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::i
     // Only the leaf gets 0700. `DirBuilder::mode` applies to *every* component
     // it creates, so a recursive create of the whole path on a system without
     // /var/cache would leave /var/cache itself root-owned and root-only, and
-    // every other package that expects to write there would break. The parent is
-    // created at the default mode, and normally exists already.
+    // every other package that expects to write there would break. The parent
+    // therefore gets 0755 — and 0755 explicitly, not `create_dir_all`'s default.
+    //
+    // The default is `0o777 & ~umask`, which makes the parent's mode a property
+    // of whoever started wdm. The unit now sets `UMask=0022`, but a drop-in or a
+    // hand-started wdm need not, and at `umask 0` this created a
+    // world-writable /var/cache — which is precisely the "the greeter account
+    // gains write access to the parent" precondition the O_NOFOLLOW comment
+    // below says is an assumption and not a given. umask can only clear bits, so
+    // naming 0755 here bounds it from above whatever the caller's umask is.
+    //
+    // An existing parent is left exactly as it is: `create` on a path that is
+    // already there does not reapply the mode, and reasserting one on /var/cache
+    // is not wdm's business.
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)?;
     }
 
     let mut builder = std::fs::DirBuilder::new();
@@ -1299,6 +1314,16 @@ mod tests {
         assert!(
             parent_mode & 0o055 != 0,
             "the parent stays traversable: {parent_mode:o}"
+        );
+        // And not writable by anyone else, whatever the caller's umask was. With
+        // `create_dir_all`'s default mode this was 0o777 & ~umask, so a wdm
+        // started with `umask 0` — a drop-in, or a hand-started bring-up —
+        // created a world-writable /var/cache and handed a compromised greeter
+        // the one precondition the O_NOFOLLOW open exists to survive.
+        assert_eq!(
+            parent_mode & 0o022,
+            0,
+            "the parent is group- or world-writable: {parent_mode:o}"
         );
 
         let leaf = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&dir).unwrap()) & 0o777;

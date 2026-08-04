@@ -26,6 +26,29 @@ ExecStart=/usr/bin/wdm
 Restart=always
 RestartSec=1
 
+# Explicit, and explicitly not shorter. wdm does not exit while a user's session
+# is on the display: it catches SIGTERM, records it, and goes on dispatching
+# until the session ends, because exiting would leave the session owning a
+# display no display manager is tracking. So `systemctl stop wdm` during an
+# active session does not complete until the user logs out, and systemd's stop
+# timeout is what bounds that.
+#
+# Not shorter, because the SIGKILL at the end of it takes the PAM helper with
+# wdm, and the helper is what runs pam_close_session — the session's keyring,
+# mount namespace and logind bookkeeping are unwound by that call and by nothing
+# else. Not `infinity` either: a wedged session must not be able to hold up a
+# shutdown forever. At shutdown proper this timeout is not reached, because
+# systemd stops the session scopes first, wdm hears the session end and exits on
+# the SIGTERM it already has.
+TimeoutStopSec=90s
+
+# The greeter's cache directory is created under /var/cache, and
+# create_cache_dir_at names the modes it wants explicitly — but umask can only
+# take bits away, so a mode is only ever as tight as the umask permits and never
+# tighter. Stated here so the directories wdm creates do not depend on what the
+# service manager happened to inherit.
+UMask=0022
+
 # wdm needs to be root: it owns DRM master, reads the shadow database through
 # PAM, and drops privileges itself when launching the greeter and the session.
 User=root

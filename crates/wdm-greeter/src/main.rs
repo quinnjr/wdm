@@ -198,9 +198,23 @@ struct App {
     /// True while a `create_session` is outstanding.
     authenticating: bool,
     /// True once PAM explained itself mid-conversation (an Info or Error
-    /// prompt, such as faillock's lockout notice). Suppresses the automatic
-    /// retry on `auth_failed`, which would scroll the explanation away.
+    /// prompt, such as faillock's lockout notice).
+    ///
+    /// It decides which text survives the verdict, and nothing else: an
+    /// explanation PAM gave — "the account is locked, 10 minutes left" — is
+    /// strictly more useful than the "Authentication failure" that follows it,
+    /// so `auth_failed` leaves it standing. It used to gate an automatic retry
+    /// as well; nothing opens a conversation on the user's behalf any more, so
+    /// there is no retry left to gate.
     blocked: bool,
+    /// True once a conversation has ended without authenticating.
+    ///
+    /// Latched, never cleared: it says whether there is anything to try
+    /// *again*, and that stops being false for the rest of this greeter's life.
+    /// The only thing it changes is the idle prompt line — see [`idle_prompt`],
+    /// which pairs it with `authenticating` so an attempt in flight still reads
+    /// as one.
+    attempted: bool,
 
     /// The frame's pixels, reused across frames and rebuilt only on resize.
     /// `ui::paint` overwrites every pixel, so it needs no clearing between
@@ -242,6 +256,7 @@ impl App {
             launching: false,
             authenticating: false,
             blocked: false,
+            attempted: false,
             canvas: None,
             xkb: None,
             exit: false,
@@ -285,7 +300,7 @@ impl App {
         self.prompt = None;
         self.info = None;
         // A new attempt is underway, so whatever PAM said about the last one
-        // no longer blocks anything.
+        // no longer decides anything.
         self.blocked = false;
         self.authenticating = true;
         greeter.create_session(user.name.clone());
@@ -474,34 +489,20 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Whether a failed conversation should be restarted without a keypress.
+    /// React to `auth_failed`: show the reason and drop back to the form.
     ///
-    /// Auto-retry is a convenience for the mistyped-password case. When PAM
-    /// explained the failure — an account locked with minutes left on the
-    /// clock — restarting would clear that explanation from the screen and
-    /// reset the form under the user, so the failure is left standing and
-    /// Enter starts the next attempt deliberately.
-    ///
-    /// Meaningful only when called from `auth_failed`, which is its only
-    /// caller. The shared client's `Model::should_auto_retry` also demands
-    /// `conversation_over && prompt.is_none() && !authenticated`; here those
-    /// three are facts of the call site rather than conditions — `auth_failed`
-    /// *is* the end of the conversation, and it has already cleared `prompt`
-    /// and `authenticating` by the time it asks. Calling this from anywhere
-    /// else would be asking a question it does not answer.
-    fn should_auto_retry(&self) -> bool {
-        !self.blocked
-    }
-
-    /// React to `auth_failed`: show the reason, and say whether the caller
-    /// should start the next attempt.
-    ///
-    /// The decision is returned rather than acted on here so that it is
-    /// observable: a test can assert the retry without a compositor to talk to,
-    /// which a self-contained `begin_auth()` call could not offer.
-    #[must_use]
-    fn auth_failed(&mut self, reason: String) -> bool {
+    /// Nothing is restarted here, and that is the point. Restarting looked like
+    /// a convenience for the mistyped-password case, but a wrong password and a
+    /// conversation that timed out are indistinguishable at this level, so the
+    /// retry re-armed PAM for a screen nobody was standing at — one
+    /// `pam_faillock` charge per turn, each sitting on wdm's prompt until its
+    /// 30-minute response timeout, until the account locked. wdm-gtk-greeter
+    /// and the default webkit theme both arrived at the same rule, and `submit`
+    /// says it is the only thing that opens a conversation; this is what makes
+    /// that true. A wrong password now costs the user one keystroke more.
+    fn auth_failed(&mut self, reason: String) {
         self.authenticating = false;
+        self.attempted = true;
         self.prompt = None;
         self.answer.clear();
         // The conversation it was buffered for is over. It must not survive into
@@ -515,22 +516,18 @@ impl App {
             self.error = Some(reason);
         }
         self.needs_redraw = true;
-        // Retrying asks again so the user can have another go without pressing
-        // anything.
-        //
-        // wdm delays each failure response, and the delay grows, so this
-        // converges rather than spinning — but the first failure of a
-        // conversation is reported with no delay at all, so a PAM stack
-        // that denies instantly does produce one uncontrolled round trip
-        // before the backoff engages.
-        self.should_auto_retry()
     }
 
     /// Launch the selected session; valid only after `auth_ok`.
     fn start_session(&mut self) {
         let (Some(greeter), Some(session)) = (&self.greeter, self.sessions.get(self.session_index))
         else {
-            self.error = Some("no session to start".to_owned());
+            // The same sentence the enumerate-phase screen above paints, and
+            // the same one wdm-gtk-greeter and the default theme use: the
+            // condition is identical — this machine has nothing to log into —
+            // and a user comparing two machines must not read two sentences for
+            // it. Pinned by the drift check in wdm-gtk-greeter's `ui.rs`.
+            self.error = Some("No sessions installed".to_owned());
             self.needs_redraw = true;
             return;
         };
@@ -621,7 +618,11 @@ impl App {
                     sessions: &self.session_names,
                     session_index: self.session_index,
                     menu_open: self.menu_open,
-                    prompt: self.prompt.as_ref().map(|p| p.text.as_str()),
+                    prompt: self
+                        .prompt
+                        .as_ref()
+                        .map(|p| p.text.as_str())
+                        .or_else(|| idle_prompt(self.attempted, self.authenticating)),
                     answer: &self.answer,
                     // Masked unless PAM said the answer may be echoed. Defaulting
                     // to masked matters: an unmasked password is worse than an
@@ -863,11 +864,8 @@ impl Dispatch<WdmGreeterV1, ()> for App {
                 state.start_session();
             }
 
-            wdm_greeter_v1::Event::AuthFailed { reason } => {
-                if state.auth_failed(reason) {
-                    state.begin_auth();
-                }
-            }
+            // Deliberately not followed by `begin_auth`: see `auth_failed`.
+            wdm_greeter_v1::Event::AuthFailed { reason } => state.auth_failed(reason),
 
             _ => {}
         }
@@ -1049,6 +1047,28 @@ impl Dispatch<WlOutput, ()> for App {
 /// [`PromptStyle::Visible`]: wdm_greeter_v1::PromptStyle::Visible
 fn spend_buffered(buffered: Option<String>, secret: bool) -> Option<String> {
     buffered.filter(|_| secret)
+}
+
+/// The prompt line to show when PAM has asked nothing.
+///
+/// [`ui::paint`] falls back to "Waiting…" for a view with no prompt, which is
+/// right for a screen nobody has touched and wrong straight after a refusal:
+/// the conversation is over, nothing is coming, and the user has to press Enter
+/// for anything else to happen. Saying so is the whole of what replaced the
+/// automatic retry — see [`App::auth_failed`] — and an Enter that has to be
+/// guessed at reads as a wedged greeter.
+///
+/// `authenticating` is asked as well as `attempted`, because the two states are
+/// not the same and wdm may hold the first prompt of a conversation back for a
+/// whole rate-limit cooldown: an attempt in flight has nothing for the user to
+/// do, so it keeps the "Waiting…" fallback rather than inviting a keypress that
+/// `submit` would ignore.
+///
+/// Wording matched to wdm-gtk-greeter's `wait_prompt` and the default webkit
+/// theme, which reach the same state; the drift check that pins it lives in
+/// wdm-gtk-greeter.
+fn idle_prompt(attempted: bool, authenticating: bool) -> Option<&'static str> {
+    (attempted && !authenticating).then_some("Press Enter to try again")
 }
 
 fn main() -> ExitCode {
@@ -1248,22 +1268,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pam_explanation_suppresses_the_auto_retry() {
+    fn a_pam_explanation_survives_the_verdict() {
         // The defect this guards: with a faillock-locked account, PAM sends
-        // "the account is locked, 10 minutes left" and an unconditional retry
-        // would clear it from the screen while feeding the lock.
+        // "the account is locked, 10 minutes left" and the generic
+        // "Authentication failure" that follows would scroll it away.
         let mut app = app();
         app.pam_prompt(
             0,
             "Account locked, 10 minutes left".to_owned(),
             PromptStyle::Info,
         );
-        assert!(!app.should_auto_retry());
+        assert!(app.blocked);
 
-        assert!(
-            !app.auth_failed("Authentication failure".to_owned()),
-            "the retry must not be requested"
-        );
+        app.auth_failed("Authentication failure".to_owned());
         assert_eq!(
             app.info.as_deref(),
             Some("Account locked, 10 minutes left"),
@@ -1272,23 +1289,51 @@ mod tests {
     }
 
     #[test]
-    fn an_unexplained_failure_still_retries() {
+    fn an_unexplained_failure_does_not_retry() {
+        // The defect this guards: a plain wrong password leaves `blocked`
+        // false, and this used to answer that by opening a fresh conversation
+        // nobody asked for. A timeout is indistinguishable from a mistyped
+        // password here, so the retry armed PAM for a screen the user had
+        // walked away from and sat on wdm's prompt until its 30-minute
+        // response timeout — a second `pam_faillock` charge, then a third.
         let mut app = app();
         app.pam_prompt(0, "Password:".to_owned(), PromptStyle::Secret);
-        assert!(app.should_auto_retry(), "a question is not an explanation");
-        assert!(
-            app.auth_failed("Authentication failure".to_owned()),
-            "a bare failure is the mistyped-password case, so it retries"
-        );
+        assert!(!app.blocked, "a question is not an explanation");
+
+        app.auth_failed("Authentication failure".to_owned());
         assert_eq!(app.error.as_deref(), Some("Authentication failure"));
+        assert!(
+            !app.authenticating,
+            "the conversation is over and nothing may replace it but `submit`"
+        );
+        // What replaced the retry: the user is told which key restarts it,
+        // because an Enter that has to be guessed at reads as a wedged greeter.
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), None);
+        assert_eq!(
+            idle_prompt(app.attempted, app.authenticating),
+            Some("Press Enter to try again")
+        );
+    }
+
+    #[test]
+    fn the_idle_line_only_invites_a_retry_when_there_is_one() {
+        // Nothing attempted yet: "again" would be a lie on a login screen
+        // nobody has touched, so `ui::paint` keeps its "Waiting…" fallback.
+        assert_eq!(idle_prompt(false, false), None);
+        // An attempt in flight: wdm may hold the first prompt back for a whole
+        // rate-limit cooldown, and `submit` ignores Enter throughout, so the
+        // invitation would be to a keypress that does nothing.
+        assert_eq!(idle_prompt(false, true), None);
+        assert_eq!(idle_prompt(true, true), None);
+        assert_eq!(idle_prompt(true, false), Some("Press Enter to try again"));
     }
 
     #[test]
     fn error_style_prompts_also_block() {
         let mut app = app();
         app.pam_prompt(0, "Permission denied".to_owned(), PromptStyle::Error);
-        assert!(!app.should_auto_retry());
-        assert!(!app.auth_failed("Authentication failure".to_owned()));
+        assert!(app.blocked);
+        app.auth_failed("Authentication failure".to_owned());
         assert_eq!(app.error.as_deref(), Some("Permission denied"));
     }
 
@@ -1356,14 +1401,14 @@ mod tests {
         // pam_faillock reports the lockout as a PAM_ERROR_MSG and the stack
         // then fails with a generic reason. Overwriting `error` there would
         // replace the only text that says why, leaving "Authentication
-        // failure" and no retry — worse than either alone.
+        // failure" and nothing else — worse than either alone.
         let mut app = app();
         app.pam_prompt(
             0,
             "Account locked due to 3 failed logins".to_owned(),
             PromptStyle::Error,
         );
-        assert!(!app.auth_failed("Authentication failure".to_owned()));
+        app.auth_failed("Authentication failure".to_owned());
         assert_eq!(
             app.error.as_deref(),
             Some("Account locked due to 3 failed logins")

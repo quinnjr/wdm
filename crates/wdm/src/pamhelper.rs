@@ -68,8 +68,8 @@ use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
 use zeroize::Zeroize;
 
 use crate::auth::{
-    Phase, PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, next_prompt_id,
-    notice_to_greeter, os_to_string, pam_session_env, to_greeter,
+    Cause, Phase, PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, notice_to_greeter,
+    os_to_string, pam_session_env, to_greeter,
 };
 use crate::pamwire::{MAX_MESSAGE, Msg};
 use crate::session::Launch;
@@ -112,9 +112,13 @@ pub fn run() -> ExitCode {
             log::error!("the PAM socket closed before the first message");
             return ExitCode::FAILURE;
         }
-        // Unreachable with no timeout, but a `_` arm here would hide a future
-        // one.
-        Recv::Timeout => return ExitCode::FAILURE,
+        // Unreachable with no timeout — `recv` retries `EINTR` itself rather
+        // than reporting it here, which is the only way this arm was ever
+        // reached — but a `_` arm would hide a future one.
+        Recv::Timeout => {
+            log::error!("the PAM socket timed out with no deadline set");
+            return ExitCode::FAILURE;
+        }
     };
 
     log::debug!(
@@ -128,6 +132,8 @@ pub fn run() -> ExitCode {
         timeout: RESPONSE_TIMEOUT,
         username: &start.username,
         authenticated: false,
+        display_released: false,
+        next_id: start.id_base,
     };
 
     let context = match Context::new(SERVICE, Some(&start.username), conv) {
@@ -165,6 +171,8 @@ struct Start {
     username: String,
     tty: String,
     session: SessionDescription,
+    /// The first prompt id this attempt may issue, reserved by wdm.
+    id_base: u32,
 }
 
 impl Start {
@@ -176,6 +184,7 @@ impl Start {
             vtnr,
             session_type,
             desktop,
+            id_base,
         } = msg
         else {
             return None;
@@ -189,6 +198,7 @@ impl Start {
                 session_type: session_type.clone(),
                 desktop: desktop.clone(),
             },
+            id_base: *id_base,
         })
     }
 }
@@ -387,7 +397,10 @@ impl Spawn for SessionSpawn<'_> {
             self.username,
             launch.vt,
             pam_env,
-            launch.extra_env.clone(),
+            // Borrowed: `Msg`'s `Drop` already forced one copy of this out of
+            // the message, and `build` clones only the entries the greeter is
+            // allowed to set — which is fewer than all of them.
+            &launch.extra_env,
         )
         .map_err(|e| e.to_string())?;
 
@@ -408,9 +421,10 @@ impl Spawn for SessionSpawn<'_> {
 /// still reaches `pam_close_session` — would have no coverage at all. Hence the
 /// seam: [`serve`] owns the order, and it is the order that is being asserted.
 ///
-/// What this trait cannot check is that [`LibPam`] calls PAM correctly. That is
-/// held by review against [`crate::auth::run`], which does the same sequence and
-/// is the code currently in production.
+/// What this trait cannot check is that [`LibPam`] calls PAM correctly — the
+/// flags, the order, the pairing. That is held by review of [`LibPam`] itself,
+/// and, for the one part of it that is a security property rather than a
+/// correctness one, by [`authenticate_failure`]'s table test.
 trait Pam {
     /// `pam_start` through `pam_acct_mgmt`, inclusive.
     fn authenticate(&mut self) -> Result<(), String>;
@@ -480,9 +494,14 @@ fn serve(wire: &Wire, pam: &mut dyn Pam, spawner: &mut dyn Spawn) {
 /// closes the PAM session — which is why the `waitpid` is here and not anywhere
 /// that could be skipped. wdm is not the session's parent and cannot do this.
 ///
-/// Nothing here reads the socket. A wdm that vanishes mid-session is not a
-/// reason to kill the user's session, and the sends failing is enough: the
-/// helper still reaps its child and still closes the PAM session on the way out.
+/// No read is possible once the display is gone, and that is a property of the
+/// whole of [`Pam::with_session`] rather than of this function: the conversation
+/// is still installed in the `Context` and a module could still call it, so
+/// [`WireConversation::display_released`] refuses a question here instead of
+/// letting it block. Nothing in this function reads the socket either, which is
+/// why a wdm that vanishes mid-session does not kill the user's session — the
+/// sends failing is enough, and the helper still reaps its child and still
+/// closes the PAM session on the way out.
 fn run_session(
     wire: &Wire,
     spawner: &mut dyn Spawn,
@@ -547,12 +566,7 @@ fn name_of(msg: &Msg) -> &'static str {
     }
 }
 
-/// The real thing: [`crate::auth::run`]'s PAM sequence, out of process.
-///
-/// Any divergence from that function is a bug in one of the two. It is
-/// deliberately a transcription and not a refactor of it — the thread stays in
-/// production until the whole change lands, and a shared implementation would
-/// have to be shaped for both callers before either had proved itself.
+/// The real thing: `pam_start` through `pam_close_session`, out of process.
 ///
 /// Concrete in its conversation rather than generic over `ConversationHandler`,
 /// because it has to reach back into that conversation and tell it
@@ -561,6 +575,25 @@ fn name_of(msg: &Msg) -> &'static str {
 struct LibPam<'a> {
     context: Context<WireConversation<'a>>,
     start: &'a Start,
+}
+
+/// What the greeter is told when `pam_authenticate` refuses.
+///
+/// One line, extracted from [`LibPam::authenticate`] for one reason: it is the
+/// mapping from PAM's own words to the greeter's, and inside a method on a type
+/// holding a live `Context` nothing can drive it — `pam_client2::Error::new` is
+/// `pub(crate)`, so a test cannot even build the input. As a free function over
+/// [`Cause`] it takes a `&str`, and
+/// `tests::the_authenticate_verdict_is_one_string_for_every_cause` walks the
+/// causes this host's stack really produced.
+///
+/// What that test cannot catch is a caller that stops going through here at all.
+/// `tests::serve_forwards_the_authenticate_verdict_verbatim` covers the other
+/// half — that whatever [`Pam::authenticate`] returns is what crosses the socket
+/// — and between them the only unguarded move is editing the call site above to
+/// name `to_greeter` with a different phase.
+fn authenticate_failure(username: &str, cause: &(impl Cause + ?Sized)) -> String {
+    to_greeter(Phase::Authenticate, username, cause)
 }
 
 impl Pam for LibPam<'_> {
@@ -584,13 +617,11 @@ impl Pam for LibPam<'_> {
         // DISALLOW_NULL_AUTHTOK: an account with an empty password must not be
         // loginable from the greeter.
         if let Err(e) = self.context.authenticate(Flag::DISALLOW_NULL_AUTHTOK) {
-            // Phase::Authenticate is the one phase whose text the greeter never
-            // sees, or the login screen is an account oracle; the real cause is
-            // logged inside. See `auth::AUTH_FAILED`, and
-            // `tests::an_authentication_failure_reaches_wdm_as_one_fixed_string`
-            // below, which is what stops this reverting to PAM's own words with
-            // a green suite.
-            return Err(to_greeter(Phase::Authenticate, &self.start.username, &e));
+            // Through `authenticate_failure` rather than `to_greeter` directly,
+            // so the phase choice — the one whose text the greeter never sees,
+            // or the login screen is an account oracle — is made in a function a
+            // test can drive. See `auth::AUTH_FAILED`.
+            return Err(authenticate_failure(&self.start.username, &e));
         }
 
         // Past here a credential has been proven, so PAM modules may speak to
@@ -619,6 +650,13 @@ impl Pam for LibPam<'_> {
     }
 
     fn with_session(&mut self, session_type: &str, desktop: &str, hold: &mut dyn FnMut(Opened)) {
+        // Reaching here means wdm has sent Launch, which it sends only after it
+        // has released the display and killed the greeter. So nothing can be
+        // asked from now on, and a module that asks anyway — pam_kwallet
+        // wanting a wallet password, an OTP module on the session stack — must
+        // be refused rather than left blocking on a socket nobody will answer.
+        self.context.conversation_mut().display_released = true;
+
         // The greeter's choice supersedes the defaults set before
         // authentication. This must land before open_session: pam_systemd
         // registers the logind session there, and a session registered with the
@@ -669,6 +707,19 @@ impl Pam for LibPam<'_> {
 /// The socket, and the only I/O policy in this module.
 struct Wire {
     sock: UnixDatagram,
+    /// The receive buffer, reused for every datagram.
+    ///
+    /// [`MAX_MESSAGE`] is 256 KiB, which is above glibc's mmap threshold: a
+    /// fresh `vec![0u8; MAX_MESSAGE]` per `recv` is an mmap, a 256 KiB memset
+    /// and a munmap to carry a forty-byte prompt, and [`WireConversation::ask`]
+    /// goes round its loop once per discarded stale response as well as once per
+    /// answer.
+    ///
+    /// A `RefCell` and not a `Mutex` because the helper is single-threaded, and
+    /// deliberately so — see the module docs. The borrow is confined to
+    /// [`Self::recv`], which is never re-entered: nothing it calls reads the
+    /// socket.
+    buf: std::cell::RefCell<Vec<u8>>,
 }
 
 /// What came off the socket.
@@ -695,25 +746,38 @@ impl Wire {
         }
         // SAFETY: the descriptor is open, and nothing else in this process has
         // taken ownership of it — the helper does nothing before this.
-        Ok(Self {
-            sock: unsafe { UnixDatagram::from_raw_fd(fd) },
-        })
+        Ok(Self::from_socket(unsafe { UnixDatagram::from_raw_fd(fd) }))
     }
 
-    #[cfg(test)]
     fn from_socket(sock: UnixDatagram) -> Self {
-        Self { sock }
+        Self {
+            sock,
+            // Heap, not stack: MAX_MESSAGE is 256 KiB and this runs on whatever
+            // stack the exec gave us. Allocated once, here, rather than once per
+            // datagram.
+            buf: std::cell::RefCell::new(vec![0u8; MAX_MESSAGE]),
+        }
     }
 
     /// Send one datagram, or log why not.
     ///
     /// Nothing here can act on a send failure: the peer is wdm, and if it has
     /// gone the next `recv` reports it as [`Recv::Closed`] and the helper
-    /// unwinds through the path it already has for cancellation.
+    /// unwinds through the path it already has for cancellation. It is logged at
+    /// `error` all the same — a message that did not go is one the peer is still
+    /// waiting for, and the failures that are not a dead peer leave both ends
+    /// alive and stuck.
+    ///
+    /// The encoded copy is scrubbed, mirroring `auth.rs`'s twin. The helper
+    /// never encodes a [`Msg::Response`] today, so it protects nothing yet; it
+    /// is here because the two functions are otherwise identical and a guard
+    /// only one of them carries is a guard the next reader assumes is unneeded.
     fn send(&self, msg: &Msg) {
-        if let Err(e) = self.sock.send(&msg.encode()) {
-            log::debug!("sending {} to wdm: {e}", name_of(msg));
+        let mut bytes = msg.encode();
+        if let Err(e) = self.sock.send(&bytes) {
+            log::error!("sending {} to wdm: {e}", name_of(msg));
         }
+        bytes.zeroize();
     }
 
     /// Receive one datagram, waiting at most `timeout`.
@@ -728,52 +792,56 @@ impl Wire {
             return Recv::Closed;
         }
 
-        // Heap, not stack: MAX_MESSAGE is 256 KiB and this runs on whatever
-        // stack the exec gave us.
-        let mut buf = vec![0u8; MAX_MESSAGE];
-        let received = self.sock.recv(&mut buf);
+        let mut buf = self.buf.borrow_mut();
 
-        let decoded = match received {
-            // A zero-length read on SOCK_SEQPACKET is the peer closing. The
-            // codec never produces an empty datagram, so there is nothing this
-            // could be confused with.
-            Ok(0) => {
-                log::debug!("wdm closed the PAM socket");
-                Recv::Closed
-            }
-            Ok(n) => match Msg::decode(&buf[..n]) {
-                Some(msg) => Recv::Msg(msg),
-                None => {
-                    // Both ends are the same binary, so this is a bug or an
-                    // attack, never version skew.
-                    log::error!("undecodable message of {n} bytes on the PAM socket");
-                    Recv::Closed
+        let (decoded, wrote) = loop {
+            match self.sock.recv(&mut buf) {
+                // A zero-length read on SOCK_SEQPACKET is the peer closing. The
+                // codec never produces an empty datagram, so there is nothing
+                // this could be confused with.
+                Ok(0) => {
+                    log::debug!("wdm closed the PAM socket");
+                    break (Recv::Closed, 0);
                 }
-            },
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Recv::Timeout
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                // A signal, not an end. The caller owns the deadline, so
-                // reporting a timeout lets it decide whether any time is left
-                // rather than looping here without one.
-                Recv::Timeout
-            }
-            Err(e) => {
-                log::error!("reading the PAM socket: {e}");
-                Recv::Closed
+                Ok(n) => match Msg::decode(&buf[..n]) {
+                    Some(msg) => break (Recv::Msg(msg), n),
+                    None => {
+                        // Both ends are the same binary, so this is a bug or an
+                        // attack, never version skew.
+                        log::error!("undecodable message of {n} bytes on the PAM socket");
+                        break (Recv::Closed, n);
+                    }
+                },
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break (Recv::Timeout, 0);
+                }
+                // A signal, not an end and not a deadline. Retried here because
+                // nothing above wants to see it: every caller treats a Timeout
+                // as final — `ask` tells the greeter the login timed out and
+                // fails the attempt, which is a pam_faillock charge; `serve`
+                // silently cancels; `run` exits FAILURE — so surfacing EINTR as
+                // one turned a stray signal into any of those. `SO_RCVTIMEO`
+                // restarts the clock on the retry, which is why `ask` computes
+                // its deadline once and passes what is left of it.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    log::error!("reading the PAM socket: {e}");
+                    break (Recv::Closed, 0);
+                }
             }
         };
 
         // The buffer held a password if that was a Response. `Msg`'s Drop
         // scrubs the String it decoded into; this is the copy the kernel wrote,
-        // which nothing else would ever touch again.
-        buf.zeroize();
+        // which nothing else would ever touch again. Only the bytes written:
+        // the rest of the buffer is whatever the last scrub left, which is
+        // zeroes.
+        buf[..wrote].zeroize();
 
         decoded
     }
@@ -781,10 +849,8 @@ impl Wire {
 
 /// Bridges libpam's blocking conversation to the socket.
 ///
-/// The same shape as [`crate::auth`]'s `ChannelConversation`, with a socket
-/// where that has two channels. Notably the same in one place that matters: the
-/// deadline is computed once, before the loop, so a peer sending stale responses
-/// cannot extend it.
+/// The deadline is computed once, before the loop, so a peer sending stale
+/// responses cannot extend it.
 struct WireConversation<'a> {
     wire: &'a Wire,
     /// Always [`RESPONSE_TIMEOUT`] in production; a field so tests can reach the
@@ -801,12 +867,53 @@ struct WireConversation<'a> {
     /// oracle of the two. Prompts are never gated — a question that is not shown
     /// cannot be answered, and every one of them is a question wdm asked for.
     authenticated: bool,
+    /// Whether wdm has released the display and killed the greeter.
+    ///
+    /// Set by [`LibPam::with_session`], because [`Msg::Launch`] is sent only
+    /// after the handoff. Past it there is nobody to answer a question: a module
+    /// that prompts inside `pam_open_session` would otherwise land in
+    /// [`Self::ask`] and block there for [`RESPONSE_TIMEOUT`] — half an hour of
+    /// black screen with no greeter, no session and no way out but the VT chord.
+    /// So the question is logged and refused promptly instead.
+    display_released: bool,
+    /// The next prompt id to issue.
+    ///
+    /// Seeded from [`Msg::Start`]'s `id_base`, which wdm reserved. The helper is
+    /// a fresh `exec` per attempt and so cannot hold a counter that outlives
+    /// one; wdm can, and does. See `auth::NEXT_PROMPT_ID`.
+    next_id: u32,
 }
 
 impl WireConversation<'_> {
+    /// Take the next unused prompt id.
+    fn take_id(&mut self) -> u32 {
+        let id = self.next_id;
+        // Saturating rather than wrapping: an id that went back round would
+        // collide with one this same conversation has already issued, which is
+        // the one thing an id may never do. Reaching it needs four billion
+        // prompts in one attempt, and every id after it is then the same — a
+        // conversation that has issued four billion questions has other
+        // problems, and a stuck id is the safe way to have them.
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
+
     /// Emit a prompt and block until the matching response arrives.
     fn ask(&mut self, prompt: &CStr, style: PromptStyle) -> Result<CString, ErrorCode> {
-        let id = next_prompt_id();
+        if self.display_released {
+            // Logged rather than forwarded: the send would succeed — wdm's end
+            // of the socket is still open, it is waiting for the session — and
+            // nothing would display it.
+            log::error!(
+                "a PAM module asked {:?} a question after the display was released: {:?}; \
+                 refusing it, because there is no greeter left to answer",
+                self.username,
+                prompt.to_string_lossy()
+            );
+            return Err(ErrorCode::CONV_ERR);
+        }
+
+        let id = self.take_id();
         // PAM messages come from modules and are not guaranteed UTF-8.
         self.emit(id, prompt.to_string_lossy().into_owned(), style);
 
@@ -831,11 +938,12 @@ impl WireConversation<'_> {
                     //
                     // An `error` prompt is how a greeter learns that PAM
                     // explained itself: it lands in `Model::push_notice`, which
-                    // sets `blocked`, which is what `Model::should_auto_retry`
-                    // consults. So this single event both tells the user why
-                    // their form reset and stops the loop.
+                    // sets `blocked`. So this single event both tells the user
+                    // why their form reset and marks the failure as one to
+                    // leave on screen rather than replace.
+                    let notice = self.take_id();
                     self.emit(
-                        next_prompt_id(),
+                        notice,
                         "The login attempt timed out waiting for a response.".to_owned(),
                         PromptStyle::Error,
                     );
@@ -892,7 +1000,8 @@ impl WireConversation<'_> {
         } else {
             notice_to_greeter(self.username, &text)
         };
-        self.emit(next_prompt_id(), text, style);
+        let id = self.take_id();
+        self.emit(id, text, style);
     }
 
     fn emit(&self, id: u32, text: String, style: PromptStyle) {
@@ -973,12 +1082,17 @@ mod tests {
 
     /// A conversation on `wire`, at whichever side of `pam_authenticate`
     /// `authenticated` names.
+    ///
+    /// Its ids come from a real reservation, so a test that runs two
+    /// conversations sees what two helper generations would see.
     fn conversation(wire: &Wire, timeout: Duration, authenticated: bool) -> WireConversation<'_> {
         WireConversation {
             wire,
             timeout,
             username: "someone",
             authenticated,
+            display_released: false,
+            next_id: crate::auth::reserve_prompt_ids(),
         }
     }
 
@@ -992,16 +1106,35 @@ mod tests {
         assert!(Wire::from_fd(4096).is_err());
     }
 
+    /// What the two fakes did, in the order they did it.
+    ///
+    /// Shared between [`FakePam`] and [`FakeSpawn`] because the property worth
+    /// asserting spans both: that `pam_open_session` happens before the fork and
+    /// `pam_close_session` after the reap. A `closed: bool` set unconditionally
+    /// after the callback returns — which is what this replaces — asserts only
+    /// that a fake did what the fake was written to do.
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
+
+    fn log() -> Log {
+        Log::default()
+    }
+
+    fn record(log: &Log, what: &'static str) {
+        log.borrow_mut().push(what);
+    }
+
+    fn entries(log: &Log) -> Vec<&'static str> {
+        log.borrow().clone()
+    }
+
     /// A [`Pam`] that succeeds, asks one question through the conversation, and
     /// records what it was told.
     struct FakePam<'a> {
         conv: WireConversation<'a>,
+        log: Log,
         /// Set when `with_session` runs, so a test can prove `open_session` did
         /// not happen before [`Msg::Launch`].
         opened: Option<(String, String)>,
-        /// Set when the session is closed, which must happen even when wdm
-        /// simply drops the socket.
-        closed: bool,
         answer: Option<String>,
     }
 
@@ -1023,20 +1156,21 @@ mod tests {
             hold: &mut dyn FnMut(Opened),
         ) {
             self.opened = Some((session_type.to_owned(), desktop.to_owned()));
+            record(&self.log, "opened");
             hold(Ok(vec![(
                 "XDG_RUNTIME_DIR".to_owned(),
                 "/run/user/1000".to_owned(),
             )]));
-            self.closed = true;
+            record(&self.log, "closed");
         }
     }
 
     impl FakePam<'_> {
-        fn new(wire: &Wire) -> FakePam<'_> {
+        fn new<'a>(wire: &'a Wire, log: &Log) -> FakePam<'a> {
             FakePam {
                 conv: conversation(wire, Duration::from_secs(5), false),
+                log: Log::clone(log),
                 opened: None,
-                closed: false,
                 answer: None,
             }
         }
@@ -1044,16 +1178,15 @@ mod tests {
 
     /// A [`Pam`] whose `authenticate` fails the way [`LibPam`]'s does.
     ///
-    /// Deliberately not a hardcoded string: it calls the same `to_greeter` the
-    /// real one calls, with a cause that is the account oracle itself, so that
-    /// the assertion below is on the value that actually crosses the socket.
-    /// [`FakePam`] hardcodes its own failure text and so cannot fail for this.
+    /// Through [`authenticate_failure`], the same function the real one calls,
+    /// with a cause that is the account oracle itself — so what `serve` puts on
+    /// the wire is a value the production mapping produced rather than a literal
+    /// this fake chose.
     struct RefusingPam;
 
     impl Pam for RefusingPam {
         fn authenticate(&mut self) -> Result<(), String> {
-            Err(to_greeter(
-                Phase::Authenticate,
+            Err(authenticate_failure(
                 "bob",
                 "User not known to the underlying authentication module",
             ))
@@ -1065,15 +1198,52 @@ mod tests {
     }
 
     #[test]
-    fn an_authentication_failure_reaches_wdm_as_one_fixed_string() {
-        // What `LibPam::authenticate` refers to. Without it, reverting that line
-        // to PAM's own words reopens the account oracle with a green suite:
-        // `auth`'s own test pins `to_greeter`, and nothing pinned that the
-        // helper's wire message is what `to_greeter` returned.
+    fn the_authenticate_verdict_is_one_string_for_every_cause() {
+        // The mapping `LibPam::authenticate` makes, driven directly. It is one
+        // line there, unreachable to a test — `pam_client2::Error::new` is
+        // `pub(crate)`, so the input cannot be built — which is why it is a free
+        // function over `Cause` and why this can walk the strings this host's
+        // stack really produced. Change the phase in `authenticate_failure` and
+        // the login screen becomes an account oracle; this is what says so.
+        let causes = [
+            "User not known to the underlying authentication module",
+            "Authentication failure",
+            "Permission denied",
+            "Authentication service cannot retrieve authentication info",
+        ];
+        for cause in causes {
+            assert_eq!(
+                authenticate_failure("someone", cause),
+                "Authentication failure",
+                "{cause:?} reached the greeter as its own text"
+            );
+        }
+        // Two calls compared against each other as well, so a reply that varied
+        // by account rather than by cause is caught too.
+        assert_eq!(
+            authenticate_failure("alice", causes[0]),
+            authenticate_failure("root", causes[1]),
+            "the verdict varied by account or by cause"
+        );
+    }
+
+    #[test]
+    fn serve_forwards_the_authenticate_verdict_verbatim() {
+        // The other half: whatever `Pam::authenticate` returns is what crosses
+        // the socket, unaltered and as a `Failed`. `RefusingPam` calls the same
+        // `to_greeter` the real one calls, with the account oracle itself as the
+        // cause — but the flattening it exercises is its own, not `LibPam`'s,
+        // which is what `the_authenticate_verdict_is_one_string_for_every_cause`
+        // is for.
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
+        let log = log();
 
-        serve(&wire, &mut RefusingPam, &mut FakeSpawn::refusing("unused"));
+        serve(
+            &wire,
+            &mut RefusingPam,
+            &mut FakeSpawn::refusing("unused", &log),
+        );
 
         let verdict = expect(&wdm, "the verdict");
         let Msg::Failed(reason) = &verdict else {
@@ -1105,24 +1275,27 @@ mod tests {
         refuse: Option<String>,
         /// What to run. Something short-lived, so `wait` returns.
         argv: Vec<String>,
+        log: Log,
     }
 
     impl FakeSpawn {
-        fn running(argv: &[&str]) -> Self {
+        fn running(argv: &[&str], log: &Log) -> Self {
             Self {
                 pam_env: None,
                 asked: false,
                 refuse: None,
                 argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                log: Log::clone(log),
             }
         }
 
-        fn refusing(reason: &str) -> Self {
+        fn refusing(reason: &str, log: &Log) -> Self {
             Self {
                 pam_env: None,
                 asked: false,
                 refuse: Some(reason.to_owned()),
                 argv: Vec::new(),
+                log: Log::clone(log),
             }
         }
     }
@@ -1136,12 +1309,15 @@ mod tests {
             self.asked = true;
             self.pam_env = Some(pam_env);
             if let Some(reason) = &self.refuse {
+                record(&self.log, "launch_refused");
                 return Err(reason.clone());
             }
-            std::process::Command::new(&self.argv[0])
+            let child = std::process::Command::new(&self.argv[0])
                 .args(&self.argv[1..])
                 .spawn()
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            record(&self.log, "spawned");
+            child
         }
     }
 
@@ -1169,10 +1345,16 @@ mod tests {
     /// helper exists to fix. And `pam_close_session` must run after the session
     /// process has been reaped, on the handle that opened it — which is why the
     /// helper cannot simply `exec` the session and why `closed` is asserted last.
+    ///
+    /// Asserted as an ordered log across both fakes rather than as a flag, which
+    /// is what it was: `with_session` set `closed = true` unconditionally after
+    /// its callback returned, so the assertion only said that a fake had done
+    /// what the fake was written to do.
     #[test]
     fn the_helper_runs_the_session_between_opening_and_closing_it() {
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
+        let log = log();
 
         let driver = std::thread::spawn(move || {
             let prompt = expect(&wdm, "a prompt");
@@ -1211,8 +1393,8 @@ mod tests {
             drop(wdm);
         });
 
-        let mut pam = FakePam::new(&wire);
-        let mut spawner = FakeSpawn::running(&["/bin/true"]);
+        let mut pam = FakePam::new(&wire, &log);
+        let mut spawner = FakeSpawn::running(&["/bin/true"], &log);
         serve(&wire, &mut pam, &mut spawner);
         driver.join().unwrap();
 
@@ -1230,10 +1412,13 @@ mod tests {
             )]),
             "the environment pam_open_session produced did not reach the launch"
         );
-        assert!(
-            pam.closed,
-            "pam_close_session did not run after the session was reaped"
-        );
+        // The whole sequence, in order. `spawned` after `opened` is the defect
+        // the helper exists to fix — a session forked before `pam_open_session`
+        // inherits none of what that call sets up — and `closed` after
+        // `spawned` is why the helper cannot simply `exec` the session: the
+        // callback returns only once `run_session` has reaped its child, so
+        // `closed` cannot precede the reap.
+        assert_eq!(entries(&log), ["opened", "spawned", "closed"]);
     }
 
     #[test]
@@ -1245,6 +1430,7 @@ mod tests {
         // pam_systemd session leaked here is leaked for the life of the machine.
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
+        let log = log();
 
         let driver = std::thread::spawn(move || {
             let Msg::Prompt { id, .. } = expect(&wdm, "a prompt") else {
@@ -1268,12 +1454,15 @@ mod tests {
             drop(wdm);
         });
 
-        let mut pam = FakePam::new(&wire);
-        let mut spawner = FakeSpawn::refusing("no such user: nobody-at-all");
+        let mut pam = FakePam::new(&wire, &log);
+        let mut spawner = FakeSpawn::refusing("no such user: nobody-at-all", &log);
         serve(&wire, &mut pam, &mut spawner);
         driver.join().unwrap();
 
-        assert!(pam.closed, "a failed launch left the PAM session open");
+        // Opened, the launch refused, closed anyway — in that order. The close
+        // is not optional: a pam_systemd session leaked here is leaked for the
+        // life of the machine.
+        assert_eq!(entries(&log), ["opened", "launch_refused", "closed"]);
     }
 
     /// A failed authentication is reported and no session is opened.
@@ -1288,12 +1477,18 @@ mod tests {
             drop(wdm);
         });
 
-        let mut pam = FakePam::new(&wire);
-        let mut spawner = FakeSpawn::running(&["/bin/true"]);
+        let log = log();
+        let mut pam = FakePam::new(&wire, &log);
+        let mut spawner = FakeSpawn::running(&["/bin/true"], &log);
         serve(&wire, &mut pam, &mut spawner);
         driver.join().unwrap();
 
         assert!(pam.answer.is_none(), "no answer should have arrived");
+        assert!(
+            entries(&log).is_empty(),
+            "a cancelled attempt reached the session at all: {:?}",
+            entries(&log)
+        );
         assert!(
             pam.opened.is_none(),
             "a cancelled attempt must never open a PAM session"
@@ -1411,10 +1606,11 @@ mod tests {
             drop(wdm);
         });
 
-        let mut pam = FakePam::new(&wire);
+        let log = log();
+        let mut pam = FakePam::new(&wire, &log);
         // Long enough that the reader above always wins the race, and killed as
         // soon as it has.
-        let mut spawner = FakeSpawn::running(&["/bin/sleep", "30"]);
+        let mut spawner = FakeSpawn::running(&["/bin/sleep", "30"], &log);
         serve(&wire, &mut pam, &mut spawner);
         driver.join().unwrap();
     }
@@ -2108,7 +2304,7 @@ mod tests {
         //
         // Assert the style, not merely that something was said: an `info`
         // prompt would display identically and would not set `blocked`, which
-        // is what Model::should_auto_retry consults.
+        // is how a greeter tells an explained failure from a bare one.
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
 
@@ -2229,6 +2425,87 @@ mod tests {
     }
 
     #[test]
+    fn two_helper_generations_never_share_a_prompt_id() {
+        // The defect the id base exists for. Ids are minted here, and the helper
+        // is a fresh `exec` per attempt, so a counter it owned outright would
+        // restart at 0 every login — and `Login::reset` clears `pending_prompt`,
+        // so the next attempt would re-register id 0 and a late `respond(0, …)`
+        // from the cancelled conversation would be accepted for it.
+        //
+        // Two conversations, each seeded the way `run` seeds one, and every id
+        // either of them issues collected.
+        let (helper_sock, wdm) = seqpacket_pair();
+        let wire = Wire::from_socket(helper_sock);
+
+        let mut issued = Vec::new();
+        for _ in 0..2 {
+            // A fresh `WireConversation` with a fresh reservation is exactly
+            // what a fresh `exec` of the helper produces.
+            let mut conv = conversation(&wire, Duration::from_secs(5), true);
+            conv.text_info(c"first");
+            conv.text_info(c"second");
+
+            for what in ["the first notice", "the second notice"] {
+                let Msg::Prompt { id, .. } = expect(&wdm, what) else {
+                    panic!("expected a prompt");
+                };
+                issued.push(id);
+            }
+        }
+
+        assert_eq!(issued.len(), 4);
+        let mut unique = issued.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            issued.len(),
+            "two generations issued the same prompt id: {issued:?}"
+        );
+        assert!(
+            issued[2] > issued[1],
+            "the second generation's ids restarted below the first's: {issued:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_that_prompts_after_the_handoff_is_refused_rather_than_blocking() {
+        // `Msg::Launch` arrives only once wdm has released the display and
+        // killed the greeter, so from there on there is nobody to answer. A
+        // module prompting inside `pam_open_session` — pam_kwallet wanting a
+        // wallet password — used to land in `ask` and block for
+        // RESPONSE_TIMEOUT: half an hour of black screen with no greeter, no
+        // session and no way out but the VT chord.
+        let (helper_sock, wdm) = seqpacket_pair();
+        let wire = Wire::from_socket(helper_sock);
+
+        let mut conv = conversation(&wire, RESPONSE_TIMEOUT, true);
+        conv.display_released = true;
+
+        // The real timeout, not a shortened one: what is under test is that the
+        // deadline is never armed at all.
+        let started = Instant::now();
+        assert_eq!(
+            conv.prompt_echo_off(c"Wallet password:").unwrap_err(),
+            ErrorCode::CONV_ERR
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the module blocked on a socket nobody is reading"
+        );
+
+        // And nothing was emitted: a prompt sent now would sit unanswered on a
+        // socket wdm is using to wait for the session.
+        wdm.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            wdm.recv(&mut buf).is_err(),
+            "a question was sent to a greeter that no longer exists"
+        );
+    }
+
+    #[test]
     fn a_response_containing_nul_is_refused() {
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
@@ -2324,9 +2601,11 @@ mod tests {
     }
 
     #[test]
-    fn start_is_the_only_message_that_starts_an_attempt() {
-        // The helper reads exactly one Start and refuses anything else, so a
-        // peer cannot skip authentication by opening with a Launch.
+    fn start_is_the_only_message_that_parses_as_the_start_of_an_attempt() {
+        // `Start::from_msg`, which is what `run` reads its first message
+        // through: nothing else decodes into one, so a peer cannot skip
+        // authentication by opening with a Launch. That `run` then *exits*
+        // rather than continuing is its own line and is not covered here.
         let start = Msg::Start {
             username: "testuser".to_owned(),
             tty: "/dev/tty7".to_owned(),
@@ -2334,12 +2613,16 @@ mod tests {
             vtnr: 7,
             session_type: "wayland".to_owned(),
             desktop: String::new(),
+            id_base: 12_288,
         };
         let parsed = Start::from_msg(&start).expect("a Start must parse");
         assert_eq!(parsed.username, "testuser");
         assert_eq!(parsed.tty, "/dev/tty7");
         assert_eq!(parsed.session.seat, "seat0");
         assert_eq!(parsed.session.vtnr, 7);
+        // The block wdm reserved. Losing it here would put every attempt's
+        // first prompt back at whatever the helper defaulted to.
+        assert_eq!(parsed.id_base, 12_288);
 
         assert!(Start::from_msg(&Msg::Ok).is_none());
         assert!(

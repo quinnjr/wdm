@@ -14,6 +14,16 @@ use fontdue::{Font, FontSettings};
 
 /// Fonts to try, in order. Any of these being present is enough; wdm does not
 /// depend on a particular one because a minimal system may have only one.
+///
+/// ponytail: a hard-coded list rather than fontconfig. The ceiling is that a
+/// system whose only font is not on it gets a wordless red screen — the three
+/// families here cover every supported distribution's minimal install, but a
+/// container image or an embedded rootfs with, say, only Roboto does not, and
+/// nothing renders in a script these faces do not cover. The upgrade path is
+/// `fontconfig`'s `FcFontMatch` for `sans-serif`, which is one dependency and
+/// one call; it is not taken because this is the path that runs when everything
+/// else has already failed, and a library that reads caches, opens config files
+/// and can itself fail is a poor thing to reach for there.
 const FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",

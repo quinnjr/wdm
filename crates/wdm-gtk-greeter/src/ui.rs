@@ -448,7 +448,7 @@ impl Ui {
         self.model.borrow_mut().begin_attempt();
 
         self.entry.set_text("");
-        self.prompt.set_label("Waiting…");
+        self.prompt.set_label(WAITING);
         self.error.set_visible(false);
         self.notice.set_visible(false);
     }
@@ -493,27 +493,18 @@ impl Ui {
             }
             self.entry.set_text("");
             self.model.borrow_mut().prompt = None;
-            self.prompt.set_label("Checking…");
+            self.prompt.set_label(CHECKING);
             self.flush();
-        } else if !self.attempting.get() {
-            // Enter on an empty field is not a login attempt, and must not cost
-            // one. Opening a conversation here would run the whole PAM stack
-            // against an empty password, fail, and charge `pam_faillock` for it
-            // — so three stray presses of Enter on a login screen would lock the
-            // account. Someone brushing the keyboard is not a failed login.
-            //
-            // Refused with a sentence rather than silently: an Enter that does
-            // nothing at all reads as a wedged greeter.
-            //
-            // Only the *first* prompt is guarded this way. Once a conversation
-            // is underway an empty answer is a real choice — a stack that asks
-            // for an optional token accepts one — and it is answered above.
-            if text.is_empty() {
-                self.prompt.set_label("Enter your password");
-                self.entry.grab_focus();
-                return;
-            }
-
+        } else if let Some(label) = unanswerable_prompt(self.attempting.get(), text.is_empty()) {
+            // There is nothing for this Enter to answer, and nothing it should
+            // start. Refused with a sentence rather than silently, and every
+            // such refusal comes back here: an Enter that does nothing at all
+            // reads as a wedged greeter, and the branch that used to fall off
+            // the end of this function unhandled — an attempt in flight with no
+            // prompt yet — was exactly that.
+            self.prompt.set_label(label);
+            self.entry.grab_focus();
+        } else {
             // No prompt yet, because no conversation is open until right now.
             // Keep what was typed so the prompt PAM is about to send can be
             // answered with it: `begin_auth` clears the entry, and asking the
@@ -653,7 +644,7 @@ impl Ui {
                 }
                 self.model.borrow_mut().prompt = None;
                 self.entry.set_text("");
-                self.prompt.set_label("Checking…");
+                self.prompt.set_label(CHECKING);
                 self.flush();
                 return;
             }
@@ -816,7 +807,7 @@ impl Ui {
         greeter.start_session(session.to_owned(), Vec::new());
 
         drop(model);
-        self.prompt.set_label("Starting session…");
+        self.prompt.set_label(STARTING);
         self.entry.set_sensitive(false);
         self.submit.set_sensitive(false);
         self.flush();
@@ -826,6 +817,22 @@ impl Ui {
 fn refs(items: &[String]) -> Vec<&str> {
     items.iter().map(String::as_str).collect()
 }
+
+/// The prompt line while an attempt is in flight and PAM has asked nothing yet.
+///
+/// Named rather than inlined for the same reason [`unusable_reason`] is: the
+/// default webkit theme says it too and cannot share the binding, so
+/// `the_other_greeters_spell_these_messages_the_same_way` compares the two — and
+/// a comparison against a literal spelled out in the test only catches the
+/// theme. Three call sites here, which is also three chances to drift.
+const WAITING: &str = "Waiting…";
+
+/// The prompt line while an answer is with PAM and its verdict is not back.
+const CHECKING: &str = "Checking…";
+
+/// The prompt line once `start_session` has gone and this greeter is on its way
+/// out.
+const STARTING: &str = "Starting session…";
 
 /// Why this machine has nothing to log into, if it has nothing.
 ///
@@ -865,6 +872,37 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
 /// it was typed for the one that did not arrive.
 fn spend_buffered(buffered: Option<String>, secret: bool) -> Option<String> {
     buffered.filter(|_| secret)
+}
+
+/// What to say to an Enter that has nothing to answer, if it has nothing.
+///
+/// `None` means the press is a real request to log in and `submit` should open
+/// a conversation. The two refusals, and why each is a refusal rather than an
+/// attempt:
+///
+/// - An attempt is already in flight and PAM has not asked anything yet. The
+///   protocol warns that a greeter must not assume a prompt arrives promptly —
+///   wdm answers a rate-limited `create_session` late rather than refusing it,
+///   so this window can last a whole cooldown — and a second `begin_auth`
+///   inside it is refused by `attempting` anyway. Saying "Waiting…" again is
+///   what makes that visible; this branch used to fall off the end of `submit`
+///   with no arm at all, which is the silent Enter the comment there disclaims.
+/// - Nothing is in flight and the field is empty. Opening a conversation would
+///   run the whole PAM stack against an empty password, fail, and charge
+///   `pam_faillock` for it, so three stray presses of Enter would lock the
+///   account. Someone brushing the keyboard is not a failed login.
+///
+/// Only the *first* prompt is guarded on emptiness. Once a conversation is
+/// underway an empty answer is a real choice — a stack that asks for an
+/// optional token accepts one — and `submit` answers it before asking here.
+fn unanswerable_prompt(attempting: bool, empty: bool) -> Option<&'static str> {
+    if attempting {
+        Some(WAITING)
+    } else if empty {
+        Some("Enter your password")
+    } else {
+        None
+    }
 }
 
 /// What to tell the user when an attempt has ended and none has replaced it.
@@ -1040,6 +1078,35 @@ mod tests {
     }
 
     #[test]
+    fn an_enter_with_nothing_to_answer_always_says_something() {
+        // The defect this guards: `submit`'s no-prompt arm was `else if
+        // !attempting`, so an Enter pressed while a `create_session` was
+        // outstanding and no prompt had arrived matched no branch at all. That
+        // window is not brief — wdm answers a rate-limited create_session late
+        // rather than refusing it, so it can last a whole cooldown — and an
+        // Enter that does nothing at all is the wedged-greeter reading the
+        // sentence in `submit` exists to prevent.
+        assert_eq!(unanswerable_prompt(true, true), Some("Waiting…"));
+        assert_eq!(
+            unanswerable_prompt(true, false),
+            Some("Waiting…"),
+            "an attempt in flight has nothing to answer whatever was typed"
+        );
+
+        // Nothing in flight: an empty field must not cost a PAM attempt, and
+        // anything else is a real request to log in.
+        assert_eq!(
+            unanswerable_prompt(false, true),
+            Some("Enter your password")
+        );
+        assert_eq!(unanswerable_prompt(false, false), None);
+
+        // The label it re-asserts is the one `begin_auth` put up, not a fourth
+        // wording of the same state.
+        assert_eq!(unanswerable_prompt(true, true), Some(WAITING));
+    }
+
+    #[test]
     fn a_dead_link_does_not_invite_a_retry() {
         // Driven off a real model rather than a bare bool, so the branch is
         // pinned to what `Link::pump` actually latches: once it is dead it
@@ -1110,26 +1177,50 @@ mod tests {
         //
         // Everything the three greeters say to the user in words of their own
         // belongs here: the two `unusable_reason` values, all four states of
-        // `wait_prompt`, and the empty-submit refusal. A message that is not in
-        // this test is a message the default theme can be left behind on, and
-        // the way that is discovered is a user reading two different sentences
-        // for the same condition on two machines.
+        // `wait_prompt`, the empty-submit refusal, and the three transient
+        // lines. A message that is not in this test is a message the default
+        // theme can be left behind on, and the way that is discovered is a user
+        // reading two different sentences for the same condition on two
+        // machines.
         let reference = include_str!("../../wdm-greeter/src/main.rs");
+        let reference_ui = include_str!("../../wdm-greeter/src/ui.rs");
         let theme = include_str!("../../wdm-webkit-greeter/themes/default/theme.js");
 
-        // What all three say. The last is the empty-submit refusal, which the
-        // reference greeter writes into `self.error` and this greeter writes
-        // straight onto the prompt label; it is spelled out rather than read
-        // from a constant because `submit` inlines it, and extracting it would
-        // be a helper with one caller when the literal is the thing that drifts.
-        for shared in [
-            unusable_reason(true, false).unwrap(),
-            unusable_reason(false, true).unwrap(),
-            "Enter your password",
+        let no_users = unusable_reason(true, false).unwrap();
+        let no_sessions = unusable_reason(false, true).unwrap();
+        // The empty-submit refusal, which the reference greeter writes into
+        // `self.error` and this greeter writes onto the prompt label.
+        let empty_submit = unanswerable_prompt(false, true).unwrap();
+
+        // What all three say, matched in the reference greeter at the *call
+        // site* rather than anywhere in the file. It paints "No sessions
+        // installed" from two places, and a bare `contains` was satisfied by
+        // the enumerate-phase one while the other — authenticated with nothing
+        // to launch, the one a user actually hits — read "no session to start"
+        // for as long as it liked. Each needle is built from the sentence
+        // itself, so rewording it here still fails rather than quietly
+        // matching a line that no longer exists.
+        for (shared, call_site) in [
+            (
+                no_users,
+                format!(r#"ui::paint_message(canvas, "{no_users}", true)"#),
+            ),
+            (
+                no_sessions,
+                format!(r#"ui::paint_message(canvas, "{no_sessions}", true)"#),
+            ),
+            (
+                no_sessions,
+                format!(r#"self.error = Some("{no_sessions}".to_owned())"#),
+            ),
+            (
+                empty_submit,
+                format!(r#"self.error = Some("{empty_submit}".to_owned())"#),
+            ),
         ] {
             assert!(
-                reference.contains(shared),
-                "wdm-greeter no longer says {shared:?}"
+                reference.contains(&call_site),
+                "wdm-greeter no longer says {shared:?} at `{call_site}`"
             );
             assert!(
                 theme.contains(shared),
@@ -1137,12 +1228,31 @@ mod tests {
             );
         }
 
-        // Only the theme is checked for the idle-state wording: the reference
-        // greeter has no line of its own for any of these. It shows PAM's
-        // prompt verbatim and "Waiting…" when there is none, and it has no
-        // wording for a lost link at all — it ends when its dispatch does. So
-        // this is a two-way check where the loop above is three-way, and that
-        // is a fact about the reference greeter rather than an oversight.
+        // The transient lines: what the screen says while the greeter is busy
+        // and the user is not. All three are in the theme; the reference
+        // greeter paints two of them from its own `ui.rs` — it has no
+        // "Checking…" state, because it puts PAM's prompt up verbatim and falls
+        // straight back to "Waiting…" when there is none.
+        for (line, in_reference) in [(WAITING, true), (CHECKING, false), (STARTING, true)] {
+            assert!(
+                theme.contains(line),
+                "the default theme no longer says {line:?}"
+            );
+            assert_eq!(
+                reference_ui.contains(line),
+                in_reference,
+                "wdm-greeter's use of {line:?} changed"
+            );
+        }
+
+        // Only the theme is checked for the rest of the idle-state wording: of
+        // these four the reference greeter has a line of its own for exactly
+        // one, "Press Enter to try again", which it gained when its automatic
+        // retry was removed. It shows PAM's prompt verbatim otherwise, and it
+        // has no wording for a lost link at all — it ends when its dispatch
+        // does. So this is a two-way check where the loop above is three-way,
+        // and that is a fact about the reference greeter rather than an
+        // oversight.
         //
         // Every arm, not just the terminal one: `wait_prompt` gained "Password"
         // when the greeter stopped opening a conversation before the user asked,
@@ -1157,5 +1267,9 @@ mod tests {
                 "the default theme no longer says {line:?}"
             );
         }
+        assert!(
+            reference.contains(&format!(r#""{}""#, wait_prompt(true, true))),
+            "wdm-greeter no longer offers the retry its `idle_prompt` was added for"
+        );
     }
 }

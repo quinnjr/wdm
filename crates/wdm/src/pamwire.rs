@@ -71,6 +71,15 @@ pub enum Msg {
         session_type: String,
         /// Desktop id without the `.desktop` suffix; empty until chosen.
         desktop: String,
+        /// First prompt id this attempt may use.
+        ///
+        /// Prompt ids are minted in the helper, and the helper is a fresh `exec`
+        /// per attempt — so a counter it owned outright would restart at 0 every
+        /// login, and a late `respond(0, …)` from a cancelled conversation would
+        /// match the next attempt's first prompt. wdm therefore reserves the
+        /// block and the helper counts up from here; see
+        /// `crate::auth::reserve_prompt_ids`.
+        id_base: u32,
     },
     /// Answer the prompt with this id.
     Response { id: u32, secret: String },
@@ -266,7 +275,51 @@ impl<'a> Reader<'a> {
 
 impl Msg {
     /// Encode into a single `SOCK_SEQPACKET` datagram.
+    ///
+    /// [`MAX_MESSAGE`] is checked on the way out as well as on the way in, and
+    /// the check on this side is the one that has a symptom worth naming: the
+    /// only field a peer controls the size of is [`Msg::Launch`]'s `extra_env`,
+    /// which is what the greeter asked for, and a datagram over the socket
+    /// buffer is refused by `send` with `EMSGSIZE`. That failure used to be a
+    /// `debug` line, after which the other end waited for a message that was
+    /// never sent. Refusing is not expressible without changing every call
+    /// site's type, so this says so as loudly as it can instead — an `error`
+    /// line in production, and a panic in a debug build, where a test that
+    /// builds one is the thing most likely to be looking.
     pub fn encode(&self) -> Vec<u8> {
+        let out = self.encode_inner();
+        if out.len() > MAX_MESSAGE {
+            log::error!(
+                "encoded a {} of {} bytes, over the {MAX_MESSAGE}-byte limit; \
+                 the send will fail and the peer will wait for it forever",
+                self.name(),
+                out.len()
+            );
+            debug_assert!(out.len() <= MAX_MESSAGE, "message over MAX_MESSAGE");
+        }
+        out
+    }
+
+    /// This message's variant name, for logs.
+    ///
+    /// By hand rather than by `Debug`, which on [`Msg::Response`] would print
+    /// the secret. Both peers have their own copy of this for their own log
+    /// lines; this one exists so the codec can name a message without either.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::Response { .. } => "response",
+            Self::Launch { .. } => "launch",
+            Self::Prompt { .. } => "prompt",
+            Self::Ok => "ok",
+            Self::Failed(_) => "failed",
+            Self::SessionStarted { .. } => "session_started",
+            Self::SessionFailed(_) => "session_failed",
+            Self::SessionEnded { .. } => "session_ended",
+        }
+    }
+
+    fn encode_inner(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Self::Start {
@@ -276,6 +329,7 @@ impl Msg {
                 vtnr,
                 session_type,
                 desktop,
+                id_base,
             } => {
                 out.push(TAG_START);
                 put_str(&mut out, username);
@@ -284,6 +338,7 @@ impl Msg {
                 put_u32(&mut out, *vtnr);
                 put_str(&mut out, session_type);
                 put_str(&mut out, desktop);
+                put_u32(&mut out, *id_base);
             }
             Self::Response { id, secret } => {
                 out.push(TAG_RESPONSE);
@@ -357,6 +412,7 @@ impl Msg {
                 vtnr: r.u32()?,
                 session_type: r.string()?,
                 desktop: r.string()?,
+                id_base: r.u32()?,
             },
             TAG_RESPONSE => Self::Response {
                 id: r.u32()?,
@@ -412,6 +468,7 @@ mod tests {
             vtnr: 7,
             session_type: "wayland".to_owned(),
             desktop: String::new(),
+            id_base: 4096,
         });
         round_trip(Msg::Response {
             id: 7,
@@ -604,6 +661,7 @@ mod tests {
             vtnr: 7,
             session_type: "wayland".to_owned(),
             desktop: "sway".to_owned(),
+            id_base: 8192,
         }
         .encode();
 
@@ -613,6 +671,32 @@ mod tests {
                 "a Start truncated to {cut} bytes decoded anyway"
             );
         }
+    }
+
+    #[test]
+    fn encoding_an_oversized_message_is_refused() {
+        // MAX_MESSAGE's doc says it bounds the datagram, and only `decode`
+        // honoured it. The size a peer controls is `Launch`'s `extra_env`, and
+        // an oversized one is refused by `send` with EMSGSIZE — after which the
+        // helper waits for a launch that was never delivered, with the display
+        // already released. `encode` cannot refuse without changing its type, so
+        // what is pinned here is that it panics in a debug build rather than
+        // handing back a datagram nothing can send.
+        let overhead = Msg::Failed(String::new()).encode().len();
+        let over = Msg::Failed("x".repeat(MAX_MESSAGE + 1 - overhead));
+        assert_eq!(over.encode_inner().len(), MAX_MESSAGE + 1);
+
+        let panicked = std::panic::catch_unwind(|| over.encode()).is_err();
+        assert_eq!(
+            panicked,
+            cfg!(debug_assertions),
+            "an oversized message was encoded without complaint"
+        );
+
+        // And the ordinary case is untouched: the guard must not refuse a
+        // message that is merely at the limit.
+        let at_limit = Msg::Failed("x".repeat(MAX_MESSAGE - overhead));
+        assert_eq!(at_limit.encode().len(), MAX_MESSAGE);
     }
 
     #[test]
@@ -644,9 +728,11 @@ mod tests {
         // one. A well-formed message that is merely too big is still refused —
         // the limit is on the datagram, not on whether the contents make sense.
         // A reason long enough to push the whole encoded message one byte over.
+        // Built through `encode_inner`, because `encode` itself now refuses to
+        // produce this quietly — see `encoding_an_oversized_message_is_refused`.
         let overhead = Msg::Failed(String::new()).encode().len();
         let padding = MAX_MESSAGE + 1 - overhead;
-        let bytes = Msg::Failed("x".repeat(padding)).encode();
+        let bytes = Msg::Failed("x".repeat(padding)).encode_inner();
         assert_eq!(bytes.len(), MAX_MESSAGE + 1);
         assert!(
             Msg::decode(&bytes).is_none(),

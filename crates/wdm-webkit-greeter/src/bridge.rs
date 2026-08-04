@@ -114,6 +114,21 @@ enum Stmt {
 struct Queued {
     script: String,
     kind: Stmt,
+    /// The pair this statement belongs to, if it is half of one.
+    ///
+    /// The two halves are evicted together or not at all — see
+    /// [`Bridge::enforce_limit`]. Only `window.wdm._prompt` and the
+    /// `show_prompt` beside it are paired: the assignment classes as expendable
+    /// state, which is true of it in isolation and false of it here, because
+    /// the default theme's `show_prompt` answers a buffered password with
+    /// `wdm.respond`, and `respond` with `_prompt` null throws "with no prompt
+    /// pending" into `call`'s own try/catch. The user is left looking at a
+    /// disabled field reading "Checking…" that nothing will ever update.
+    ///
+    /// A token rather than a flag on one of them, so the relation survives
+    /// eviction and the timed-out-verdict retain, neither of which keeps the
+    /// two adjacent.
+    pair: Option<u64>,
 }
 
 impl Queued {
@@ -121,6 +136,7 @@ impl Queued {
         Self {
             script,
             kind: Stmt::Assignment,
+            pair: None,
         }
     }
 
@@ -128,7 +144,14 @@ impl Queued {
         Self {
             script,
             kind: Stmt::Callback,
+            pair: None,
         }
+    }
+
+    /// Tag this statement as one half of an indivisible pair.
+    fn paired(mut self, token: u64) -> Self {
+        self.pair = Some(token);
+        self
     }
 }
 
@@ -249,6 +272,12 @@ pub struct Bridge {
     /// long as the trouble lasted. See
     /// [`claim_error_report`](Self::claim_error_report).
     last_reported: Option<String>,
+    /// Next token handed to a [`Queued::pair`], never reused.
+    ///
+    /// A counter rather than the prompt id it happens to accompany: the ids are
+    /// wdm's, and a pairing added here for anything else would have to borrow
+    /// an id space it does not own.
+    next_pair: u64,
 }
 
 impl Bridge {
@@ -333,19 +362,27 @@ impl Bridge {
         if prompt != self.prompt {
             self.prompt = prompt;
             if let Some(prompt) = &model.prompt {
-                out.push(Queued::assignment(format!(
-                    "window.wdm._prompt = {};",
-                    literal(&json!({
-                        "id": prompt.id,
-                        "text": prompt.text,
-                        "secret": prompt.secret,
-                    }))
-                )));
+                // One pair, not two independent statements: the theme is told
+                // to ask, and `window.wdm._prompt` is what its answer is sent
+                // against. See [`Queued::pair`].
+                let token = self.next_pair;
+                self.next_pair += 1;
+                out.push(
+                    Queued::assignment(format!(
+                        "window.wdm._prompt = {};",
+                        literal(&json!({
+                            "id": prompt.id,
+                            "text": prompt.text,
+                            "secret": prompt.secret,
+                        }))
+                    ))
+                    .paired(token),
+                );
                 let kind = if prompt.secret { "password" } else { "text" };
-                out.push(Queued::callback(call(
-                    "show_prompt",
-                    &[json!(prompt.text), json!(kind)],
-                )));
+                out.push(
+                    Queued::callback(call("show_prompt", &[json!(prompt.text), json!(kind)]))
+                        .paired(token),
+                );
             }
         }
 
@@ -398,6 +435,11 @@ impl Bridge {
     /// oldest event, which is the exact failure the two-pass split exists to
     /// prevent.
     ///
+    /// Neither pass may split a [`Queued::pair`]: dooming either half dooms the
+    /// other. That is what stops the assignment pass — which by design spends
+    /// every assignment before touching an event — from stripping
+    /// `window.wdm._prompt` out from under a `show_prompt` it kept.
+    ///
     /// ponytail: a page wedged past [`PENDING_LIMIT`] loses the oldest events
     /// it has not acknowledged, and `show_message`/`show_prompt` have no
     /// successor to restore them. The ceiling is the queue depth; the upgrade
@@ -430,9 +472,29 @@ impl Bridge {
                 } else {
                     step
                 };
-                if !doomed[index] && self.pending[index].kind == pass {
-                    doomed[index] = true;
-                    left -= 1;
+                if doomed[index] || self.pending[index].kind != pass {
+                    continue;
+                }
+                doomed[index] = true;
+                left -= 1;
+
+                // A pair goes as a unit. Without this the assignment pass —
+                // which runs first, precisely because assignments are the
+                // expendable ones — dropped `window.wdm._prompt` and left the
+                // `show_prompt` beside it standing, and a theme that answers
+                // that prompt from its buffer calls `wdm.respond` with no
+                // prompt pending. See [`Queued::pair`].
+                //
+                // Charged against `left` too, so the pass stops as soon as
+                // enough has gone rather than over-running by one statement per
+                // pair.
+                if let Some(token) = self.pending[index].pair {
+                    for (other, queued) in self.pending.iter().enumerate() {
+                        if !doomed[other] && queued.pair == Some(token) {
+                            doomed[other] = true;
+                            left = left.saturating_sub(1);
+                        }
+                    }
                 }
             }
         }
@@ -1732,12 +1794,34 @@ mod tests {
 
         let out = bridge.flush().unwrap();
         assert_eq!(out.script.lines().count(), PENDING_LIMIT);
-        // Long past the point where there is any replaceable state left to
-        // throw away, so what remains is events and nothing else — dropped
-        // oldest-first only because by then there is no better choice.
+
+        // Long past the point where the queue is nothing but prompts, so every
+        // eviction here had to split a pair or take both halves.
+        //
+        // The defect this guards: it took the assignment and left the callback.
+        // Assignments are evicted first because a later one supersedes them,
+        // which is true of `window.wdm._prompt` in isolation and false of it
+        // beside its `show_prompt` — the default theme's `show_prompt` spends a
+        // buffered password with `wdm.respond`, and `respond` with `_prompt`
+        // null throws "with no prompt pending" into `call`'s own try/catch. The
+        // user is left looking at a disabled field reading "Checking…" that
+        // nothing will ever update, which is the state this test used to
+        // assert.
+        let lines: Vec<&str> = out.script.lines().collect();
+        let mut prompts = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("show_prompt") {
+                continue;
+            }
+            prompts += 1;
+            assert!(
+                index > 0 && lines[index - 1].starts_with("window.wdm._prompt = {"),
+                "a show_prompt survived without the state its answer is matched against"
+            );
+        }
         assert!(
-            !out.script.contains("window.wdm._prompt = {"),
-            "an assignment outlived the events it was queued beside"
+            prompts > 0,
+            "the case was never reached: nothing but prompts was ever queued"
         );
     }
 
@@ -1761,7 +1845,15 @@ mod tests {
         }
 
         let script = bridge.flush().unwrap().script;
-        assert_eq!(script.lines().count(), PENDING_LIMIT);
+        // Not exactly the limit: a prompt is an indivisible pair, so a queue
+        // that is one statement over gives up two. Bounded by the limit is the
+        // property that matters; overshooting by less than a pair is the price
+        // of never splitting one.
+        assert!(
+            (PENDING_LIMIT - 1..=PENDING_LIMIT).contains(&script.lines().count()),
+            "kept {} statements",
+            script.lines().count()
+        );
         assert!(
             script.contains("The account is locked."),
             "the explanation was evicted while state was still expendable"

@@ -109,6 +109,16 @@ pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
 /// It deliberately does **not** return early when `running` goes false. wdm
 /// exiting while the user's session still owns the display would orphan it, and
 /// the shutdown path the backend already has runs after this returns.
+///
+/// The consequence is worth naming, because the two halves are each obviously
+/// right and only the combination bites: the SIGTERM source in
+/// [`setup::build`] exists so `systemctl stop wdm` is not left pending, and this
+/// loop ignores what it recorded, so for the whole of a user's session the
+/// handler is inert. A `systemctl stop wdm` issued then does not complete when
+/// the user logs out — it completes at `TimeoutStopSec`, with a SIGKILL that
+/// takes the PAM helper and so skips `pam_close_session`. `packaging/wdm.service`
+/// sets that timeout explicitly and says why it is neither shorter nor
+/// `infinity`; a deployment that changes this policy has to change that too.
 pub fn wait_for_session(
     event_loop: &mut EventLoop<'static, LoopData>,
     data: &mut LoopData,
@@ -163,11 +173,9 @@ pub fn restart_greeter(
     if let Some(error) = error {
         data.state.login.set_last_error(error);
     }
-    // Surfaces belonging to the dead greeter must go, or they keep being
-    // rendered over the new one.
-    data.state.layers.clear();
-    // Focus was on a surface that no longer exists.
-    data.state.update_focus();
+    // Surfaces, cursor and focus all belonged to a greeter that no longer
+    // exists; see Wdm::forget_greeter for why the cursor is not optional.
+    data.state.forget_greeter();
 
     if data.state.greeter.gave_up() {
         return;
@@ -259,9 +267,10 @@ fn arm_respawn(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>,
 /// tty1 is the way back in, which is why the message says so.
 fn give_up(data: &mut LoopData, reason: String) {
     log::error!("{reason}");
-    data.state.layers.clear();
     data.state.login.clear_bindings();
-    data.state.update_focus();
+    // Nothing of the greeter's may survive onto the give-up screen, the cursor
+    // surface included: it is the one thing the error screen would still render.
+    data.state.forget_greeter();
     data.state.give_up_reason = Some(reason);
 }
 

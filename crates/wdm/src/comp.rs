@@ -89,6 +89,21 @@ impl ClientData for ClientState {
     }
 }
 
+/// How many layer surfaces the greeter may have mapped at once.
+///
+/// The greeter is untrusted, and nothing else in the protocol bounds this: each
+/// surface costs a full `render_elements_from_surface_tree` per output per
+/// frame, plus a `with_states` in `send_preferred_scales` and `send_frames`, so
+/// a greeter that creates them in a loop degrades the login screen for as long
+/// as it is up. The legitimate shape is one surface per output — a background on
+/// each, a login form on the primary — so the cap is generous against eight
+/// monitors and still small enough to bound the per-frame work.
+///
+/// Counted against mapped surfaces rather than created ones on purpose: a
+/// greeter that opens and closes a surface per redraw is doing something odd but
+/// not expensive, and `layer_destroyed` gives the slot straight back.
+const MAX_LAYER_SURFACES: usize = 16;
+
 /// A layer surface wdm has accepted, and the output it belongs to.
 pub struct MappedLayer {
     pub surface: LayerSurface,
@@ -391,6 +406,36 @@ impl Wdm {
         }
     }
 
+    /// Forget every surface the greeter left behind.
+    ///
+    /// One place rather than four, because there are four ways a greeter stops
+    /// existing — the handoff, a restart, giving up, and the nested backend's
+    /// launch — and each of them used to clear a different subset. `layers` was
+    /// cleared everywhere, `update_focus` on two paths of the four, and `cursor`
+    /// on none at all.
+    ///
+    /// The cursor is the one with teeth. A GTK or Qt greeter sets
+    /// `CursorImageStatus::Surface(...)`; after the handoff that client is gone,
+    /// but the status outlives it, and the next generation's first
+    /// `cursor_elements` hands the dead `WlSurface` to `with_states` and to
+    /// `render_elements_from_surface_tree`, which resolves it through
+    /// `surface.data::<SurfaceUserData>().unwrap()`. At best a dead tree
+    /// renders; at worst that unwrap panics in the root process one frame into
+    /// the new login screen.
+    ///
+    /// Focus has to go with them: a keyboard focused on a destroyed layer
+    /// surface carries into the next generation, so the new greeter's first
+    /// keystrokes are delivered to a surface that no longer exists.
+    pub fn forget_greeter(&mut self) {
+        // Surfaces belonging to the dead greeter must go, or they keep being
+        // rendered over the new one.
+        self.layers.clear();
+        // Back to the built-in arrow. `Hidden` would be wrong: a pointer that
+        // never reappears is indistinguishable from a wedged compositor.
+        self.cursor = CursorImageStatus::default_named();
+        self.update_focus();
+    }
+
     /// Render elements for one output, front to back.
     ///
     /// smithay treats index 0 as topmost, so popups are emitted before their
@@ -403,7 +448,12 @@ impl Wdm {
         output: &Output,
     ) -> Vec<WdmElement<GlesRenderer>> {
         let scale = output.current_scale().fractional_scale();
-        let mut elements: Vec<WdmElement<GlesRenderer>> = Vec::new();
+
+        // The cursor first, because smithay treats index 0 as topmost and the
+        // pointer belongs on top of everything. Built here rather than spliced
+        // in at the front afterwards: a splice at 0 shifts the whole vector, and
+        // this runs once per output per frame.
+        let mut elements: Vec<WdmElement<GlesRenderer>> = self.cursor_elements(renderer, output);
 
         for layer in self
             .layers
@@ -445,7 +495,6 @@ impl Wdm {
             );
         }
 
-        elements.splice(0..0, self.cursor_elements(renderer, output));
         elements
     }
 
@@ -817,6 +866,19 @@ impl WlrLayerShellHandler for Wdm {
             output.as_ref().map(Output::name)
         );
 
+        // Closed rather than ignored, and closed rather than a protocol error:
+        // `closed` is what the protocol gives a compositor to withdraw a
+        // surface, so a greeter that is merely buggy can notice and recover,
+        // while one that is not gets no more of wdm's per-frame budget either
+        // way. Killing the client would restart it into the same loop.
+        if self.layers.len() >= MAX_LAYER_SURFACES {
+            log::warn!(
+                "greeter asked for more than {MAX_LAYER_SURFACES} layer surfaces; closing {namespace:?}"
+            );
+            surface.send_close();
+            return;
+        }
+
         self.layers.push(MappedLayer { surface, output });
         self.configure_layers();
         // The output is only known now, so this is the first point at which the
@@ -1082,7 +1144,85 @@ mod tests {
     use super::*;
 
     use smithay::output::{Mode as OutputMode, PhysicalProperties, Subpixel};
+    use smithay::reexports::calloop::EventLoop;
     use smithay::utils::Size;
+
+    /// A compositor with no backend behind it.
+    ///
+    /// Everything `Wdm::new` needs exists without a GPU or a seat: the display
+    /// is a real `wayland-server` one with no clients, the greeter is
+    /// unprivileged so no account is resolved, and the `Login` is empty. The
+    /// event loop is returned only because the `LoopHandle` inside `Login`
+    /// borrows from it.
+    #[allow(clippy::type_complexity)]
+    fn test_wdm() -> (EventLoop<'static, LoopData>, Display<Wdm>, Wdm) {
+        let event_loop: EventLoop<'static, LoopData> = EventLoop::try_new().unwrap();
+        let display: Display<Wdm> = Display::new().unwrap();
+        let handle = display.handle();
+
+        let (events, _rx) = smithay::reexports::calloop::channel::channel();
+        let login = Login::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            std::path::PathBuf::from("/nonexistent/wdm-test"),
+            7,
+            events,
+            event_loop.handle(),
+        );
+        // Unprivileged, so no user is looked up and nothing is spawned.
+        let greeter = crate::supervise::Greeter::new("/bin/true", "nobody", "wayland-test", false)
+            .expect("greeter");
+
+        let state = Wdm::new(&handle, Config::default(), login, greeter).expect("compositor");
+        (event_loop, display, state)
+    }
+
+    #[test]
+    fn forgetting_the_greeter_drops_its_cursor_and_its_focus() {
+        // The defect: `cursor` was the one greeter surface reference no path
+        // reset — not the handoff, not restart_greeter, not give_up. A GTK or Qt
+        // greeter sets CursorImageStatus::Surface, and after the handoff that
+        // client is gone; the next generation's first cursor_elements then hands
+        // the dead surface to with_states and to
+        // render_elements_from_surface_tree, which resolves it through an
+        // `unwrap` on the surface's user data — a panic in the root process one
+        // frame into the new login screen.
+        //
+        // Hidden stands in for the Surface case here, because building a real
+        // WlSurface needs a connected client and the assertion is the same one:
+        // whatever the greeter left in this field, forget_greeter must replace
+        // it with something wdm owns.
+        let (_loop, _display, mut state) = test_wdm();
+
+        state.cursor = CursorImageStatus::Hidden;
+        state.forget_greeter();
+
+        assert!(
+            matches!(state.cursor, CursorImageStatus::Named(_)),
+            "the greeter's cursor survived it"
+        );
+        assert!(state.layers.is_empty());
+        assert_eq!(
+            state.keyboard.current_focus(),
+            None,
+            "keyboard focus survived the surface it was on"
+        );
+    }
+
+    #[test]
+    fn forgetting_the_greeter_is_idempotent() {
+        // It runs on four paths and two of them can follow one another — a
+        // restart that gives up, a give-up during a handoff — so a second call
+        // against already-cleared state must be a no-op rather than a panic.
+        let (_loop, _display, mut state) = test_wdm();
+
+        state.forget_greeter();
+        state.forget_greeter();
+
+        assert!(matches!(state.cursor, CursorImageStatus::Named(_)));
+        assert!(state.layers.is_empty());
+    }
 
     /// An `Output` needs no GPU, so the ranking can be exercised directly.
     /// `model` carries the identity the duplicate-name test tells copies apart by.

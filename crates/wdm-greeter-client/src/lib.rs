@@ -240,13 +240,25 @@ pub struct Model {
     pub authenticated: bool,
     /// Set only by `auth_failed`, and cleared when a new attempt starts.
     ///
-    /// The UI's auto-retry keys off this rather than off `error`, which also
-    /// carries `last_error` and PAM's own error-style messages: retrying on
-    /// those cancelled a live conversation and discarded an answer the user had
+    /// Distinct from `error`, which also carries `last_error` and PAM's own
+    /// error-style messages. A UI that keyed "the attempt is over" off `error`
+    /// would cancel a live conversation and discard an answer the user had
     /// already given.
     pub conversation_over: bool,
-    /// Set when PAM sent a notice during this conversation, which suppresses
-    /// auto-retry.
+    /// Set when PAM sent a notice during this conversation — a locked account,
+    /// an expiry warning, a timeout wdm composed itself.
+    ///
+    /// It marks a failure PAM *explained*, which a UI should leave on screen.
+    ///
+    /// This crate used to offer `should_auto_retry`, which combined this with
+    /// `conversation_over` to tell a greeter when to open another conversation
+    /// unasked. It is gone, and no greeter in this repository retries by
+    /// itself, because every automatic attempt is charged to the user by
+    /// `pam_faillock` exactly like a real one: a greeter that retried on an
+    /// unexplained failure would arm a conversation nobody was present for,
+    /// which then sat on PAM's prompt until wdm's response timeout — a second
+    /// charge against an account whose owner had walked away. Enough of those
+    /// lock it. A retry must be a keypress.
     pub blocked: bool,
     /// Set by [`Model::link_lost`], and never cleared: a Wayland connection
     /// does not come back.
@@ -257,9 +269,10 @@ pub struct Model {
     /// and a dead socket is not one of those things.
     ///
     /// Deliberately narrower than it sounds, and named for what it records: it
-    /// is about the socket only, not about whether a retry is *sensible* —
-    /// `blocked`, `conversation_over` and the rate limit are
-    /// [`should_auto_retry`](Model::should_auto_retry)'s business.
+    /// is about the socket only. Whether another attempt is *sensible* is a
+    /// separate question, answered by [`Model::blocked`] and
+    /// [`Model::conversation_over`] — and one this crate no longer answers on a
+    /// greeter's behalf. See `blocked` for why nothing retries automatically.
     ///
     /// The UI ends a conversation by inviting the user to press Enter and try
     /// again. Once this is set that invitation is a lie: `Link::pump` returns
@@ -278,17 +291,6 @@ pub struct Model {
 impl Model {
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-    }
-
-    /// Whether the greeter should start another attempt without being asked.
-    ///
-    /// Retrying immediately is right for a mistyped password: the user wants to
-    /// type it again, not click first. It is wrong when PAM has explained
-    /// itself — a locked account, an expired password — because the retry
-    /// scrolls the explanation away, resets the form under the user, and on a
-    /// faillock stack each attempt can extend the lock.
-    pub fn should_auto_retry(&self) -> bool {
-        self.conversation_over && self.prompt.is_none() && !self.authenticated && !self.blocked
     }
 
     /// Record one of PAM's explanations.
@@ -617,55 +619,39 @@ mod tests {
     }
 
     #[test]
-    fn retries_a_plain_failure() {
-        // A mistyped password: the user wants to type again, not click first.
-        assert!(failed().should_auto_retry());
+    fn a_plain_failure_leaves_nothing_for_the_ui_to_explain() {
+        // The state a mistyped password produces: over, unexplained, and no
+        // longer holding a question. This used to be the input to
+        // `should_auto_retry`, which answered "yes" — and that yes is what
+        // armed a conversation nobody was present for. The state is still worth
+        // pinning; what a greeter does with it is now the greeter's, and every
+        // greeter in this repository waits for a keypress.
+        let model = failed();
+        assert!(model.conversation_over);
+        assert!(!model.blocked, "a bare failure carries no explanation");
+        assert!(model.prompt.is_none());
+        assert!(model.notice_text().is_none());
     }
 
     #[test]
-    fn does_not_retry_when_pam_explained_itself() {
-        // The defect this guards: with a faillock-locked account, PAM sends
-        // "the account is locked, 10 minutes left" and the greeter used to
-        // retry straight past it — scrolling the reason away, resetting the
-        // form under the user, and feeding the lock.
-        let model = Model {
-            blocked: true,
-            notices: vec![Notice::new(
-                NoticeKind::Info,
-                "The account is locked due to 3 failed logins.".to_owned(),
-            )],
-            ..failed()
-        };
-        assert!(!model.should_auto_retry());
-    }
+    fn pam_explaining_itself_is_recorded_as_blocked() {
+        // With a faillock-locked account PAM sends "the account is locked, 10
+        // minutes left". `blocked` is how a UI knows the failure came with a
+        // reason worth leaving on screen, rather than one worth replacing with
+        // a fresh prompt.
+        let mut model = failed();
+        model.push_notice(
+            NoticeKind::Info,
+            "The account is locked due to 3 failed logins.".to_owned(),
+        );
 
-    #[test]
-    fn does_not_retry_mid_conversation() {
-        let model = Model {
-            conversation_over: false,
-            ..Model::default()
-        };
-        assert!(!model.should_auto_retry());
-
-        // Nor while a question is still pending.
-        let model = Model {
-            prompt: Some(Prompt {
-                id: 0,
-                text: "Password:".to_owned(),
-                secret: true,
-            }),
-            ..failed()
-        };
-        assert!(!model.should_auto_retry());
-    }
-
-    #[test]
-    fn does_not_retry_once_authenticated() {
-        let model = Model {
-            authenticated: true,
-            ..failed()
-        };
-        assert!(!model.should_auto_retry());
+        assert!(model.blocked);
+        assert!(
+            model
+                .notice_text()
+                .is_some_and(|t| t.contains("3 failed logins")),
+            "the explanation must survive for the UI to show"
+        );
     }
 
     #[test]
@@ -712,8 +698,9 @@ mod tests {
         model.error = Some("authentication failed".to_owned());
 
         assert!(
-            !model.should_auto_retry(),
-            "a timed-out attempt must not re-arm itself; this is the lockout loop"
+            model.blocked,
+            "a timed-out attempt must arrive explained; unexplained is what a \
+             greeter used to re-arm on, and that loop is the lockout"
         );
         assert!(model.notice_text().unwrap().contains("timed out"));
     }
@@ -739,7 +726,10 @@ mod tests {
         assert_eq!(model.notices[0].kind, NoticeKind::Error);
         assert!(!model.authenticated);
         assert!(model.conversation_over);
-        assert!(!model.should_auto_retry());
+        assert!(
+            model.blocked,
+            "the UI must show this rather than move past it"
+        );
         assert_ne!(model.revision, before, "the UI would never repaint");
     }
 
@@ -821,9 +811,10 @@ mod tests {
         // halves are one sentence and must read as one.
         let notice = model.notice_text().unwrap();
         assert_eq!(notice, "The account is locked. (10 minutes left to unlock)");
-        // And a notice always suppresses the retry that would scroll it away.
+        // And a notice marks the conversation explained, so a UI leaves it up
+        // rather than replacing it with a fresh prompt.
         model.conversation_over = true;
-        assert!(!model.should_auto_retry());
+        assert!(model.blocked);
     }
 
     #[test]

@@ -5,6 +5,28 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-04
+
+The second project audit, reconciled — 44 findings across 212 units. Three
+were defects rather than the documentation and test gaps they were filed as:
+prompt ids restarted at 0 on every login now that the helper minting them is a
+fresh `exec` per attempt; the give-up screen left a one-pixel strip of stale
+framebuffer on modes that do not divide evenly at fractional scale; and a
+greeter could cancel and retry without limit, forking a root helper and
+charging `pam_faillock` on every turn.
+
+**Breaking for out-of-tree greeters:** `wdm_greeter_client::Model::should_auto_retry`
+is removed. Nothing in this repository retried automatically any more, and the
+method advertised the behaviour that locked accounts out in 0.4.0 — every
+automatic attempt is charged by `pam_faillock` exactly like a real one, so a
+retry has to be a keypress. Read `Model::blocked` and `Model::conversation_over`
+and decide for yourself.
+
+smithay's DRM and EGL diagnostics now reach the journal. It logs through
+`tracing` and wdm installed no subscriber, so roughly fifty error sites in the
+DRM and EGL backends were discarded — on the code path that had only just run
+on real hardware for the first time.
+
 ## [0.6.0] — 2026-08-04
 
 Hardening of the login screen against account enumeration, and the first
@@ -559,7 +581,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/quinnjr/wdm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/quinnjr/wdm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/quinnjr/wdm/releases/tag/v0.5.0
 [0.4.0]: https://github.com/quinnjr/wdm/releases/tag/v0.4.0
