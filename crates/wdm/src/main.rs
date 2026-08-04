@@ -138,9 +138,17 @@ fn is_root() -> bool {
 fn main() -> ExitCode {
     // WDM_LOG rather than RUST_LOG so a session's own RUST_LOG cannot
     // reconfigure the display manager's logging.
+    //
+    // `filter_or`, not `filter`: with no default directive the floor is `error`,
+    // and `auth::to_greeter`'s journal line — the *only* record of why an
+    // authentication failed, now that the greeter is told nothing — is emitted
+    // at `info` and would be discarded on any install that has not set WDM_LOG.
+    // The default belongs here rather than in packaging/wdm.service so that a
+    // hand-installed wdm, or one started from a shell for a bring-up, keeps the
+    // record too.
     env_logger::Builder::from_env(
         env_logger::Env::new()
-            .filter("WDM_LOG")
+            .filter_or("WDM_LOG", "info")
             .write_style("WDM_LOG_STYLE"),
     )
     .format_timestamp_millis()
