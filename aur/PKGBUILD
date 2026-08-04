@@ -2,7 +2,7 @@
 
 pkgbase=wdm
 pkgname=('wdm' 'wdm-greeter' 'wdm-gtk-greeter' 'wdm-webkit-greeter')
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='A Wayland display manager that is its own compositor'
 arch=('x86_64' 'aarch64')
@@ -11,6 +11,9 @@ license=('MIT')
 makedepends=('cargo' 'libinput' 'seatd' 'systemd-libs' 'mesa' 'libdrm'
              'libxkbcommon' 'pam' 'gtk4' 'gtk4-layer-shell' 'webkitgtk-6.0')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Stale: this is the v0.2.0 tarball's checksum, and it can only be recomputed
+# once v0.3.0 is tagged and GitHub has generated the archive. Regenerate with
+# `updpkgsums` at release time, before this PKGBUILD is published.
 sha256sums=('10aff2d22a13ca641839714cebb34e74cc16bca6d188ba19977e93642767d464')
 
 prepare() {

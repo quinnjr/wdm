@@ -61,3 +61,25 @@ pub use generated::server;
 /// style socket name, not a separate auth channel: authentication travels over
 /// the same connection as rendering.
 pub const GREETER_SOCKET_ENV: &str = "WAYLAND_DISPLAY";
+
+/// Exit status a greeter uses to say it will not recover by being restarted.
+///
+/// Part of the greeter contract, which is why it lives here rather than in
+/// either implementation: a greeter that has concluded it is wedged — a silent
+/// web process, a renderer that never came up — exits with this status, and wdm
+/// counts that against the restart budget **whatever the greeter's uptime was**.
+/// Every other exit is judged on uptime, on the assumption that a greeter which
+/// ran for a while and then died merely crashed. That assumption is wrong for
+/// this case: deciding nothing is ever going to answer takes longer than the
+/// rapid-failure window allows, so a greeter respawning into the same wedge
+/// would look like a healthy one restarting, and the give-up screen — the only
+/// thing that tells the user to switch to tty1 — would never be reached.
+///
+/// The value is `EX_UNAVAILABLE` from `sysexits.h`. A greeter must therefore not
+/// use 69 to mean anything else: wdm cannot tell the two apart, and an ordinary
+/// failure spelled this way would exhaust the restart budget early.
+///
+/// Deliberately outside both feature gates. Greeters (`client`) exit with it and
+/// wdm (`server`) compares against it, so gating it on either would put the two
+/// halves of one agreement behind different switches.
+pub const GREETER_GAVE_UP_EXIT: u8 = 69;

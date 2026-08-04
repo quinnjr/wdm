@@ -4,9 +4,9 @@
 # Virtual terminal to run on. VT 7 is free on a default systemd install, so wdm
 # needs no Conflicts= against a getty and tty1 remains available for recovery.
 #
-# Moving wdm onto a VT a getty uses — 1 through 6 — needs the wdm.service
-# drop-in wdm(1) describes, or wdm and the getty contend for the same VT with
-# nothing arbitrating and the recovery console goes with it.
+# Moving wdm onto a VT a getty uses needs a wdm.service drop-in, or wdm and the
+# getty contend for the same VT with nothing arbitrating and the recovery
+# console goes with it. See wdm(1) for the drop-in.
 vt = 7
 
 # Session offered to a user with no recorded last session. wdm reports this to

@@ -51,6 +51,7 @@ use webkit6::{NavigationPolicyDecision, PolicyDecisionType, WebView};
 
 use bridge::{Bridge, Request};
 use wdm_greeter_client::{Link, Model, SharedLink};
+use wdm_protocol::GREETER_GAVE_UP_EXIT;
 
 /// The one message that is delivered outside the bridge's queue, and the
 /// invariant that it is delivered at most once.
@@ -140,21 +141,6 @@ const THEME_ROOT: &str = "/usr/share/wdm/webkit-greeter/themes";
 /// See `wdm-gtk-greeter`: GDK owns the connection's fd and reads from it, so
 /// the queue is polled rather than watched.
 pub(crate) const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-
-/// The status a greeter exits with when its theme has stopped answering.
-///
-/// Distinct from plain failure because the two need different treatment from
-/// wdm's supervisor. Silence takes `WEDGED_AFTER × VERDICT_DEADLINE` pump ticks
-/// to establish — around half a minute — which is well outside the supervisor's
-/// rapid-failure window, so an exit for this reason looks like a greeter that
-/// ran fine and then stopped, and *resets* the failure count. The give-up
-/// screen is then unreachable and the login screen reloads every half minute
-/// forever.
-///
-/// So: an exit with this status means the greeter is not going to recover by
-/// being restarted, and wdm should count it as a rapid failure regardless of
-/// how long the process had been up.
-const WEDGED_EXIT: u8 = 69;
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::new().filter("WDM_GREETER_LOG")).init();
@@ -320,8 +306,18 @@ fn activate(
 
             // And any other state the model held before the pump timer saw its
             // first change goes through the normal queue.
+            //
+            // Resynced first, because a reload rewinds one piece of page state
+            // behind the bridge's back: `link_dead` is baked into the
+            // document-start API script, which re-runs with the value frozen at
+            // startup. After a link death both the page's copy and the bridge's
+            // mirror read true, the diff sees no change, and the reloaded
+            // document is left believing the socket is alive — offering a retry
+            // that goes nowhere. See `Bridge::resync`.
             let model = model.borrow();
-            bridge.borrow_mut().diff(&model);
+            let mut bridge = bridge.borrow_mut();
+            bridge.resync();
+            bridge.diff(&model);
         }
     });
 
@@ -338,7 +334,7 @@ fn activate(
         // A page that has answered nothing for long enough is not coming back
         // on its own, and a greeter process that stays alive in front of a dead
         // login screen is invisible to wdm's supervisor. Exiting is what turns
-        // it into a respawn — with [`WEDGED_EXIT`] rather than plain failure,
+        // it into a respawn — with [`GREETER_GAVE_UP_EXIT`] rather than plain failure,
         // because establishing silence takes long enough that the supervisor
         // would otherwise read the exit as a healthy greeter that happened to
         // stop, reset its failure count, and reload the same broken theme
@@ -350,7 +346,7 @@ fn activate(
         };
         if wedged {
             log::error!("the theme has stopped responding; exiting so wdm can respawn the greeter");
-            failure.set(WEDGED_EXIT);
+            failure.set(GREETER_GAVE_UP_EXIT);
             app.quit();
             return glib::ControlFlow::Break;
         }
@@ -615,7 +611,7 @@ fn evaluate(webview: &WebView, bridge: &Rc<RefCell<Bridge>>, outbound: &bridge::
             let error = result.as_ref().err().map(|e| e.to_string());
             let mut bridge = bridge.borrow_mut();
             bridge.delivered(epoch, result.is_ok());
-            // Once per run of trouble, not every tick: a page that never
+            // Once per distinct error, not every tick: a page that never
             // recovers is retried sixty times a second, and sixty warnings a
             // second in the journal is how a symptom becomes the whole log.
             // The bridge is asked rather than its failure count consulted,
@@ -623,7 +619,7 @@ fn evaluate(webview: &WebView, bridge: &Rc<RefCell<Bridge>>, outbound: &bridge::
             // print and would otherwise spend the budget before this line —
             // the only one naming the statement that broke — ever ran.
             if let Some(e) = error
-                && bridge.report_error()
+                && bridge.claim_error_report(&e)
             {
                 log::warn!("theme script: {e}");
             }
@@ -852,21 +848,19 @@ mod tests {
             "is_authenticated",
             "in_authentication",
             "link_dead",
-            // Not in themes.md's table — it is the bridge's own — but the
-            // default theme reads it to tell "answer the prompt" from "try
-            // again", so it is contract in practice.
+            // The bridge's own, but documented alongside the rest and read by
+            // the default theme to tell "answer the prompt" from "try again",
+            // so it is contract on all three ends like everything above it.
             "_prompt",
         ] {
             assert!(
                 script.contains(&format!("{name}:")),
                 "the injected API lost wdm.{name}"
             );
-            if name != "_prompt" {
-                assert!(
-                    doc.contains(&format!("wdm.{name}")),
-                    "themes.md no longer documents wdm.{name}"
-                );
-            }
+            assert!(
+                doc.contains(&format!("wdm.{name}")),
+                "themes.md no longer documents wdm.{name}"
+            );
         }
         for method in ["authenticate", "respond", "cancel", "start_session"] {
             assert!(
@@ -889,12 +883,31 @@ mod tests {
             "wdm.default_session",
             "wdm.is_authenticated",
             "wdm._prompt",
+            // The one the theme reads defensively — `typeof wdm.link_dead !==
+            // "undefined" && …` — so a rename does not throw, it just makes the
+            // check false forever and the theme goes back to offering a retry
+            // into a socket nobody reads. Nothing else would notice.
+            "wdm.link_dead",
             "wdm.authenticate(",
             "wdm.respond(",
             "wdm.start_session(",
         ] {
             assert!(theme.contains(used), "the default theme lost {used}");
         }
+
+        // The assignment the bridge keeps that field current with, which is a
+        // separate string from the API's key and can drift from it on its own:
+        // renaming one and not the other leaves the theme reading a field that
+        // is never updated, and every check above still passes.
+        let mut bridge = Bridge::default();
+        let mut live = Model::default();
+        live.link_dead = true;
+        bridge.diff(&live);
+        let assignment = bridge.flush().expect("nothing was queued").script;
+        assert!(
+            assignment.contains("window.wdm.link_dead = "),
+            "the bridge stopped assigning wdm.link_dead: {assignment}"
+        );
 
         // The three callbacks are the other direction: the bridge names them,
         // and a theme that has stopped defining one goes quiet rather than

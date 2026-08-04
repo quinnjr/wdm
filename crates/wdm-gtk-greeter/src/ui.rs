@@ -368,6 +368,21 @@ impl Ui {
 
     /// Answer the pending prompt, or start an attempt if there is none.
     fn submit(&self) {
+        // Nothing sent from here arrives once `Link::pump` has latched dead, and
+        // an attempt that cannot be made is worse than none: `begin_attempt`
+        // clears the error and the notice, `begin_auth` writes "Waiting…", and
+        // no further pump ever changes any of it — a login form with no error,
+        // no notice and no instruction, permanently. `wait_for_user` re-asserts
+        // what is actually true instead. The default webkit theme guards its own
+        // `start()` the same way, for the same reason.
+        //
+        // Scoped, because `wait_for_user` borrows the model again.
+        let link_alive = !self.model.borrow().link_dead;
+        if !link_alive {
+            self.wait_for_user();
+            return;
+        }
+
         let text = self.entry.text().to_string();
 
         let pending = {
@@ -471,7 +486,13 @@ impl Ui {
             )
         };
 
-        let error = error_label(error, unusable);
+        // The attempt's error wins while there is one, because it is the newer
+        // news. The fallback is what keeps an unusable machine explained:
+        // `begin_attempt` clears `error` because it belongs to an attempt, while
+        // an empty user or session list is a fact about the machine that
+        // outlives every attempt — so without it the form goes permanently
+        // insensitive with nothing on it saying why.
+        let error = error.or_else(|| unusable.map(str::to_owned));
 
         self.error.set_label(error.as_deref().unwrap_or(""));
         self.error.set_visible(error.is_some());
@@ -525,18 +546,29 @@ impl Ui {
     /// that reaches here is a lost connection, and there is nothing to try
     /// against after that.
     ///
-    /// Sensitivity is deliberately not touched: only `reload_lists` turns the
-    /// form off, and it does so because there is nothing on this machine to log
-    /// into. Re-enabling here would hand the user an entry that cannot lead
-    /// anywhere — which is exactly the state the no-session fallback is in.
+    /// Sensitivity is never re-enabled here: only `reload_lists` turns the form
+    /// off, and it does so because there is nothing on this machine to log into.
+    /// Re-enabling would hand the user an entry that cannot lead anywhere —
+    /// which is exactly the state the no-session fallback is in.
+    ///
+    /// It is turned *off* here for the one state that is terminal rather than
+    /// merely idle. A lost link reaches this through `refresh`'s "PAM explained
+    /// itself" branch — `link_lost` pushes a notice and ends the conversation —
+    /// so this is where the transition is observed, and an entry the user can
+    /// still type into is an invitation to an attempt `submit` will only refuse.
+    /// The default webkit theme disables the same controls in `giveUp`.
     fn wait_for_user(&self) {
         // Scoped, and released before any widget call: every path into a widget
         // from here can re-enter and borrow the model again.
-        let link_alive = self.model.borrow().link_is_alive();
+        let link_alive = !self.model.borrow().link_dead;
 
         self.attempting.set(false);
         self.prompt.set_label(wait_prompt(link_alive));
         self.entry.set_text("");
+        if !link_alive {
+            self.entry.set_sensitive(false);
+            self.submit.set_sensitive(false);
+        }
     }
 
     fn launch(&self) {
@@ -601,10 +633,11 @@ fn refs(items: &[String]) -> Vec<&str> {
 /// of all a machine with nobody to be.
 ///
 /// wdm-greeter and the default webkit theme say the same two things in their
-/// own languages. Those copies cannot share this constant across the crate and
-/// language boundary and nothing checks them against it, so changing a string
-/// here means changing `crates/wdm-greeter/src/main.rs` and
-/// `crates/wdm-webkit-greeter/themes/default/theme.js` by hand.
+/// own languages, and cannot share this constant across the crate and language
+/// boundary. Changing a string here therefore means changing
+/// `crates/wdm-greeter/src/main.rs` and
+/// `crates/wdm-webkit-greeter/themes/default/theme.js` too — which is checked by
+/// `the_other_greeters_spell_these_messages_the_same_way`, not left to hand.
 fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
     if no_users {
         Some("No users available to log in")
@@ -615,24 +648,14 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
     }
 }
 
-/// What the error line says, given the attempt's verdict and the machine's.
-///
-/// The attempt's error wins while there is one, because it is the newer news.
-/// The fallback is what keeps an unusable machine explained: `begin_attempt`
-/// clears `error` because it belongs to an attempt, while an empty user or
-/// session list is a fact about the machine that outlives every attempt — so
-/// without this the form goes permanently insensitive with nothing on it
-/// saying why.
-fn error_label(model_error: Option<String>, unusable: Option<&'static str>) -> Option<String> {
-    model_error.or_else(|| unusable.map(str::to_owned))
-}
-
 /// What to tell the user when an attempt has ended and none has replaced it.
 ///
 /// "Try again" is offered only while there is something to try against: after
 /// `Link::pump` latches dead, Enter would send nothing and change nothing, and
-/// the user would be pressing a key at a screen that cannot answer. Wording
-/// matches the default webkit theme.
+/// the user would be pressing a key at a screen that cannot answer — which is
+/// why `submit` refuses outright rather than starting an attempt that erases
+/// this line. Wording matches the default webkit theme, and that it still does
+/// is checked by `the_other_greeters_spell_these_messages_the_same_way`.
 fn wait_prompt(link_alive: bool) -> &'static str {
     if link_alive {
         "Press Enter to try again"
@@ -723,12 +746,10 @@ mod tests {
     fn an_attempts_verdict_wins_over_the_machines() {
         // Both are true at once on a machine with no sessions whose PAM stack
         // still refused the password. What the user just did is the newer news.
+        let error = Some("Authentication failure".to_owned());
+        let unusable = Some("No sessions installed");
         assert_eq!(
-            error_label(
-                Some("Authentication failure".to_owned()),
-                Some("No sessions installed")
-            )
-            .as_deref(),
+            error.or_else(|| unusable.map(str::to_owned)).as_deref(),
             Some("Authentication failure")
         );
     }
@@ -739,7 +760,8 @@ mod tests {
         // belongs to an attempt, and refresh() re-derives the label from
         // `error` on every revision — so without the fallback the next event
         // left a permanently insensitive form with nothing on it to say why.
-        // Delete the fallback in `error_label` and this is the test that fails.
+        // Delete the `or_else` fallback in `refresh` and this is the test that
+        // fails.
         let mut model = Model::default();
         model.error = Some(unusable_reason(true, true).unwrap().to_owned());
         model.begin_attempt();
@@ -747,14 +769,20 @@ mod tests {
 
         let unusable = unusable_reason(model.users.is_empty(), model.sessions.is_empty());
         assert_eq!(
-            error_label(model.error.clone(), unusable).as_deref(),
+            model
+                .error
+                .clone()
+                .or_else(|| unusable.map(str::to_owned))
+                .as_deref(),
             Some("No users available to log in")
         );
     }
 
     #[test]
     fn a_usable_machine_between_attempts_says_nothing() {
-        assert_eq!(error_label(None, None), None);
+        let error: Option<String> = None;
+        let unusable: Option<&'static str> = None;
+        assert_eq!(error.or_else(|| unusable.map(str::to_owned)), None);
     }
 
     #[test]
@@ -763,12 +791,82 @@ mod tests {
         // pinned to what `Link::pump` actually latches: once it is dead it
         // stays dead, and Enter would send into a socket nobody reads.
         let mut m = Model::default();
-        assert_eq!(wait_prompt(m.link_is_alive()), "Press Enter to try again");
+        assert_eq!(wait_prompt(!m.link_dead), "Press Enter to try again");
 
         m.link_lost("broken pipe");
         assert_eq!(
-            wait_prompt(m.link_is_alive()),
+            wait_prompt(!m.link_dead),
             "Connection to wdm lost — switch to a text console"
+        );
+    }
+
+    #[test]
+    fn a_dead_link_keeps_its_explanation_because_no_attempt_starts() {
+        // What `submit`'s guard is for. `link_lost` leaves the only text on the
+        // screen that explains the silence, and it lives in `notices` — which
+        // `begin_attempt` clears, because notices belong to an attempt. Since
+        // `Link::pump` never reports another change, whatever the wipe leaves
+        // behind is what the user stares at for good.
+        //
+        // Two models rather than one, because the guarded path is the *absence*
+        // of the call: the first is the form as `submit` leaves it, the second
+        // is the form as it looked before the guard existed.
+        let mut guarded = Model::default();
+        guarded.link_lost("broken pipe");
+        assert!(
+            guarded
+                .notice_text()
+                .is_some_and(|t| t.contains("Lost the connection to wdm")),
+            "link_lost no longer explains itself"
+        );
+        // The guard's whole action: re-assert the wording and stop.
+        assert_eq!(
+            wait_prompt(!guarded.link_dead),
+            "Connection to wdm lost — switch to a text console"
+        );
+
+        let mut unguarded = Model::default();
+        unguarded.link_lost("broken pipe");
+        unguarded.begin_attempt();
+        assert!(
+            unguarded.notice_text().is_none() && unguarded.error.is_none(),
+            "begin_attempt no longer erases the explanation, so the guard is \
+             pinning a hazard that has moved"
+        );
+    }
+
+    #[test]
+    fn the_other_greeters_spell_these_messages_the_same_way() {
+        // A drift check across a crate and a language boundary, on the model of
+        // wdm-webkit-greeter's `the_default_theme_uses_the_api_it_is_shipped_with`.
+        // The reference greeter paints these in Rust of its own and the default
+        // theme writes them in JavaScript, so neither can share the constants
+        // above; what they can do is fail the build when one of the three is
+        // changed alone. Matched on the message text only — the code around it
+        // in either file is free to change.
+        let reference = include_str!("../../wdm-greeter/src/main.rs");
+        let theme = include_str!("../../wdm-webkit-greeter/themes/default/theme.js");
+
+        for reason in [
+            unusable_reason(true, false).unwrap(),
+            unusable_reason(false, true).unwrap(),
+        ] {
+            assert!(
+                reference.contains(reason),
+                "wdm-greeter no longer says {reason:?}"
+            );
+            assert!(
+                theme.contains(reason),
+                "the default theme no longer says {reason:?}"
+            );
+        }
+
+        // Only the theme is checked for this one: the reference greeter has no
+        // wording for a lost link at all — it ends when its dispatch does.
+        let lost = wait_prompt(false);
+        assert!(
+            theme.contains(lost),
+            "the default theme no longer says {lost:?}"
         );
     }
 }

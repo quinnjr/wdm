@@ -170,23 +170,12 @@ impl Launch {
         // forfeit the privilege needed for the other two.
         unsafe {
             command.pre_exec(move || {
-                // First, before anything else: calloop's signal source blocks
-                // SIGTERM and SIGINT on wdm's thread (see backend/setup.rs), and
-                // a blocked mask is inherited by fork and survives exec. A user
-                // session started with them blocked inherits that mask into
-                // every process it ever starts: `loginctl terminate-session`,
-                // `systemctl stop` and systemd's shutdown TERM phase all degrade
-                // to SIGKILL, and Ctrl-C is dead in every terminal.
-                let mut empty: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut empty);
-                // pthread_sigmask returns the error number rather than setting
-                // errno, so it is reported directly — and from_raw_os_error
-                // does not allocate, which matters here for the reason given
-                // below.
-                let rc = libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-                if rc != 0 {
-                    return Err(std::io::Error::from_raw_os_error(rc));
-                }
+                // First, before anything else. The rule and the reasoning are
+                // shared with the greeter's spawn path, so they live with the
+                // function: see crate::supervise::unblock_signals. A plain
+                // non-generic call allocates nothing, so the constraint this
+                // closure runs under still holds.
+                crate::supervise::unblock_signals()?;
 
                 // A new session and process group, so the session does not
                 // share wdm's and is not killed with it.

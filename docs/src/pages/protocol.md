@@ -84,9 +84,11 @@ the launch fails the greeter is relaunched and told why through `last_error`.
 
 `env` is a `wl_array` of NUL-separated `NAME=VALUE` entries. It is **filtered**:
 only `LANG`, `LANGUAGE`, `LC_*` and `XKB_*` are honoured, values containing `/`
-are rejected, as are values longer than 64 bytes, and everything that survives
-is applied *before* wdm's own session variables so the greeter cannot contradict
-a fact about the seat.
+or NUL are rejected, as are values longer than 64 bytes, and everything that
+survives is applied *before* wdm's own session variables so the greeter cannot
+contradict a fact about the seat. The NUL check cannot fire in practice —
+entries are NUL-separated, so one inside a value does not survive decoding — but
+the filter states what it accepts rather than relying on the framing above it.
 
 Filtering is **silent, and not an error**. An entry that is well formed but does
 not survive the filter is dropped with no event and no protocol error —

@@ -9,9 +9,10 @@ After=systemd-user-sessions.service plymouth-quit-wait.service
 # third-party greeter wedges. Conflicts=getty@tty1.service would stop that getty
 # and take the recovery console away, so it is not shipped even inert.
 #
-# That describes the default, not an invariant: `vt` is configurable, and moving
-# wdm onto a getty's VT without the drop-in wdm(1) describes leaves the two
-# contending for it with nothing arbitrating.
+# Setting `vt` to a terminal a getty uses needs a drop-in adding Conflicts= and
+# After= for that getty, or the two contend for the VT with nothing arbitrating
+# and the recovery console goes with it. See wdm(1), which is authoritative and
+# gives the drop-in in full.
 
 # Past the limit wdm stays down rather than flickering forever; tty1 still
 # works. These belong in [Unit] -- systemd ignores them under [Service], which

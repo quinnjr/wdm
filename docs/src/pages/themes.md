@@ -108,9 +108,29 @@ explanation: the verdict is the last message sent, it overwrites everything
 before it, and "Authentication failure" on its own tells the user nothing they
 can act on.
 
-Callbacks may be delivered **more than once** for the same event. The greeter
-re-delivers when a page is slow to answer, so a theme must tolerate a repeat
-rather than counting calls or toggling state on each one.
+A theme must tolerate a callback arriving **twice**, and a callback it was owed
+**never arriving at all**. The two have different causes:
+
+- **A repeat** when an evaluation fails outright — the page refused the script,
+  so the greeter retransmits everything that evaluation carried.
+- **A drop** when the page merely takes too long. A callback the greeter cannot
+  confirm the page ran is thrown away rather than sent again, because silence is
+  not a refusal: the statements may already have run, and re-sending them would
+  render "The account is locked." once per retransmission.
+- **A drop** again once the queue is past its limit — 256 unacknowledged
+  statements, reachable only by a page that has stopped acknowledging anything.
+  Assignments are evicted first because a newer one supersedes them, but past
+  that callbacks go too.
+
+So write handlers that are idempotent, and do not read the absence of a
+`show_message` as PAM having sent none.
+
+The shipped default theme also caps what it *displays* at **six** messages. Past
+that it drops the second-oldest, never the first: the oldest is the one carrying
+the lockout reason, and there is no scrolling on this screen by design. A theme
+copying it inherits that cap, and it means the shipped theme is not lossless —
+a stack that emits more than six messages in one attempt shows the first and the
+five most recent.
 
 ## What a theme is responsible for
 

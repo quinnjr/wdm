@@ -80,6 +80,17 @@ const WEDGED_AFTER: u32 = 60;
 /// retransmitted. That asymmetry is why this is generous rather than tight.
 const VERDICT_DEADLINE: u32 = 30;
 
+/// The statement an idle page is given to answer, so silence is still visible.
+///
+/// Three things are required of it, and no other literal would do: it parses as
+/// a complete JavaScript *statement*, so it can be concatenated with the rest of
+/// a flush; it does nothing, so a theme cannot tell a heartbeat from silence by
+/// its effects; and it is queued as a [`Stmt::Assignment`], so
+/// [`Bridge::enforce_limit`] treats it as expendable and it is the first thing
+/// thrown away when a wedged page fills the queue rather than something that
+/// costs the user a message.
+const HEARTBEAT: &str = "void 0;";
+
 /// What kind of thing a queued statement is, which decides what may be done to
 /// it when the queue has to lose something or send something twice.
 ///
@@ -121,6 +132,27 @@ impl Queued {
     }
 }
 
+/// The evaluation whose verdict is still out.
+///
+/// One value rather than a flag, a count and a tick counter kept in step by
+/// hand. The flag existed only because [`Bridge::enforce_limit`] can evict the
+/// very statements an unresolved evaluation carried, taking the count to zero
+/// while the evaluation is still coming — so "is one outstanding" and "how many
+/// did it carry" are genuinely different questions, and answering the first
+/// with the second disabled the hang detector exactly when the queue was full.
+/// Making outstanding-ness the `Option` puts that beyond reach: eviction can
+/// only touch `count`, and every place that ends an evaluation is one
+/// assignment of `None`.
+struct InFlight {
+    /// How many statements from the front of `pending` the evaluation carried.
+    count: usize,
+    /// How many pump ticks it has gone without a verdict.
+    ///
+    /// Counted rather than timed, so `Bridge` stays free of clocks: the pump's
+    /// interval is the unit. See [`Bridge::tick`].
+    ticks: u32,
+}
+
 /// One flush's worth of script, tagged with the epoch it belongs to.
 ///
 /// The tag is what makes a late verdict harmless: see [`Bridge::delivered`].
@@ -144,15 +176,23 @@ pub struct Bridge {
     /// list only grows, everything past this index is new, and each is reported
     /// with its own style instead of being folded into one line.
     ///
+    /// Valid only for the generation it was counted in — see
+    /// `notices_generation`.
+    notices_reported: usize,
+    /// Which generation of `Model::notices` `notices_reported` counts.
+    ///
     /// The client clears that list without telling us — `AuthOk` does it while
     /// the phase is still `Launching`, which is exactly when `pam_open_session`
     /// forwards the password-expiry warning, the motd and the last-login line.
-    /// So the count is clamped to the list's length on every diff rather than
-    /// trusted: a stale-high counter swallows those notices entirely.
-    notices_reported: usize,
-    /// How long `Model::notices` was at the previous diff, which is how a clear
-    /// that happened without one is detected. See [`diff`](Self::diff).
-    notices_seen: usize,
+    ///
+    /// The length cannot detect that clear, which is why this exists.
+    /// `Link::pump` drains a whole batch of Wayland events before `diff` runs
+    /// once, so the clear and the notices that follow it land together and the
+    /// list is the same length or longer than it was: a counter compared
+    /// against a length sees nothing happen and swallows every one of them. The
+    /// client stamps the list instead, bumping this wherever it clears, so a
+    /// difference here *is* the clear and the count starts again from zero.
+    notices_generation: u64,
     error: Option<String>,
     authenticated: bool,
     over: bool,
@@ -171,24 +211,11 @@ pub struct Bridge {
     /// evaluation dropped the event permanently: the diff would never notice it
     /// again, and a theme waiting on `authentication_complete` waited forever.
     pending: Vec<Queued>,
-    /// How many of `pending` are in an evaluation whose verdict is still out.
-    in_flight: usize,
-    /// Whether an evaluation is outstanding at all.
+    /// The evaluation whose verdict is still out, if there is one.
     ///
-    /// Separate from `in_flight` because that is a *count* of statements and
-    /// [`enforce_limit`](Self::enforce_limit) can drive it to zero while the
-    /// evaluation carrying them is still unresolved. Gating on the count there
-    /// told [`tick`](Self::tick) there was nothing to time out — disabling the
-    /// hang detector precisely when the queue is full, which is what a wedged
-    /// page produces — and let [`flush`](Self::flush) issue a second concurrent
-    /// evaluation sharing an epoch, whose verdict then drained statements it
-    /// never carried.
-    awaiting: bool,
-    /// How many pump ticks the evaluation in flight has gone without a verdict.
-    ///
-    /// Counted rather than timed, so `Bridge` stays free of clocks: the pump's
-    /// interval is the unit. See [`tick`](Self::tick).
-    ticks_awaiting_verdict: u32,
+    /// `Some` *is* outstanding-ness — see [`InFlight`] for why that is not the
+    /// same as its count being non-zero.
+    in_flight: Option<InFlight>,
     /// How many pump ticks have passed with nothing outstanding and nothing
     /// queued. See [`tick`](Self::tick)'s heartbeat.
     idle_ticks: u32,
@@ -207,15 +234,21 @@ pub struct Bridge {
     /// Failed evaluations since the last successful one, counting one that
     /// never answered at all.
     consecutive_failures: u32,
-    /// Whether the current run of trouble has already been described in the
-    /// journal.
+    /// The last WebKit error text the journal was told about in this run of
+    /// trouble.
     ///
     /// Not the same question as "is this the first failure": a missed deadline
     /// produces a failure with no error string to log, so counting was enough
     /// to spend the once-only budget on silence and then discard the WebKit
     /// error that arrived next — the only line naming the statement that broke.
-    /// See [`report_error`](Self::report_error).
-    reported: bool,
+    ///
+    /// The text rather than a bool, because a run of failures is not
+    /// necessarily a run of the *same* failure: one statement's `ReferenceError`
+    /// and another's `TypeError` are two different things to fix, and a bool
+    /// printed whichever arrived first and silently swallowed the other for as
+    /// long as the trouble lasted. See
+    /// [`claim_error_report`](Self::claim_error_report).
+    last_reported: Option<String>,
 }
 
 impl Bridge {
@@ -267,17 +300,18 @@ impl Bridge {
         // line all arrive from `pam_open_session` inside exactly that window,
         // as does a `link_lost` during the handoff.
         //
-        // A list shorter than it was is a list that was cleared, which is the
-        // only way it ever shrinks — so start again from zero rather than merely
-        // clamping, because a clear and a push landing between two diffs leave
-        // the length unchanged or higher and clamping alone would still swallow
-        // them. Re-reporting a notice the page has seen is the failure this
-        // trades for, and it is the recoverable one.
-        if model.notices.len() < self.notices_seen {
+        // Keyed on the client's generation rather than on the length, because
+        // the length cannot see the clear that matters. `Link::pump` drains the
+        // whole batch of events before this runs once, so the clear and the
+        // notices that follow it arrive together and leave the list the same
+        // size or larger — a length comparison reports nothing happened, and a
+        // clamp to the length has nothing to clamp. Re-reporting a notice the
+        // page has already seen is what this trades for, and it is the
+        // recoverable failure of the two.
+        if model.notices_generation != self.notices_generation {
+            self.notices_generation = model.notices_generation;
             self.notices_reported = 0;
         }
-        self.notices_seen = model.notices.len();
-        self.notices_reported = self.notices_reported.min(model.notices.len());
         if model.notices.len() > self.notices_reported {
             for notice in &model.notices[self.notices_reported..] {
                 out.push(Queued::callback(call(
@@ -356,10 +390,26 @@ impl Bridge {
     /// *oldest* thing in the queue. Evicting by age alone dropped exactly that
     /// and kept a later `show_prompt`.
     ///
+    /// Once no assignment is left, callbacks go *newest*-first, which is the
+    /// opposite of the assignment pass and deliberately so: the oldest
+    /// surviving event is the lockout explanation, and it is the last thing
+    /// this will give up. Walking from index 0 on both passes undid the whole
+    /// point — the moment assignments ran out it went back to dropping the
+    /// oldest event, which is the exact failure the two-pass split exists to
+    /// prevent.
+    ///
+    /// ponytail: a page wedged past [`PENDING_LIMIT`] loses the oldest events
+    /// it has not acknowledged, and `show_message`/`show_prompt` have no
+    /// successor to restore them. The ceiling is the queue depth; the upgrade
+    /// path is to acknowledge per statement rather than per evaluation, so what
+    /// the page has actually run is known and only genuinely unseen events need
+    /// holding — a queue that never fills for any page still answering at all.
+    ///
     /// Statements still in flight can be dropped along with the rest, so
-    /// `in_flight` shrinks with them. That is why outstanding-ness is tracked
-    /// by `awaiting` and not by the count: nothing here touches the epoch, so
-    /// the evaluation those statements belonged to is still coming.
+    /// `in_flight`'s count shrinks with them. That is why outstanding-ness is
+    /// `in_flight` being `Some` and not the count being non-zero: nothing here
+    /// touches the epoch, so the evaluation those statements belonged to is
+    /// still coming.
     fn enforce_limit(&mut self) {
         let excess = self.pending.len().saturating_sub(PENDING_LIMIT);
         if excess == 0 {
@@ -370,25 +420,36 @@ impl Bridge {
         let mut doomed = vec![false; self.pending.len()];
         let mut left = excess;
         for pass in [Stmt::Assignment, Stmt::Callback] {
-            for (slot, queued) in doomed.iter_mut().zip(&self.pending) {
+            let newest_first = pass == Stmt::Callback;
+            for step in 0..self.pending.len() {
                 if left == 0 {
                     break;
                 }
-                if !*slot && queued.kind == pass {
-                    *slot = true;
+                let index = if newest_first {
+                    self.pending.len() - 1 - step
+                } else {
+                    step
+                };
+                if !doomed[index] && self.pending[index].kind == pass {
+                    doomed[index] = true;
                     left -= 1;
                 }
             }
         }
 
-        let lost_in_flight = doomed[..self.in_flight].iter().filter(|d| **d).count();
+        let lost_in_flight = match &self.in_flight {
+            Some(flight) => doomed[..flight.count].iter().filter(|d| **d).count(),
+            None => 0,
+        };
         let mut index = 0;
         self.pending.retain(|_| {
             let keep = !doomed[index];
             index += 1;
             keep
         });
-        self.in_flight -= lost_in_flight;
+        if let Some(flight) = &mut self.in_flight {
+            flight.count -= lost_in_flight;
+        }
     }
 
     /// Everything queued, as one script — or nothing while a verdict is out.
@@ -396,12 +457,13 @@ impl Bridge {
     /// One evaluation at a time: sending more while one is unresolved would
     /// mean not knowing which statements a later failure lost.
     pub fn flush(&mut self) -> Option<Outbound> {
-        if self.awaiting || self.pending.is_empty() {
+        if self.in_flight.is_some() || self.pending.is_empty() {
             return None;
         }
-        self.awaiting = true;
-        self.in_flight = self.pending.len();
-        self.ticks_awaiting_verdict = 0;
+        self.in_flight = Some(InFlight {
+            count: self.pending.len(),
+            ticks: 0,
+        });
         self.idle_ticks = 0;
         Some(Outbound {
             epoch: self.epoch,
@@ -420,11 +482,18 @@ impl Bridge {
     /// evaluation [`tick`](Self::tick) already wrote off — drains nothing: it
     /// describes statements that have since been abandoned or retransmitted,
     /// and acting on it would acknowledge what the page never ran. A late
-    /// *success* still clears the failure count, though, because answering at
-    /// all is proof the page is alive. Without that, a theme consistently
-    /// slower than [`VERDICT_DEADLINE`] gained a failure per deadline and could
-    /// never shed one: "slow" escalated to wedged, the greeter quit, respawned,
-    /// and did it again.
+    /// *success* still forgives a failure, though, because answering at all is
+    /// proof the page is alive. Without that, a theme consistently slower than
+    /// [`VERDICT_DEADLINE`] gained a failure per deadline and could never shed
+    /// one: "slow" escalated to wedged, the greeter quit, respawned, and did it
+    /// again.
+    ///
+    /// One failure, not all of them. The count a stale success finds is not
+    /// the count its own evaluation earned — the retransmission that replaced
+    /// it has been failing since, and zeroing erases that. A page answering one
+    /// deadline late nets out at zero either way, so the slow theme is still
+    /// forgiven; a page answering less often than it is asked keeps climbing,
+    /// which is the difference between "slow" and "not really there".
     ///
     /// A failure keeps the statements queued, so the next flush retransmits all
     /// of them — an evaluation that came back `Err` demonstrably did not run,
@@ -433,31 +502,44 @@ impl Bridge {
     pub fn delivered(&mut self, epoch: u64, ok: bool) {
         if epoch != self.epoch {
             if ok {
-                self.consecutive_failures = 0;
-                self.reported = false;
+                self.consecutive_failures = self.consecutive_failures.saturating_sub(1);
+                if self.consecutive_failures == 0 {
+                    self.last_reported = None;
+                }
             }
             return;
         }
         if ok {
-            self.pending.drain(..self.in_flight);
+            let carried = self.in_flight.as_ref().map_or(0, |flight| flight.count);
+            self.pending.drain(..carried);
             self.consecutive_failures = 0;
-            self.reported = false;
+            self.last_reported = None;
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         }
-        self.awaiting = false;
-        self.in_flight = 0;
-        self.ticks_awaiting_verdict = 0;
+        self.in_flight = None;
     }
 
-    /// Whether this run of trouble still owes the journal an explanation.
+    /// Claim the right to print `error` to the journal, if it has not already
+    /// been printed in this run of trouble.
     ///
-    /// Returns true once per run of failures, and only for a caller that has an
-    /// error string worth printing — gating on the failure *count* instead
-    /// spent the budget on the first missed deadline, which has no error text,
-    /// and then discarded the WebKit error that named the broken statement.
-    pub fn report_error(&mut self) -> bool {
-        !std::mem::replace(&mut self.reported, true)
+    /// A predicate with a side effect, named for the claim rather than for the
+    /// printing: the caller does the logging, and `if … && bridge.report_error()`
+    /// read as though this were the thing that logged and could fail.
+    ///
+    /// True at most once per *distinct* error text, and only for a caller that
+    /// has one — gating on the failure count instead spent the budget on the
+    /// first missed deadline, which has no error text, and then discarded the
+    /// WebKit error that named the broken statement. Keying on the text keeps
+    /// the flood suppressed, because a page failing the same way sixty times a
+    /// second reports the same string sixty times a second, while a second,
+    /// different cause still reaches the journal on the tick it first appears.
+    pub fn claim_error_report(&mut self, error: &str) -> bool {
+        if self.last_reported.as_deref() == Some(error) {
+            return false;
+        }
+        self.last_reported = Some(error.to_owned());
+        true
     }
 
     /// Advance the deadline on the evaluation in flight, if there is one.
@@ -488,13 +570,17 @@ impl Bridge {
     /// [`flush`]: Self::flush
     /// [`is_wedged`]: Self::is_wedged
     pub fn tick(&mut self) {
-        if !self.awaiting {
-            self.heartbeat();
-            return;
-        }
-        self.ticks_awaiting_verdict = self.ticks_awaiting_verdict.saturating_add(1);
-        if self.ticks_awaiting_verdict < VERDICT_DEADLINE {
-            return;
+        match &mut self.in_flight {
+            None => {
+                self.heartbeat();
+                return;
+            }
+            Some(flight) => {
+                flight.ticks = flight.ticks.saturating_add(1);
+                if flight.ticks < VERDICT_DEADLINE {
+                    return;
+                }
+            }
         }
 
         if self.consecutive_failures == 0 {
@@ -508,7 +594,22 @@ impl Bridge {
         // locked." once per retransmission. The assignments stay: they are
         // idempotent, and losing them would leave the page's state behind the
         // model's.
-        let tail = self.pending.split_off(self.in_flight);
+        //
+        // ponytail: a page that stalls past VERDICT_DEADLINE loses the PAM
+        // messages of that evaluation — the lockout explanation among them —
+        // because "may have run" is the most that can be said about any of
+        // them. The ceiling is that a verdict describes a whole evaluation; the
+        // upgrade path is to acknowledge per statement rather than per
+        // evaluation, so a timed-out flush can be replayed exactly, resending
+        // what the page never reached and nothing it did.
+        // Taken here rather than reset at the end: the evaluation is over as of
+        // this line, and its count is the split point below.
+        let carried = self
+            .in_flight
+            .take()
+            .expect("the match above returned unless one was outstanding")
+            .count;
+        let tail = self.pending.split_off(carried);
         let before = self.pending.len();
         self.pending.retain(|q| q.kind == Stmt::Assignment);
         let dropped = before - self.pending.len();
@@ -526,17 +627,20 @@ impl Bridge {
         // would drain `in_flight` statements belonging to the retransmission
         // that has since been sent, acknowledging what the page never ran.
         self.epoch = self.epoch.wrapping_add(1);
-        self.awaiting = false;
-        self.in_flight = 0;
-        self.ticks_awaiting_verdict = 0;
+        // Along with `in_flight` above: the page is back to having nothing outstanding,
+        // and that is the state `idle_ticks` counts. Leaving it where the last
+        // idle stretch happened to stop is currently harmless — the queue is
+        // never empty here — but every other transition leaves this consistent
+        // and one that does not is a trap for whoever changes the next one.
+        self.idle_ticks = 0;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
     /// Queue something for an idle page to answer, so silence is still visible.
     ///
-    /// `void 0;` is an assignment as far as the queue is concerned — nothing to
-    /// duplicate, nothing to lose — and it exists only to give the next flush a
-    /// script to send.
+    /// [`HEARTBEAT`] is an assignment as far as the queue is concerned —
+    /// nothing to duplicate, nothing to lose — and it exists only to give the
+    /// next flush a script to send.
     fn heartbeat(&mut self) {
         if !self.pending.is_empty() {
             self.idle_ticks = 0;
@@ -547,12 +651,12 @@ impl Bridge {
             return;
         }
         self.idle_ticks = 0;
-        self.pending.push(Queued::assignment("void 0;".to_owned()));
+        self.pending.push(Queued::assignment(HEARTBEAT.to_owned()));
     }
 
     /// Failed evaluations since the last that succeeded.
     ///
-    /// Whether to log is [`report_error`](Self::report_error)'s question, not
+    /// Whether to log is [`claim_error_report`](Self::claim_error_report)'s question, not
     /// this one's: retrying every 16ms forever would otherwise be sixty
     /// warnings a second in the journal.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -573,6 +677,25 @@ impl Bridge {
     /// [`tick`](Self::tick) sees that.
     pub fn is_wedged(&self) -> bool {
         self.consecutive_failures >= WEDGED_AFTER
+    }
+
+    /// Forget what the *page* has been told about the link, so the next
+    /// [`diff`](Self::diff) says it again whatever it is.
+    ///
+    /// Called on load-finished, and only for `link_dead`, because that is the
+    /// one piece of page state a reload silently rewinds. It is baked into the
+    /// document-start [`api_script`], which re-runs on every load with the value
+    /// frozen at startup — so a link that died after startup leaves a reloaded
+    /// page believing it is alive, while this bridge, having already sent the
+    /// assignment once, sees no change and never corrects it. The theme then
+    /// offers a retry into a socket nobody reads and clears the one message
+    /// explaining why nothing works.
+    ///
+    /// Inverting the mirror rather than emitting directly keeps one place
+    /// deciding what the assignment looks like: the next diff finds a
+    /// disagreement and does what it always does.
+    pub fn resync(&mut self) {
+        self.link_dead = !self.link_dead;
     }
 
     /// Forget the previous conversation, so its verdict is reported again if it
@@ -619,7 +742,13 @@ pub fn error_script(text: &str) -> String {
 /// script, so a theme callback that throws would otherwise abort every
 /// statement after it — including the `is_authenticated` assignment a broken
 /// `show_message` has no business suppressing.
-fn call(name: &str, args: &[serde_json::Value]) -> String {
+///
+/// `name` is interpolated into the script unescaped, which is why it is
+/// `&'static str`: it is the *shape* of the statement, not data, and every
+/// caller passes a literal. The compiler enforcing that is the point — nothing
+/// derived from PAM, from the account database or from the page can reach it,
+/// and the escaping discipline that covers `args` has no hole to guard here.
+fn call(name: &'static str, args: &[serde_json::Value]) -> String {
     let args: Vec<String> = args.iter().map(literal).collect();
     format!(
         "if (typeof window.{name} === 'function') {{ try {{ window.{name}({}); }} catch (e) {{ console.error('wdm: {name}:', e); }} }}",
@@ -891,6 +1020,13 @@ mod tests {
         assert!(js.contains("Account expired."), "{js}");
     }
 
+    /// What `AuthOk` does to the model: the notices go, and the generation is
+    /// stamped so anyone counting them knows to start again.
+    fn clear_notices(model: &mut Model) {
+        model.notices.clear();
+        model.notices_generation = model.notices_generation.wrapping_add(1);
+    }
+
     #[test]
     fn a_notice_after_the_model_clears_is_still_reported() {
         // The counter cannot trust the list to only grow. `wdm-greeter-client`
@@ -905,7 +1041,7 @@ mod tests {
         }
         assert!(drain(&mut bridge, &model).contains("notice 2"));
 
-        model.notices.clear(); // what AuthOk does, without a Bridge::restart()
+        clear_notices(&mut model);
         model.push_notice(
             NoticeKind::Info,
             "your password expires in 3 days".to_owned(),
@@ -913,6 +1049,50 @@ mod tests {
 
         let js = drain(&mut bridge, &model);
         assert!(js.contains("your password expires in 3 days"), "{js}");
+    }
+
+    #[test]
+    fn a_clear_the_length_cannot_see_still_restarts_the_count() {
+        // The case the length comparison could not fire for, and the reason
+        // this is keyed on the client's generation instead. `Link::pump` drains
+        // a whole batch of Wayland events before `diff` runs once, so `AuthOk`'s
+        // clear and everything `pam_open_session` says after it arrive
+        // together: one notice reported, cleared, one pushed, and the list is
+        // exactly as long as it was. A shrink check never fires, a clamp has
+        // nothing to clamp, and the password-expiry warning is swallowed.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Info, "welcome back".to_owned());
+        assert!(drain(&mut bridge, &model).contains("welcome back"));
+
+        clear_notices(&mut model);
+        model.push_notice(
+            NoticeKind::Info,
+            "your password expires in 3 days".to_owned(),
+        );
+        assert_eq!(
+            model.notices.len(),
+            1,
+            "the equal-length case was not set up"
+        );
+
+        let js = drain(&mut bridge, &model);
+        assert!(js.contains("your password expires in 3 days"), "{js}");
+
+        // And the same again with more than one, so a fix that happens to work
+        // for a single notice is not enough: report two, clear, push two.
+        for n in 0..2 {
+            model.push_notice(NoticeKind::Info, format!("first {n}"));
+        }
+        drain(&mut bridge, &model);
+        clear_notices(&mut model);
+        for n in 0..3 {
+            model.push_notice(NoticeKind::Info, format!("second {n}"));
+        }
+        let js = drain(&mut bridge, &model);
+        for n in 0..3 {
+            assert!(js.contains(&format!("second {n}")), "{js}");
+        }
     }
 
     #[test]
@@ -1195,6 +1375,45 @@ mod tests {
     }
 
     #[test]
+    fn a_page_answering_less_often_than_it_is_asked_still_escalates() {
+        // The other side of the forgiveness above, and what a stale-epoch
+        // success zeroing the count destroyed. The count a late verdict finds
+        // is not the one its own evaluation earned: the retransmission that
+        // replaced it has been failing since, and wiping those failures let a
+        // page answering one evaluation in two sit at zero forever — never
+        // wedged, never recovered, and a login screen doing nothing.
+        //
+        // Forgiving exactly one is what tells the two apart: a page one
+        // deadline late nets out at zero, a page half as fast as it is asked
+        // climbs.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+
+        let mut rounds = 0u32;
+        while !bridge.is_wedged() {
+            let mut oldest = None;
+            for _ in 0..2 {
+                model.push_notice(NoticeKind::Info, "still here".to_owned());
+                bridge.diff(&model);
+                if let Some(out) = bridge.flush() {
+                    oldest.get_or_insert(out.epoch);
+                }
+                for _ in 0..VERDICT_DEADLINE {
+                    bridge.tick();
+                }
+            }
+            // One answer for the two it was asked, and long stale by now.
+            bridge.delivered(oldest.expect("nothing was ever sent"), true);
+
+            rounds += 1;
+            assert!(
+                rounds < 10_000,
+                "a page half as fast as the pump never gave up"
+            );
+        }
+    }
+
+    #[test]
     fn a_timed_out_evaluation_does_not_repeat_its_callbacks() {
         // A timed-out evaluation is not a refused one: it may well have run.
         // The default theme appends messages, so retransmitting the whole
@@ -1249,13 +1468,18 @@ mod tests {
             bridge.tick();
         }
         let out = bridge.flush().expect("no heartbeat was queued");
-        assert_eq!(out.script, "void 0;");
+        assert_eq!(out.script, HEARTBEAT);
 
         for n in 0..=PENDING_LIMIT {
             model.push_notice(NoticeKind::Info, format!("notice {n}"));
             bridge.diff(&model);
         }
-        assert_eq!(bridge.in_flight, 0, "the case was never reached");
+        assert_eq!(
+            bridge.in_flight.as_ref().map(|f| f.count),
+            Some(0),
+            "the case was never reached: the evaluation must still be outstanding \
+             with every statement it carried evicted"
+        );
 
         assert!(
             bridge.flush().is_none(),
@@ -1281,7 +1505,7 @@ mod tests {
         while !bridge.is_wedged() {
             bridge.tick();
             if let Some(out) = bridge.flush() {
-                assert_eq!(out.script, "void 0;");
+                assert_eq!(out.script, HEARTBEAT);
             }
             ticks += 1;
             assert!(ticks < 10_000, "an idle greeter never noticed");
@@ -1345,6 +1569,101 @@ mod tests {
 
         // And once told, not told again on every pump.
         assert!(drain(&mut bridge, &model).is_empty());
+    }
+
+    #[test]
+    fn a_dead_link_is_told_to_the_page_before_anything_reacts_to_it() {
+        // The ordering `diff` argues for at length and nothing pinned. Moving
+        // the block below the notices loop leaves every other test green while
+        // `authentication_complete` fires with the page's `link_dead` still
+        // false — so the theme offers "press Enter to try again" into a socket
+        // nobody reads and clears the notice explaining why.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.link_lost("the compositor went away");
+
+        let js = drain(&mut bridge, &model);
+        let dead = js.find("window.wdm.link_dead = true;").expect(&js);
+        let notice = js.find("show_message").expect(&js);
+        let complete = js.find("authentication_complete").expect(&js);
+        assert!(
+            dead < notice,
+            "the explanation arrived before the fact: {js}"
+        );
+        assert!(notice < complete, "{js}");
+    }
+
+    #[test]
+    fn a_reloaded_page_is_told_the_link_is_dead_again() {
+        // The document-start API script re-runs on every load with the value
+        // frozen at startup, so a reload after the link died silently resets
+        // the page's copy to false. The diff emits on *change* and both sides
+        // already read true, so nothing corrects it — and the theme goes back
+        // to offering a retry. `resync` is what load-finished uses to make the
+        // next diff say it whatever it is.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.link_dead = true;
+        assert!(drain(&mut bridge, &model).contains("window.wdm.link_dead = true;"));
+        assert!(drain(&mut bridge, &model).is_empty());
+
+        bridge.resync();
+        let js = drain(&mut bridge, &model);
+        assert!(
+            js.contains("window.wdm.link_dead = true;"),
+            "a reloaded document was left believing the socket is alive: {js}"
+        );
+
+        // And it settles again: resync is a one-shot, not a mode.
+        assert!(drain(&mut bridge, &model).is_empty());
+    }
+
+    #[test]
+    fn the_journal_hears_each_distinct_error_once() {
+        // The throttle whose two failure modes are silence at the moment of
+        // interest and sixty lines a second. A bool for "already reported"
+        // bought the first statement's ReferenceError and then swallowed a
+        // second, different cause for as long as the trouble lasted.
+        let mut bridge = Bridge::default();
+
+        // Once for a given text…
+        assert!(bridge.claim_error_report("ReferenceError: x is not defined"));
+        assert!(!bridge.claim_error_report("ReferenceError: x is not defined"));
+        assert!(!bridge.claim_error_report("ReferenceError: x is not defined"));
+
+        // …but a genuinely different cause is not the same news.
+        assert!(bridge.claim_error_report("TypeError: y is not a function"));
+        assert!(!bridge.claim_error_report("TypeError: y is not a function"));
+
+        // And the first one is claimable again once it is the current story,
+        // which is the flood this suppresses: alternating causes are two lines
+        // per pair of ticks, not sixty a second of one.
+        assert!(bridge.claim_error_report("ReferenceError: x is not defined"));
+    }
+
+    #[test]
+    fn recovery_lets_the_journal_speak_again() {
+        // A run of trouble that ends and comes back is two runs. Keying on the
+        // text alone would print the same error once ever, so a theme that
+        // breaks, is reloaded and breaks again the same way would be silent the
+        // second time — which is the time someone is looking.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Info, "hello".to_owned());
+        bridge.diff(&model);
+
+        let out = bridge.flush().unwrap();
+        bridge.delivered(out.epoch, false);
+        assert!(bridge.claim_error_report("ReferenceError: x is not defined"));
+        assert!(!bridge.claim_error_report("ReferenceError: x is not defined"));
+
+        let out = bridge.flush().unwrap();
+        bridge.delivered(out.epoch, true);
+        assert_eq!(bridge.consecutive_failures(), 0);
+        assert!(
+            bridge.claim_error_report("ReferenceError: x is not defined"),
+            "a second run of the same trouble went unreported"
+        );
     }
 
     #[test]
@@ -1435,9 +1754,53 @@ mod tests {
             script.contains("The account is locked."),
             "the explanation was evicted while state was still expendable"
         );
+
+        // Built through the same `literal` the diff emits, rather than guessed
+        // as a substring: asserting the *absence* of hand-written JSON passes
+        // just as well when serde changes its spacing, or when eviction has
+        // over-run and thrown away everything. Two assertions, so a queue that
+        // kept nothing fails as loudly as one that kept the wrong thing.
+        let assignment = |id: u32| {
+            format!(
+                "window.wdm._prompt = {};",
+                literal(&json!({ "id": id, "text": "Password:", "secret": true }))
+            )
+        };
         assert!(
-            !script.contains("\"id\":1,"),
+            script.contains(&assignment(199)),
+            "the newest state was evicted, so the page is behind the model"
+        );
+        assert!(
+            !script.contains(&assignment(1)),
             "an obsolete assignment outlived an event"
+        );
+    }
+
+    #[test]
+    fn a_queue_of_nothing_but_events_gives_up_the_newest_first() {
+        // Once the assignments are gone the eviction order inverts, and it has
+        // to: the reason callbacks are spent last is that the oldest of them is
+        // the lockout explanation, and dropping the oldest is the very thing
+        // the two-pass split exists to prevent. Walking from index 0 on both
+        // passes handed that back the moment there was nothing expendable left.
+        let mut bridge = Bridge::default();
+        let mut model = model();
+        model.push_notice(NoticeKind::Error, "The account is locked.".to_owned());
+        for n in 0..PENDING_LIMIT + 8 {
+            model.push_notice(NoticeKind::Info, format!("notice {n}"));
+        }
+        bridge.diff(&model);
+
+        let script = bridge.flush().expect("nothing was queued").script;
+        assert_eq!(script.lines().count(), PENDING_LIMIT);
+        assert!(
+            script.contains("The account is locked."),
+            "the first-queued message was evicted: {script}"
+        );
+        // Quoted, because "notice 25" is a prefix of "notice 255".
+        assert!(
+            !script.contains(&format!("\"notice {}\"", PENDING_LIMIT + 7)),
+            "the newest event survived while an older one was dropped"
         );
     }
 

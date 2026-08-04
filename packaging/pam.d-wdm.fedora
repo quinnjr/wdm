@@ -16,7 +16,9 @@
 # login-capable Fedora service brackets its own. `close` runs first and resets
 # any exec context inherited from wdm; `open` computes the context the user's
 # session should run in and arms setexeccon(3) for the exec that follows, so it
-# has to come before system-auth rather than after.
+# has to come before system-auth rather than after — which is how the bracket is
+# meant to work, and is not what happens here: see the ponytail: below, which
+# also covers pam_loginuid, pam_keyinit and pam_namespace.
 #
 # pam_keyinit is listed after pam_selinux open and pam_namespace, which is where
 # Fedora's own login and sshd stacks put it: the session keyring is created with
@@ -24,16 +26,35 @@
 # anything, but this file cannot be tested from the machine it is written on, so
 # it follows the ordering the distribution ships rather than an improvised one.
 #
-# ponytail: the bracket is inert as wdm currently forks. Both pam_selinux open
-# and pam_keyinit set *per-thread* state — the armed exec context and the joined
-# session keyring — and wdm runs pam_open_session on its PAM thread while
-# forking the session from the main one. fork(2) copies only the calling thread,
-# so neither reaches the session: a confined login (staff_u, guest_u, xguest_u)
-# is still unconfined and MCS separation does not apply, on a distribution that
-# ships SELinux enforcing. The modules stay because they are correct for the day
-# that changes. The upgrade path is either to fork the session from the PAM
-# thread, or to re-apply setexeccon(3) and keyctl_join_session_keyring(3) in the
-# forking thread after pam_open_session returns.
+# ponytail: four modules in this stack are inert as wdm currently forks, and
+# they are all of them — everything not named here does work. Each sets
+# *per-thread* state, and wdm runs pam_open_session on its PAM thread while
+# forking the session from the main one; fork(2) copies only the calling thread,
+# so none of it reaches the session:
+#
+#   pam_selinux open   the armed exec context. A confined login (staff_u,
+#                      guest_u, xguest_u) is still unconfined and MCS separation
+#                      does not apply, on a distribution shipping SELinux
+#                      enforcing.
+#   pam_loginuid       loginuid is per-task and inherited from the *forking*
+#                      thread, so every graphical session is unattributable in
+#                      the audit trail — auditd records it against wdm's own
+#                      loginuid rather than the user's. It is `required`, which
+#                      makes it look load-bearing; it is not, here.
+#   pam_namespace      unshare(CLONE_NEWNS) is per-thread, so a polyinstantiated
+#                      /tmp or /home configured in namespace.conf silently does
+#                      not apply to the session.
+#   pam_keyinit        the joined session keyring.
+#
+# The modules stay because they are correct for the day that changes. The
+# upgrade path is either to fork the session from the PAM thread, or to re-apply
+# each of these in the forking thread after pam_open_session returns:
+# setexeccon(3), a write to /proc/self/loginuid, unshare(2), and
+# keyctl_join_session_keyring(3). The loginuid write is the awkward one — with
+# AUDIT_FEATURE_LOGINUID_IMMUTABLE the kernel permits it only once per task and
+# refuses any later change, so a thread whose loginuid has already been set
+# cannot correct it — which is the strongest argument for moving the fork onto
+# the PAM thread instead of patching state up afterwards.
 
 auth        substack    system-auth
 -auth       optional    pam_gnome_keyring.so

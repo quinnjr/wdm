@@ -11,7 +11,7 @@ bindings — not on wdm itself.
 
 ```toml
 [dependencies]
-wdm-protocol = { git = "https://github.com/quinnjr/wdm", tag = "v0.2.0", features = ["client"] }
+wdm-protocol = { git = "https://github.com/quinnjr/wdm", tag = "v0.3.0", features = ["client"] }
 ```
 
 Every crate here sets `publish = false`, so there is no registry version to

@@ -54,8 +54,6 @@ const replaceText = (id, text) => {
   node.hidden = !text;
 };
 
-const clearText = (id) => replaceText(id, "");
-
 // Adds one more message without disturbing the ones already there, because the
 // greeter calls show_message once per message PAM sent and PAM routinely splits
 // one explanation in two. Assigning here would leave the user reading
@@ -68,6 +66,12 @@ const clearText = (id) => replaceText(id, "");
 // the lockout reason. It is the *second* that is dropped when the line grows
 // too long, so the oldest news the user still needs stays put while the newest
 // arrives.
+//
+// ponytail: more than six messages in one conversation lose the second onward,
+// silently — a stack running pam_faillock, pam_pwquality, a motd and a
+// last-login line can reach that in a single attempt. The screen has no scroll
+// by design, which is what forces a cap at all; a scrollable message region
+// removes the need for one.
 const MAX_MESSAGES = 6;
 const appendText = (id, text, kind) => {
   // An empty message is not a message. Without this the element would unhide
@@ -82,7 +86,13 @@ const appendText = (id, text, kind) => {
   // this the messages would run together into one word. The separator lives
   // inside the span rather than beside it so that dropping a span drops its
   // separator with it, leaving no stray text nodes among node.children.
-  line.textContent = (node.children.length ? " " : "") + text;
+  //
+  // childNodes, not children: `children` counts elements only, and replaceText
+  // writes a bare text node. The first append into an element replaceText had
+  // already written — "No users available to log in", then a lost-link notice
+  // on the same element — would otherwise arrive with no space in front of it.
+  // The cap below is right to use `children`: it removes spans.
+  line.textContent = (node.childNodes.length ? " " : "") + text;
   node.append(line);
   while (node.children.length > MAX_MESSAGES) {
     node.children[1].remove();
@@ -101,10 +111,14 @@ const linkDead = () => typeof wdm.link_dead !== "undefined" && wdm.link_dead;
 // assigned, and only once: whatever PAM managed to say before the link went is
 // still the most useful thing on the screen, and both paths into here can be
 // reached more than once.
-let stalled = false;
-const stall = () => {
-  if (!stalled) {
-    stalled = true;
+//
+// Named for what it is — terminal and latched, not a pause — to match
+// wdm.link_dead, GREETER_GAVE_UP_EXIT and Disposition::GaveUp, which are the
+// same condition seen from the other side.
+let gaveUp = false;
+const giveUp = () => {
+  if (!gaveUp) {
+    gaveUp = true;
     appendText(
       "error",
       "Connection to wdm lost — switch to a text console",
@@ -112,6 +126,11 @@ const stall = () => {
     );
   }
   el("prompt").textContent = "";
+  // The one clear start() would have done and this path skips. A password typed
+  // just as the link dropped would otherwise sit in a disabled input in the
+  // WebKit web process — a separate address space from the greeter — for as
+  // long as the screen is up, which here is until the machine is rebooted.
+  el("answer").value = "";
   for (const id of ["user", "session", "answer"]) {
     el(id).disabled = true;
   }
@@ -138,12 +157,12 @@ const start = () => {
   // Before the clears below, deliberately: an attempt that cannot be made must
   // not wipe the text saying why.
   if (linkDead()) {
-    stall();
+    giveUp();
     return;
   }
 
-  clearText("message");
-  clearText("error");
+  replaceText("message", "");
+  replaceText("error", "");
   el("answer").value = "";
   el("prompt").textContent = "Waiting…";
   selectPreferredSession();
@@ -185,7 +204,7 @@ window.authentication_complete = () => {
   // would be an invitation to a blank screen: start() clears the messages and
   // sends into a socket nobody reads.
   if (linkDead()) {
-    stall();
+    giveUp();
     return;
   }
 

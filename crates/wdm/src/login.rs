@@ -1045,6 +1045,12 @@ mod tests {
         pub struct Client {
             sock: UnixStream,
             received: Vec<Message>,
+            /// Set once the server has hung up. Read at EOF is indistinguishable
+            /// from "nothing more to read" at the syscall, but the two mean
+            /// opposite things here: wdm closes the connection when a client
+            /// commits a protocol error, so an unnoticed EOF turns a rejection
+            /// into a missing-event panic several frames later.
+            closed: bool,
         }
 
         impl Client {
@@ -1056,6 +1062,7 @@ mod tests {
                 Self {
                     sock,
                     received: Vec::new(),
+                    closed: false,
                 }
             }
 
@@ -1096,7 +1103,10 @@ mod tests {
                 let mut data = Vec::new();
                 loop {
                     match self.sock.read(&mut chunk) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            self.closed = true;
+                            break;
+                        }
                         Ok(n) => data.extend_from_slice(&chunk[..n]),
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => panic!("reading from the compositor: {e}"),
@@ -1126,14 +1136,52 @@ mod tests {
                     });
                     pos += size;
                 }
+
+                // Each pump parses only what it read, so a message split across
+                // two reads would be dropped rather than reassembled. That is
+                // acceptable while every flush fits the socket buffer, but it
+                // must not be acceptable *silently*.
+                assert_eq!(
+                    pos,
+                    data.len(),
+                    "trailing {} bytes of a partial message",
+                    data.len() - pos
+                );
             }
 
             pub fn events(&self) -> &[Message] {
                 &self.received
             }
 
+            /// Panic if the compositor has hung up.
+            ///
+            /// wdm answers a protocol violation it cannot report on the wire by
+            /// dropping the connection, so every accessor that reads results has
+            /// to distinguish "the server has sent everything it is going to"
+            /// from "the server hung up on us". Both look like an empty read at
+            /// the syscall. Without this, a rejected request surfaces as a
+            /// missing event several frames from the request that caused it.
+            ///
+            /// A hangup preceded by a wl_display.error is not that case: the
+            /// compositor said what it objected to before disconnecting, the
+            /// event is in `received`, and `already_bound` is tested for exactly
+            /// that. Only a silent hangup is unexplained, and only that panics.
+            fn assert_live(&self) {
+                if !self.closed {
+                    return;
+                }
+                assert!(
+                    self.received
+                        .iter()
+                        .any(|m| m.object == DISPLAY && m.opcode == DISPLAY_ERROR),
+                    "the compositor closed the connection without saying why; \
+                     it rejected an earlier request"
+                );
+            }
+
             /// The registry name of a global, so it can be bound.
             pub fn global(&self, interface: &str) -> Option<u32> {
+                self.assert_live();
                 self.received
                     .iter()
                     .filter(|m| m.object == REGISTRY && m.opcode == REGISTRY_GLOBAL)
@@ -1146,6 +1194,7 @@ mod tests {
 
             /// Every event the compositor sent to the greeter object.
             pub fn greeter_events(&self) -> Vec<&Message> {
+                self.assert_live();
                 self.received
                     .iter()
                     .filter(|m| m.object == GREETER)
@@ -1251,20 +1300,34 @@ mod tests {
         // XML and that test goes green while checking nothing. The generated
         // bindings already carry the real table, so pin against it here rather
         // than trusting the numbers to stay true by themselves.
+        //
+        // The signature is pinned alongside the name because the tests read
+        // arguments *positionally* — `user_last_session` takes the fourth
+        // string. An argument inserted into `user` would move last_session
+        // without moving any opcode, so a name-only check would stay green
+        // while both version-gating tests silently asserted on display_name.
+        use smithay::reexports::wayland_server::backend::protocol::{AllowNull, ArgumentType};
+
+        let str_arg = ArgumentType::Str(AllowNull::No);
         let events = <WdmGreeterV1 as Resource>::interface().events;
-        for (op, name) in [
-            (wire::USER, "user"),
-            (wire::DONE, "done"),
-            (wire::AUTH_OK, "auth_ok"),
-            (wire::DEFAULT_SESSION, "default_session"),
+        for (op, name, signature) in [
+            (
+                wire::USER,
+                "user",
+                &[str_arg, str_arg, str_arg, str_arg][..],
+            ),
+            (wire::DONE, "done", &[][..]),
+            (wire::AUTH_OK, "auth_ok", &[][..]),
+            (wire::DEFAULT_SESSION, "default_session", &[str_arg][..]),
         ] {
+            let event = events
+                .get(op as usize)
+                .unwrap_or_else(|| panic!("no event at opcode {op}"));
+            assert_eq!(event.name, name, "opcode {op} is no longer {name}");
             assert_eq!(
-                events
-                    .get(op as usize)
-                    .unwrap_or_else(|| panic!("no event at opcode {op}"))
-                    .name,
-                name,
-                "opcode {op} is no longer {name}"
+                event.signature, signature,
+                "{name}'s arguments changed; the positional reads in this \
+                 module now name different fields"
             );
         }
     }

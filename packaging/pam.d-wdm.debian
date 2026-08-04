@@ -18,6 +18,20 @@
 # session gets no /etc/environment and no /etc/default/locale; without
 # pam_limits the caps in /etc/security/limits.conf — nproc, maxlogins, memlock,
 # nofile — apply on every other way into the machine but not on this one.
+#
+# ponytail: pam_loginuid is inert as wdm currently forks, and is listed for the
+# day that changes rather than for what it does today. loginuid is per-task and
+# inherited from the *forking* thread; wdm runs pam_open_session on its PAM
+# thread while forking the session from the main one, and fork(2) copies only
+# the calling thread, so the session carries wdm's own loginuid and every
+# graphical login is unattributable in the audit trail. Being `required` makes
+# it look load-bearing; it is not, here. The upgrade path is to fork the session
+# from the PAM thread, or to write /proc/self/loginuid in the forking thread
+# after pam_open_session returns — noting that with
+# AUDIT_FEATURE_LOGINUID_IMMUTABLE the kernel permits that write only once per
+# task, which is what makes forking from the PAM thread the better fix. The
+# Fedora stack carries the same note, alongside three more modules with the
+# same defect.
 
 auth        requisite   pam_nologin.so
 auth        required    pam_env.so readenv=1

@@ -47,7 +47,12 @@ priority = "optional"
 # Alternatives rather than a bare virtual: apt cannot choose between several
 # providers of one, so `Depends: wdm-greeter-implementation` would be
 # uninstallable. First named is what apt takes by default.
-depends = "libc6, libinput10, libseat1, libsystemd0, libdrm2, libgbm1, libegl1, libxkbcommon0, libpam0g, systemd, wdm-greeter | wdm-gtk-greeter | wdm-webkit-greeter"
+# `passwd` provides usermod, which postinst calls; it is Priority: required, so
+# it is never actually absent, but the rpm side declares shadow-utils for the
+# same call and two packages disagreeing about whether a dependency is worth
+# stating is how one of them later gets it wrong. getent is glibc's and needs no
+# entry.
+depends = "libc6, libinput10, libseat1, libsystemd0, libdrm2, libgbm1, libegl1, libxkbcommon0, libpam0g, systemd, passwd, wdm-greeter | wdm-gtk-greeter | wdm-webkit-greeter"
 conf-files = ["/etc/wdm/wdm.toml", "/etc/pam.d/wdm"]
 maintainer-scripts = "../../packaging/deb"
 assets = [
@@ -88,9 +93,11 @@ if [ -x /usr/bin/systemd-tmpfiles ]; then
 fi
 # Moves the greeter's home off /var/lib/wdm on a machine that installed 0.1.x.
 # Why, and why both guards, is written out once in packaging/deb/postinst.
-if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+# Absolute paths, as for the systemd- calls above: a scriptlet runs with a PATH
+# rpm chose, not the administrator's.
+if [ "$(/usr/bin/getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
     if [ -d /var/empty ]; then
-        usermod -d /var/empty wdm \
+        /usr/sbin/usermod -d /var/empty wdm \
             || echo "wdm: could not move the wdm account's home to /var/empty" >&2
     else
         echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
@@ -130,7 +137,8 @@ mesa-libgbm = "*"
 mesa-libEGL = "*"
 libxkbcommon = "*"
 pam = "*"
-# The post-install scriptlet calls getent and usermod.
+# The post-install scriptlet calls usermod. getent comes from glibc-common and
+# is not what this entry is for.
 shadow-utils = "*"
 # dnf can choose between providers of a virtual, so this one stays as it is in
 # the Arch package.

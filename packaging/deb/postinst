@@ -41,6 +41,18 @@ if [ "$1" = configure ]; then
         fi
     fi
 
+    # The flip side of declaring /etc/pam.d/wdm a conffile: a customised stack
+    # is kept, so a future security fix to the wdm PAM stack lands beside it and
+    # never applies until someone merges it by hand. The rpm scriptlet in
+    # crates/wdm/Cargo.toml says the same thing about .rpmnew; pacman prints its
+    # own .pacnew notice. Debian is the one that otherwise says nothing —
+    # unattended-upgrades runs dpkg with --force-confdef --force-confold, which
+    # keeps the old file silently, so without this the fix ships and never takes
+    # effect and nobody is told.
+    if [ -f /etc/pam.d/wdm.dpkg-dist ]; then
+        echo "wdm: /etc/pam.d/wdm.dpkg-dist was left beside your PAM stack; it may contain authentication changes that are not in effect until merged" >&2
+    fi
+
     # Make the freshly installed unit visible to systemd, so that a
     # `systemctl enable wdm` typed right after install works. This reloads
     # only; enabling stays the administrator's decision, per below.

@@ -5,6 +5,8 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-04
+
 A minor rather than a patch release: `wdm-greeter-client` removes a public field
 and `show_message` changes what a theme has to do with what it is handed. The
 protocol is untouched and `wdm_greeter_v1` stays at version 2, so a greeter
@@ -20,18 +22,44 @@ something a patch number is allowed to say.
 > until this release, so that is the shape a third-party theme most likely
 > copied. Append instead, and clear on `authenticate()` rather than on each
 > message.
+>
+> **And a callback may now arrive twice, or not at all.** The theme API's
+> obligations grew stricter than 0.2.0's: a theme must tolerate the same
+> callback being delivered more than once *and* a callback it was owed never
+> arriving. A theme that counts `show_message` calls, or toggles state once per
+> call, is wrong in a way it was not before. Write handlers that are idempotent
+> and that do not treat silence as proof PAM said nothing.
 
 ### Added
 
-- **`Model::link_dead` and `Model::link_is_alive()`** in `wdm-greeter-client`,
-  so a greeter can tell "the compositor went away" from "the attempt failed" and
-  stop offering a retry that cannot reach anything.
+- **`Model::link_dead`** in `wdm-greeter-client`, so a greeter can tell "the
+  compositor went away" from "the attempt failed" and stop offering a retry that
+  cannot reach anything. The field is deliberately the only spelling: a greeter
+  asks `model.link_dead`, a theme asks `wdm.link_dead`, and there is no inverted
+  accessor alongside it for either to disagree with.
 - **`window.wdm.link_dead`** in the webkit greeter, the same fact for a theme:
   true once the connection to wdm is gone, and it never becomes false again. A
   theme should stop offering a retry and point at a text console, because
   nothing sent after that point reaches wdm and the retry typically clears the
   message explaining the silence. A theme predating the field sees `undefined`,
   so read it defensively.
+- **`wdm_protocol::GREETER_GAVE_UP_EXIT`**, exit status **69**, now part of the
+  contract for *any* greeter rather than an internal detail of the shipped one.
+  A greeter exiting with it tells wdm it will not recover by being restarted, so
+  wdm counts the exit as a rapid failure however long the process had been up,
+  and the give-up screen is reached instead of a login screen that reloads for
+  ever. The value is `EX_UNAVAILABLE` from `sysexits.h`; a third-party greeter
+  already exiting 69 to mean something else now changes meaning silently and
+  should pick another status.
+- **The webkit greeter heartbeats an idle page.** With nothing queued for it,
+  the greeter injects a statement that does nothing — `void 0;` — into the
+  theme's page roughly every half second, purely so silence has something to be
+  silent about: a theme whose top-level script never returns, or a web process
+  that hangs before the load finishes, queues nothing at all and so previously
+  left the greeter alive in front of a frozen login screen with nothing to time
+  out. A theme author instrumenting `window`, or watching evaluations, will see
+  the greeter originating traffic against an otherwise idle page; it has no
+  observable effect of its own.
 
 ### Changed
 
@@ -47,7 +75,10 @@ something a patch number is allowed to say.
   rather than one joined string, with `Model::notice_text()` for a greeter that
   has a single label to put them in. **Breaking** for an out-of-tree greeter:
   the field is removed, not deprecated, so one reading `notice` needs the
-  one-line change to `notices` or `notice_text()`.
+  one-line change to `notices` or `notice_text()`. **`Model::push_notice` gained
+  a `NoticeKind` first argument** for the same reason — there is now a kind to
+  carry — so a greeter calling it gets an arity error rather than a silent
+  change of behaviour.
 - **`wdm.start_session()` throws when no session resolves.** Called with no
   argument on a machine where `wdm.sessions` is empty — nothing installed under
   `wayland-sessions` or `xsessions` — it used to return having done nothing, so
@@ -68,15 +99,17 @@ something a patch number is allowed to say.
 
 ### Fixed
 
-- **Every process wdm started ran with `SIGTERM` and `SIGINT` blocked.**
-  Registering the signal source blocks those signals on the calling thread, and
-  a signal mask survives both `fork` and `exec` — so the greeter and the user's
-  entire session inherited it. `loginctl terminate-session`, `systemctl stop`
-  and systemd's shutdown all degraded to `SIGKILL` after their stop timeouts,
-  Ctrl-C was inert in every terminal in the session, and each login handoff sat
-  out the greeter's full two-second grace period before killing it, because the
-  greeter could not act on the `SIGTERM` asking it to stop drawing. Both spawn
-  paths now clear the mask before exec.
+- **Every process the udev backend started ran with `SIGTERM` and `SIGINT`
+  blocked** — which is every process on a real machine. Registering the signal
+  source blocks those signals on the calling thread, and a signal mask survives
+  both `fork` and `exec`, so the greeter and the user's entire session inherited
+  it. `loginctl terminate-session`, `systemctl stop` and systemd's shutdown all
+  degraded to `SIGKILL` after their stop timeouts, Ctrl-C was inert in every
+  terminal in the session, and each login handoff sat out the greeter's full
+  two-second grace period before killing it, because the greeter could not act
+  on the `SIGTERM` asking it to stop drawing. The nested backend registered no
+  signal source at all and so was never affected — it gains one below, and both
+  spawn paths now clear the mask before exec regardless of which registered it.
 - **A greeter that gave up on its own page was restarted for ever.** The webkit
   greeter takes about half a minute to conclude a silent web process will never
   answer, which is well past the window in which an exit counts as a failure to
@@ -347,7 +380,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/quinnjr/wdm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/quinnjr/wdm/releases/tag/v0.2.0
 [0.1.3]: https://github.com/quinnjr/wdm/releases/tag/v0.1.3
 [0.1.2]: https://github.com/quinnjr/wdm/releases/tag/v0.1.2

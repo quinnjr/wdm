@@ -104,16 +104,24 @@ but an account that already exists is never modified by `useradd` or
 machine set up by hand has to run it itself:
 
 ```bash
-if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ] && [ -d /var/empty ]; then
-  usermod -d /var/empty wdm
+if [ "$(getent passwd wdm | cut -d: -f6)" = /var/lib/wdm ]; then
+  if [ -d /var/empty ]; then
+    usermod -d /var/empty wdm \
+      || echo "wdm: could not move the wdm account's home to /var/empty" >&2
+  else
+    echo "wdm: /var/empty does not exist; leaving the wdm account's home at /var/lib/wdm" >&2
+  fi
 fi
 chown root:root /var/lib/wdm
 ```
 
-Both guards matter: the first leaves an administrator who chose a different home
-alone, and the second keeps `/etc/passwd` from naming a directory that is not
-there — wdm `chdir`s into the greeter's home before exec, so a missing one is a
-greeter that never spawns.
+This is the same shape the deb's `postinst`, the rpm scriptlet and
+`aur/wdm.install` use — nested rather than conjoined, so the two failures say
+different things — and it can be diffed against them line for line. Both guards
+matter: the first leaves an administrator who chose a different home alone, and
+the second keeps `/etc/passwd` from naming a directory that is not there — wdm
+`chdir`s into the greeter's home before exec, so a missing one is a greeter that
+never spawns.
 
 `/var/lib/wdm` — the per-user last-session record — is **root-owned**, not
 owned by `wdm`. Only wdm itself writes there, and it does so as root; giving
@@ -140,11 +148,9 @@ arbitrary third-party greeters, a guaranteed-good VT is load-bearing rather than
 a nicety.
 
 That the unit ships no `Conflicts=` is a consequence of the default, not an
-invariant. If you set `vt` to a terminal a getty uses — 1 through 6 — add a
-`wdm.service` drop-in with `Conflicts=getty@ttyN.service` and
-`After=getty@ttyN.service` for that `N`; without them wdm and the getty contend
-for the same VT with nothing arbitrating, and the recovery console goes with
-it.
+invariant. Setting `vt` to a terminal a getty uses needs a `wdm.service`
+drop-in, or wdm and the getty contend for the same VT with nothing arbitrating
+and the recovery console goes with it. See `wdm(1)`, which gives the drop-in.
 
 ## Development
 
