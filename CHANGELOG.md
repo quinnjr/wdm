@@ -5,6 +5,21 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- **The Arch packaging is three AUR packages rather than one split package**:
+  `wdm` (the compositor and the toolkit-free reference greeter),
+  `wdm-gtk-greeter` and `wdm-webkit-greeter`. A split package has a single
+  `build()`, so every greeter was compiled whatever you asked for — installing
+  the GTK greeter required WebKitGTK in the build chroot, and installing `wdm`
+  alone required both toolkits. Each package now builds only its own crates, and
+  `wdm` builds against nothing but the display stack. The three are git
+  submodules of `aur/` in this repository, each tracking its own AUR repository.
+
+  No installed file moves and no package changes name, so an existing
+  installation is unaffected; only what you must have present to *build* one
+  does.
+
 ## [0.3.0] — 2026-08-04
 
 A minor rather than a patch release: `wdm-greeter-client` removes a public field

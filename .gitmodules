@@ -1,0 +1,9 @@
+[submodule "aur/wdm"]
+	path = aur/wdm
+	url = ssh://aur@aur.archlinux.org/wdm.git
+[submodule "aur/wdm-gtk-greeter"]
+	path = aur/wdm-gtk-greeter
+	url = ssh://aur@aur.archlinux.org/wdm-gtk-greeter.git
+[submodule "aur/wdm-webkit-greeter"]
+	path = aur/wdm-webkit-greeter
+	url = ssh://aur@aur.archlinux.org/wdm-webkit-greeter.git

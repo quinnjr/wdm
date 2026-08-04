@@ -24,12 +24,31 @@ as it is created.
 
 ### Arch
 
-The AUR packaging in `aur/` is a split package producing `wdm` and one package
-per greeter. `wdm` depends on the virtual `wdm-greeter-implementation`, which
-each greeter provides, so pacman asks which one to install.
+There are three AUR packages, one per build-dependency set. `wdm` depends on the
+virtual `wdm-greeter-implementation`, which every greeter provides, so pacman
+asks which one to install.
+
+| Package | Produces | Needs to build |
+|---|---|---|
+| `wdm` | `wdm`, `wdm-greeter` | the display stack only |
+| `wdm-gtk-greeter` | `wdm-gtk-greeter` | GTK4, gtk4-layer-shell |
+| `wdm-webkit-greeter` | `wdm-webkit-greeter` | the above plus WebKitGTK |
+
+Three rather than one split package because a split package has a single
+`build()`, so every greeter was compiled whatever you asked for — installing the
+GTK greeter meant having WebKitGTK in the chroot, and installing `wdm` alone
+meant both toolkits. Each package now builds only its own crates.
+
+`wdm` ships the reference greeter alongside the compositor because it is the one
+with no toolkit dependency: `wdm` on its own is installable, and satisfiable,
+with nothing but the display stack.
+
+In this repository the three are git submodules of `aur/`, each tracking its own
+AUR repository, so they are developed here and pushed there:
 
 ```bash
-cd aur && makepkg -si
+git submodule update --init
+cd aur/wdm && makepkg -si            # or aur/wdm-gtk-greeter, aur/wdm-webkit-greeter
 ```
 
 ### Debian and Fedora
@@ -116,7 +135,7 @@ chown root:root /var/lib/wdm
 ```
 
 This is the same shape the deb's `postinst`, the rpm scriptlet and
-`aur/wdm.install` use — nested rather than conjoined, so the two failures say
+`aur/wdm/wdm.install` use — nested rather than conjoined, so the two failures say
 different things — and it can be diffed against them line for line. Both guards
 matter: the first leaves an administrator who chose a different home alone, and
 the second keeps `/etc/passwd` from naming a directory that is not there — wdm
