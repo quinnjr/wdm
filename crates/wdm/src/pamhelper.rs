@@ -68,8 +68,8 @@ use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
 use zeroize::Zeroize;
 
 use crate::auth::{
-    PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, describe, describe_auth,
-    next_prompt_id, os_to_string, pam_session_env,
+    Phase, PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, next_prompt_id,
+    notice_to_greeter, os_to_string, pam_session_env, to_greeter,
 };
 use crate::pamwire::{MAX_MESSAGE, Msg};
 use crate::session::Launch;
@@ -117,11 +117,17 @@ pub fn run() -> ExitCode {
         Recv::Timeout => return ExitCode::FAILURE,
     };
 
-    log::debug!("pam helper started for {} on {}", start.username, start.tty);
+    log::debug!(
+        "pam helper started for {:?} on {}",
+        start.username,
+        start.tty
+    );
 
     let conv = WireConversation {
         wire: &wire,
         timeout: RESPONSE_TIMEOUT,
+        username: &start.username,
+        authenticated: false,
     };
 
     let context = match Context::new(SERVICE, Some(&start.username), conv) {
@@ -130,7 +136,11 @@ pub fn run() -> ExitCode {
             // Almost always a missing /etc/pam.d/wdm. Say so, because the
             // generic PAM message is unhelpful.
             log::error!("opening PAM context for service {SERVICE}: {e}");
-            wire.send(&Msg::Failed(describe(&e)));
+            // Phase::Start, not Phase::Authenticate, even though this is a
+            // pre-authentication path: pam_start records the username without
+            // resolving it, so the text is the same for every name typed and is
+            // a fact about /etc/pam.d/wdm rather than about any account.
+            wire.send(&Msg::Failed(to_greeter(Phase::Start, &start.username, &e)));
             return ExitCode::SUCCESS;
         }
     };
@@ -381,7 +391,7 @@ impl Spawn for SessionSpawn<'_> {
         )
         .map_err(|e| e.to_string())?;
 
-        log::debug!("launching {}'s session", launch.username());
+        log::debug!("launching {:?}'s session", launch.username());
         launch.spawn().map_err(|e| e.to_string())
     }
 }
@@ -543,12 +553,17 @@ fn name_of(msg: &Msg) -> &'static str {
 /// deliberately a transcription and not a refactor of it — the thread stays in
 /// production until the whole change lands, and a shared implementation would
 /// have to be shaped for both callers before either had proved itself.
-struct LibPam<'a, C: ConversationHandler> {
-    context: Context<C>,
+///
+/// Concrete in its conversation rather than generic over `ConversationHandler`,
+/// because it has to reach back into that conversation and tell it
+/// authentication has succeeded — see [`WireConversation::authenticated`]. There
+/// was never a second implementation: the seam that tests use is [`Pam`].
+struct LibPam<'a> {
+    context: Context<WireConversation<'a>>,
     start: &'a Start,
 }
 
-impl<C: ConversationHandler> Pam for LibPam<'_, C> {
+impl Pam for LibPam<'_> {
     fn authenticate(&mut self) -> Result<(), String> {
         if let Err(e) = self.context.set_tty(Some(&self.start.tty)) {
             // Not fatal: modules that care about the tty are the exception.
@@ -569,11 +584,20 @@ impl<C: ConversationHandler> Pam for LibPam<'_, C> {
         // DISALLOW_NULL_AUTHTOK: an account with an empty password must not be
         // loginable from the greeter.
         if let Err(e) = self.context.authenticate(Flag::DISALLOW_NULL_AUTHTOK) {
-            // Not `describe`: every authenticate failure looks the same to the
-            // greeter, or the login screen is an account oracle. The real cause
-            // is logged inside. See `auth::describe_auth`.
-            return Err(describe_auth(&self.start.username, &describe(&e)));
+            // Phase::Authenticate is the one phase whose text the greeter never
+            // sees, or the login screen is an account oracle; the real cause is
+            // logged inside. See `auth::AUTH_FAILED`, and
+            // `tests::an_authentication_failure_reaches_wdm_as_one_fixed_string`
+            // below, which is what stops this reverting to PAM's own words with
+            // a green suite.
+            return Err(to_greeter(Phase::Authenticate, &self.start.username, &e));
         }
+
+        // Past here a credential has been proven, so PAM modules may speak to
+        // the user in their own words again — notably the expired-password
+        // change below, whose whole job is to say what is wrong with the new
+        // password.
+        self.context.conversation_mut().authenticated = true;
 
         match self.context.acct_mgmt(Flag::DISALLOW_NULL_AUTHTOK) {
             Ok(()) => Ok(()),
@@ -583,20 +607,14 @@ impl<C: ConversationHandler> Pam for LibPam<'_, C> {
                 // same conversation so the greeter can display its prompts.
                 // Without this a user with an expired password can never log in.
                 log::info!(
-                    "{} must change their password before logging in",
+                    "{:?} must change their password before logging in",
                     self.start.username
                 );
                 self.context
                     .chauthtok(Flag::CHANGE_EXPIRED_AUTHTOK)
-                    .map_err(|e| {
-                        log::info!("password change failed for {}: {e}", self.start.username);
-                        describe(&e)
-                    })
+                    .map_err(|e| to_greeter(Phase::Chauthtok, &self.start.username, &e))
             }
-            Err(e) => {
-                log::info!("account management failed for {}: {e}", self.start.username);
-                Err(describe(&e))
-            }
+            Err(e) => Err(to_greeter(Phase::AcctMgmt, &self.start.username, &e)),
         }
     }
 
@@ -639,7 +657,11 @@ impl<C: ConversationHandler> Pam for LibPam<'_, C> {
                 // paired on one handle.
                 drop(session);
             }
-            Err(e) => hold(Err(describe(&e))),
+            Err(e) => hold(Err(to_greeter(
+                Phase::OpenSession,
+                &self.start.username,
+                &e,
+            ))),
         }
     }
 }
@@ -768,6 +790,17 @@ struct WireConversation<'a> {
     /// Always [`RESPONSE_TIMEOUT`] in production; a field so tests can reach the
     /// timeout path, which at half an hour is otherwise unreachable.
     timeout: Duration,
+    /// Whose login this is, for the journal line that replaces a suppressed
+    /// notice. Never sent on the wire — the greeter supplied it.
+    username: &'a str,
+    /// Whether `pam_authenticate` has returned success, set by [`LibPam`].
+    ///
+    /// Gates [`Self::tell`]: until it is set, a module's `text_info` and
+    /// `error_msg` reach the greeter as a fixed string instead of their own
+    /// words. See [`notice_to_greeter`] for why that channel is the sharper
+    /// oracle of the two. Prompts are never gated — a question that is not shown
+    /// cannot be answered, and every one of them is a question wdm asked for.
+    authenticated: bool,
 }
 
 impl WireConversation<'_> {
@@ -847,8 +880,19 @@ impl WireConversation<'_> {
     }
 
     /// Emit a message the greeter is not expected to answer.
+    ///
+    /// The style is preserved even when the text is not: `Error` is what sets
+    /// `blocked` in the greeter's model and stops it auto-retrying, so replacing
+    /// an error with an info would restore the retry spin.
     fn tell(&mut self, msg: &CStr, style: PromptStyle) {
-        self.emit(next_prompt_id(), msg.to_string_lossy().into_owned(), style);
+        // PAM messages come from modules and are not guaranteed UTF-8.
+        let text = msg.to_string_lossy().into_owned();
+        let text = if self.authenticated {
+            text
+        } else {
+            notice_to_greeter(self.username, &text)
+        };
+        self.emit(next_prompt_id(), text, style);
     }
 
     fn emit(&self, id: u32, text: String, style: PromptStyle) {
@@ -927,6 +971,17 @@ mod tests {
         sock.send(&msg.encode()).unwrap();
     }
 
+    /// A conversation on `wire`, at whichever side of `pam_authenticate`
+    /// `authenticated` names.
+    fn conversation(wire: &Wire, timeout: Duration, authenticated: bool) -> WireConversation<'_> {
+        WireConversation {
+            wire,
+            timeout,
+            username: "someone",
+            authenticated,
+        }
+    }
+
     #[test]
     fn from_fd_refuses_a_closed_descriptor() {
         // The check exists so that a helper started without its socket says so
@@ -979,15 +1034,60 @@ mod tests {
     impl FakePam<'_> {
         fn new(wire: &Wire) -> FakePam<'_> {
             FakePam {
-                conv: WireConversation {
-                    wire,
-                    timeout: Duration::from_secs(5),
-                },
+                conv: conversation(wire, Duration::from_secs(5), false),
                 opened: None,
                 closed: false,
                 answer: None,
             }
         }
+    }
+
+    /// A [`Pam`] whose `authenticate` fails the way [`LibPam`]'s does.
+    ///
+    /// Deliberately not a hardcoded string: it calls the same `to_greeter` the
+    /// real one calls, with a cause that is the account oracle itself, so that
+    /// the assertion below is on the value that actually crosses the socket.
+    /// [`FakePam`] hardcodes its own failure text and so cannot fail for this.
+    struct RefusingPam;
+
+    impl Pam for RefusingPam {
+        fn authenticate(&mut self) -> Result<(), String> {
+            Err(to_greeter(
+                Phase::Authenticate,
+                "bob",
+                "User not known to the underlying authentication module",
+            ))
+        }
+
+        fn with_session(&mut self, _: &str, _: &str, _: &mut dyn FnMut(Opened)) {
+            panic!("with_session must not run after authentication failed");
+        }
+    }
+
+    #[test]
+    fn an_authentication_failure_reaches_wdm_as_one_fixed_string() {
+        // What `LibPam::authenticate` refers to. Without it, reverting that line
+        // to PAM's own words reopens the account oracle with a green suite:
+        // `auth`'s own test pins `to_greeter`, and nothing pinned that the
+        // helper's wire message is what `to_greeter` returned.
+        let (helper_sock, wdm) = seqpacket_pair();
+        let wire = Wire::from_socket(helper_sock);
+
+        serve(&wire, &mut RefusingPam, &mut FakeSpawn::refusing("unused"));
+
+        let verdict = expect(&wdm, "the verdict");
+        let Msg::Failed(reason) = &verdict else {
+            panic!("expected a Failed");
+        };
+        // The literal, not `auth::AUTH_FAILED`: the constant is private to
+        // `auth` precisely so that this is the only call site able to name the
+        // greeter-facing string, and a change to it has to be made twice
+        // deliberately rather than tracked silently here.
+        assert_eq!(
+            reason, "Authentication failure",
+            "the cause reached wdm, and wdm forwards Failed to the greeter \
+             verbatim — the login screen is an account oracle again"
+        );
     }
 
     /// A [`Spawn`] that forks an ordinary child instead of a user session.
@@ -2031,10 +2131,7 @@ mod tests {
             );
         });
 
-        let mut conv = WireConversation {
-            wire: &wire,
-            timeout: Duration::from_millis(50),
-        };
+        let mut conv = conversation(&wire, Duration::from_millis(50), false);
         assert_eq!(
             conv.prompt_echo_off(c"Password:").unwrap_err(),
             ErrorCode::CONV_ERR
@@ -2076,10 +2173,7 @@ mod tests {
             }
         });
 
-        let mut conv = WireConversation {
-            wire: &wire,
-            timeout: Duration::from_millis(50),
-        };
+        let mut conv = conversation(&wire, Duration::from_millis(50), false);
         let started = Instant::now();
         assert_eq!(
             conv.prompt_echo_off(c"Password:").unwrap_err(),
@@ -2125,10 +2219,7 @@ mod tests {
             );
         });
 
-        let mut conv = WireConversation {
-            wire: &wire,
-            timeout: Duration::from_secs(5),
-        };
+        let mut conv = conversation(&wire, Duration::from_secs(5), false);
         let username = conv.prompt_echo_on(c"Username:").unwrap();
         let password = conv.prompt_echo_off(c"Password:").unwrap();
         driver.join().unwrap();
@@ -2155,10 +2246,7 @@ mod tests {
             );
         });
 
-        let mut conv = WireConversation {
-            wire: &wire,
-            timeout: Duration::from_secs(5),
-        };
+        let mut conv = conversation(&wire, Duration::from_secs(5), false);
         assert_eq!(
             conv.prompt_echo_off(c"Password:").unwrap_err(),
             ErrorCode::CONV_ERR
@@ -2171,10 +2259,7 @@ mod tests {
         let (helper_sock, wdm) = seqpacket_pair();
         let wire = Wire::from_socket(helper_sock);
 
-        let mut conv = WireConversation {
-            wire: &wire,
-            timeout: Duration::from_secs(5),
-        };
+        let mut conv = conversation(&wire, Duration::from_secs(5), true);
         // text_info and error_msg must not block waiting for an answer, so this
         // runs on the test thread with nobody reading the other end.
         conv.text_info(c"Welcome");
@@ -2195,6 +2280,47 @@ mod tests {
         };
         assert_eq!(style, PromptStyle::Error);
         assert!(error > info, "ids must advance");
+    }
+
+    #[test]
+    fn module_text_before_authentication_succeeds_does_not_reach_the_greeter() {
+        // The oracle `notice_to_greeter` closes, and the sharper of the two:
+        // pam_faillock announces a lockout only for an account that exists, and
+        // it announces it through this channel before any password has been
+        // accepted. Two notices that say different things must arrive
+        // indistinguishable.
+        let (helper_sock, wdm) = seqpacket_pair();
+        let wire = Wire::from_socket(helper_sock);
+
+        let mut before = conversation(&wire, Duration::from_secs(5), false);
+        before.error_msg(c"Account locked due to 3 failed logins");
+        before.text_info(c"Server message: user not found");
+
+        let first = expect(&wdm, "the lockout notice");
+        let Msg::Prompt { text: locked, .. } = &first else {
+            panic!("expected a prompt");
+        };
+        let second = expect(&wdm, "the unknown-user notice");
+        let Msg::Prompt { text: unknown, .. } = &second else {
+            panic!("expected a prompt");
+        };
+        assert_eq!(
+            locked, unknown,
+            "the module's own words crossed the socket, so the greeter can tell \
+             a locked account from an account that does not exist"
+        );
+        assert!(!locked.contains("locked"));
+
+        // And the other half: once authenticate has returned Ok the module gets
+        // its words back, because that is where the expired-password change runs
+        // and "password too short" is the only useful thing it says.
+        let mut after = conversation(&wire, Duration::from_secs(5), true);
+        after.error_msg(c"BAD PASSWORD: it is too short");
+        let complaint = expect(&wdm, "the password-quality complaint");
+        let Msg::Prompt { text, .. } = &complaint else {
+            panic!("expected a prompt");
+        };
+        assert_eq!(text, "BAD PASSWORD: it is too short");
     }
 
     #[test]

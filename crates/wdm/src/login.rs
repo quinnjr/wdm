@@ -76,7 +76,51 @@ const DEFAULT_SESSION_SINCE: u32 = 2;
 /// a brute force attempt: the greeter cannot try again until it has been told
 /// the previous try failed. Capped so a user who mistyped a few times is not
 /// locked out of their own machine for minutes.
+///
+/// The first entry is zero because the first failure is not rate limited — that
+/// is [`FAILURE_FLOOR`]'s job, and it is a floor rather than a backoff because
+/// it exists for a different reason. See [`failure_delay`].
 const BACKOFF_SECS: &[u64] = &[0, 1, 2, 4, 8, 10];
+
+/// The least wall time a failed authenticate may appear to take.
+///
+/// `auth::AUTH_FAILED` flattens every `pam_authenticate` failure to one string
+/// so the greeter cannot read which module refused. That closes the *message*
+/// channel and leaves the clock wide open: a stack that reaches `pam_unix` and
+/// runs a yescrypt or SHA-512 verify answers tens to hundreds of milliseconds
+/// later than one that gives up before hashing, which is far above the noise
+/// floor for a local client with a monotonic clock. Reporting `now + backoff`
+/// does not mask it — the greeter subtracts a delay it already knows and
+/// recovers PAM's own time exactly.
+///
+/// So the failure is reported on a *deadline* measured from wdm's side of the
+/// conversation instead, and this is the floor under that deadline. Two seconds
+/// is the same order as `login(1)`'s `FAIL_DELAY`: long enough to swallow any
+/// plausible difference in how far down the stack a refusal came from, short
+/// enough that a user who mistyped does not think the machine has hung.
+const FAILURE_FLOOR: Duration = Duration::from_secs(2);
+
+/// When a failure must be reported so the attempt costs a constant time.
+///
+/// `anchor` is the moment wdm last handed PAM something to work on, so
+/// everything PAM's timing could reveal happened after it. Reporting at
+/// `anchor + max(backoff, floor)` means the wall time a greeter observes is a
+/// function of its own request times and the failure count it can already
+/// count — never of which module refused.
+///
+/// Saturates to zero rather than going negative: an answer that arrived after
+/// the deadline has already paid the floor, and delaying it further would make
+/// a *slow* PAM cost more than a fast one, which is the same leak upside down.
+///
+/// Free-standing so the arithmetic can be tested without a PAM conversation to
+/// drive it; [`AuthHandle`] cannot be built in a test.
+fn failure_delay(anchor: Option<Instant>, backoff: Duration, now: Instant) -> Duration {
+    // No anchor means no attempt was recorded, which should not happen — pay
+    // the full floor rather than answering instantly, because the safe error
+    // here is the slow one.
+    let deadline = anchor.unwrap_or(now) + backoff.max(FAILURE_FLOOR);
+    deadline.saturating_duration_since(now)
+}
 
 /// Where the conversation currently is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +218,16 @@ pub struct Login {
     /// followed by a rebind resets the phase, and a greeter that kills itself
     /// gets a brand new object either way. Survives reset for the same reason.
     cooldown_until: Option<Instant>,
+    /// When PAM was last given something to work on, for [`failure_delay`].
+    ///
+    /// Set by [`Login::begin_attempt`] and re-anchored by every `respond`,
+    /// because that is the honest point: a `respond` is what hands PAM the
+    /// secret it then does or does not hash, so it is the instant every
+    /// distinguishable amount of work starts from. Anchoring only at
+    /// `create_session` would leave the floor already elapsed by the time a
+    /// user who took three seconds to type submitted, and the oracle open for
+    /// exactly the users who exist to be enumerated.
+    attempt_started: Option<Instant>,
     /// Incremented for every attempt, so a timer armed for one attempt cannot
     /// act on a later one.
     generation: u64,
@@ -222,6 +276,7 @@ impl Login {
             pending_prompt: None,
             failures: 0,
             cooldown_until: None,
+            attempt_started: None,
             generation: 0,
             failure_timer: None,
             chosen: None,
@@ -451,11 +506,16 @@ impl Login {
                 self.auth = None;
                 self.pending_prompt = None;
 
-                let delay = self.next_backoff();
+                // Measured from when PAM was handed the secret, not from now:
+                // `now + backoff` is a constant the greeter can subtract, and
+                // what is left underneath is PAM's own time — which says
+                // whether the account exists. See failure_delay.
+                let now = Instant::now();
+                let delay = failure_delay(self.attempt_started, self.next_backoff(), now);
                 self.failures = self.failures.saturating_add(1);
                 // The deadline, not the phase, is what actually rate limits:
                 // it survives destroy, rebind and greeter respawn.
-                self.cooldown_until = Some(Instant::now() + delay);
+                self.cooldown_until = Some(now + delay);
 
                 self.report_failure_after(reason, delay);
                 Action::None
@@ -513,10 +573,15 @@ impl Login {
     /// Note that a new attempt is starting.
     ///
     /// Bumps the generation so anything armed for the previous attempt becomes a
-    /// no-op, and clears the stale launch error the user has moved on from.
+    /// no-op, clears the stale launch error the user has moved on from, and
+    /// starts the clock a failure will be reported against.
     pub fn begin_attempt(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.last_error = None;
+        // An attempt that fails before it ever prompts — the stack refuses on
+        // `pam_start`, or a module ahead of `pam_unix` says no with nothing to
+        // ask — still has to cost the floor, so the anchor exists from here.
+        self.attempt_started = Some(Instant::now());
     }
 
     /// Report a failure once `delay` has elapsed.
@@ -526,6 +591,12 @@ impl Login {
     /// a brute force down. Answering immediately would leave a greeter that
     /// retries on failure — which is the natural thing to write — spinning at
     /// full speed for the whole cooldown.
+    ///
+    /// It is also what makes a failed authenticate constant-time, and that cost
+    /// nothing to add: this was already a deadline mechanism, so hiding PAM's
+    /// timing was a matter of choosing a different `delay` — see
+    /// [`failure_delay`] — not of building anything. The only thing that changed
+    /// for a user is that a failed login now takes at least [`FAILURE_FLOOR`].
     fn report_failure_after(&mut self, reason: String, delay: Duration) {
         self.phase = Phase::Cooldown;
 
@@ -789,9 +860,19 @@ impl Wdm {
         }
 
         if !self.login.users.iter().any(|u| u.name == username) {
-            // Not rejected outright: PAM deliberately conflates "no such user"
-            // with "wrong password", and short-circuiting here would turn the
-            // greeter into a user enumeration oracle.
+            // Not rejected outright, and the reason is no longer PAM's. PAM does
+            // *not* conflate "no such user" with "wrong password" — under this
+            // repository's own /etc/pam.d/wdm the first comes back as "User not
+            // known to the underlying authentication module" and the second as
+            // "Authentication failure". The two are indistinguishable to a
+            // greeter because wdm makes them so: auth::AUTH_FAILED flattens
+            // every authenticate failure to one string, and failure_delay
+            // reports it on a deadline so the clock says nothing either.
+            //
+            // Short-circuiting here would reintroduce the difference on this
+            // side of PAM — an unadvertised name would fail by a path with its
+            // own timing and its own phase transitions, and the enumeration
+            // oracle would be back without either of those defences noticing.
             log::debug!("create_session for unadvertised user {username:?}");
         }
 
@@ -842,6 +923,15 @@ impl Wdm {
         }
 
         self.login.pending_prompt = None;
+
+        // The clock a failure is reported against restarts here, not at
+        // create_session: this is the request that hands PAM the secret, so
+        // every difference in how long the stack takes to refuse it is measured
+        // from now. Anchoring at create_session instead would let a user who
+        // spent longer than FAILURE_FLOOR typing pay no floor at all, and the
+        // timing oracle would be open for precisely the accounts an attacker
+        // could take their time over.
+        self.login.attempt_started = Some(Instant::now());
 
         let Some(auth) = &self.login.auth else {
             // Phase said Authenticating but the handle is gone. Swallowing the
@@ -1105,6 +1195,137 @@ mod tests {
             );
         }
         assert!(*BACKOFF_SECS.last().unwrap() <= 30);
+    }
+
+    #[test]
+    fn a_failure_is_never_reported_before_the_floor() {
+        // The message channel is closed — every authenticate failure is
+        // auth::AUTH_FAILED — so what is left to read is the clock. A stack that
+        // reaches pam_unix and hashes answers hundreds of milliseconds later
+        // than one that refuses before hashing, and a delay measured from the
+        // answer is a constant the greeter subtracts back off. Measured from the
+        // attempt instead, both land on the same deadline.
+        let anchor = Instant::now();
+        let floor = FAILURE_FLOOR;
+
+        // Two PAM answers whose only difference is how far down the stack they
+        // came from.
+        let fast = failure_delay(
+            Some(anchor),
+            Duration::ZERO,
+            anchor + Duration::from_millis(5),
+        );
+        let slow = failure_delay(
+            Some(anchor),
+            Duration::ZERO,
+            anchor + Duration::from_millis(400),
+        );
+
+        assert_eq!(
+            anchor + Duration::from_millis(5) + fast,
+            anchor + floor,
+            "a fast refusal was reported before the floor"
+        );
+        assert_eq!(
+            anchor + Duration::from_millis(400) + slow,
+            anchor + floor,
+            "a slow refusal was reported at a different instant from a fast one"
+        );
+        assert!(
+            fast > slow,
+            "the delay did not absorb the difference in PAM's own time"
+        );
+    }
+
+    #[test]
+    fn an_answer_after_the_floor_is_not_delayed_further() {
+        // Saturating, not negative — and deliberately not "floor again". A PAM
+        // stack that is slower than the floor has already paid it; charging it
+        // another one would make slow answers cost more than fast ones, which is
+        // the same oracle upside down.
+        let anchor = Instant::now();
+        let late = anchor + FAILURE_FLOOR + Duration::from_secs(1);
+        assert_eq!(
+            failure_delay(Some(anchor), Duration::ZERO, late),
+            Duration::ZERO,
+            "an answer that arrived after its deadline was delayed again"
+        );
+    }
+
+    #[test]
+    fn the_backoff_wins_once_it_exceeds_the_floor() {
+        // The floor hides which module refused; the backoff slows repetition.
+        // They are the same deadline, so the larger of the two is what applies
+        // — a floor that shortened the backoff would undo the rate limit.
+        let anchor = Instant::now();
+        let backoff = Duration::from_secs(8);
+        assert!(
+            backoff > FAILURE_FLOOR,
+            "this test proves nothing otherwise"
+        );
+        assert_eq!(
+            failure_delay(Some(anchor), backoff, anchor),
+            backoff,
+            "the floor swallowed a backoff longer than itself"
+        );
+    }
+
+    #[test]
+    fn a_missing_anchor_pays_the_full_floor() {
+        // Unreachable — begin_attempt sets it — but the safe direction when it
+        // is wrong is the slow one, not an instant answer.
+        let now = Instant::now();
+        assert_eq!(failure_delay(None, Duration::ZERO, now), FAILURE_FLOOR);
+    }
+
+    #[test]
+    fn an_attempt_starts_the_clock_it_will_be_judged_against() {
+        let mut login = login();
+        assert!(login.attempt_started.is_none());
+        login.begin_attempt();
+        assert!(
+            login.attempt_started.is_some(),
+            "a failure would be reported against no deadline at all"
+        );
+    }
+
+    #[test]
+    fn responding_re_anchors_the_failure_clock() {
+        // A respond is what hands PAM the secret, so it is where the timeable
+        // work starts. If the anchor stayed at create_session, a user who took
+        // longer than FAILURE_FLOOR to type would have already burned the floor
+        // before PAM was even asked, and the failure would come back at PAM's
+        // own speed — the oracle, open again, for exactly the accounts an
+        // attacker can afford to be slow about.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let _client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.begin_attempt();
+        let at_create_session = h.state.login.attempt_started.expect("no anchor");
+
+        // The user spends longer than the floor typing.
+        h.state.login.attempt_started = Some(at_create_session - FAILURE_FLOOR * 2);
+        let stale = h.state.login.attempt_started.unwrap();
+
+        h.state.login.phase = Phase::Authenticating;
+        h.state.login.pending_prompt = Some(7);
+        // There is no AuthHandle to build in a test, so this takes respond's
+        // interrupted path — but the re-anchor happens before that fork, which
+        // is the whole point: it is not conditional on the conversation being
+        // healthy.
+        h.state.respond(&resource, 7, "hunter2".to_owned());
+
+        let anchor = h.state.login.attempt_started.expect("the anchor was lost");
+        assert!(
+            anchor > stale,
+            "respond did not restart the clock; a slow typist gets no floor"
+        );
+        assert_eq!(
+            failure_delay(Some(anchor), Duration::ZERO, anchor),
+            FAILURE_FLOOR,
+            "a failure answered immediately after respond would skip the floor"
+        );
     }
 
     /// Enough of the Wayland wire format to bind a global by hand.

@@ -33,8 +33,15 @@
 //! unwinds by itself. The contract `login.rs` relies on — `Login::reset()` drops
 //! the handle to cancel — is unchanged.
 //!
+//! Usernames are logged with `{:?}`, here and in [`crate::pamhelper`]. They come
+//! from the greeter's `create_session` and unadvertised names are deliberately
+//! accepted, so a username is an arbitrary string; journald splits records on
+//! newlines, and an unescaped one lets anyone at the login screen forge journal
+//! entries attributed to wdm. `Debug` for `str` escapes control characters,
+//! which is the whole of the fix. See [`to_greeter`], where it matters most.
+//!
 //! Several pieces here are `pub(crate)` rather than private — the prompt-id
-//! counter, [`RESPONSE_TIMEOUT`], [`describe`], [`pam_session_env`] and
+//! counter, [`RESPONSE_TIMEOUT`], [`to_greeter`], [`pam_session_env`] and
 //! [`SessionDescription::pam_items`] — because [`crate::pamhelper`] is where they
 //! are used. They live here rather than there so that the two ends of the socket
 //! cannot disagree about an id counter, a timeout, or an error string that must
@@ -258,7 +265,7 @@ impl AuthHandle {
     ) -> io::Result<Self> {
         let (ours, theirs) = seqpacket_pair()?;
         let child = spawn_helper(helper_command(), theirs)?;
-        log::debug!("pam helper for {username} started as pid {}", child.id());
+        log::debug!("pam helper for {username:?} started as pid {}", child.id());
 
         let handle = Self::adopt(ours, Some(child), username, events);
 
@@ -302,7 +309,7 @@ impl AuthHandle {
             .name(format!("pam-reader-{username}"))
             .spawn(move || pump(&reader, child, &events, &name))
         {
-            log::error!("spawning the PAM reader thread for {username}: {e}");
+            log::error!("spawning the PAM reader thread for {username:?}: {e}");
             wire.close();
         }
 
@@ -391,8 +398,8 @@ fn pump(
 
     if let Some(mut child) = child {
         match child.wait() {
-            Ok(status) => log::debug!("pam helper for {username} {status}"),
-            Err(e) => log::error!("waiting on the PAM helper for {username}: {e}"),
+            Ok(status) => log::debug!("pam helper for {username:?} {status}"),
+            Err(e) => log::error!("waiting on the PAM helper for {username:?}: {e}"),
         }
     }
 
@@ -401,7 +408,7 @@ fn pump(
         Outcome::Reported => {}
         // wdm closed the socket. Cancelled, or the session ended.
         _ if wire.closing.load(Ordering::SeqCst) => {
-            log::debug!("the PAM helper for {username} was dismissed");
+            log::debug!("the PAM helper for {username:?} was dismissed");
         }
         // The helper vanished with the greeter still waiting. Saying nothing
         // would leave the login screen sitting on a prompt or a spinner for
@@ -409,14 +416,14 @@ fn pump(
         // tell the difference between a helper that died and one that was told
         // to stop.
         Outcome::BeforeVerdict => {
-            log::error!("the PAM helper for {username} exited before answering");
+            log::error!("the PAM helper for {username:?} exited before answering");
             send(
                 events,
                 AuthEvent::Failed("the authentication helper exited".to_owned()),
             );
         }
         Outcome::AfterVerdict => {
-            log::error!("the PAM helper for {username} exited after authenticating");
+            log::error!("the PAM helper for {username:?} exited after authenticating");
             send(
                 events,
                 AuthEvent::SessionFailed("the authentication helper exited".to_owned()),
@@ -642,19 +649,71 @@ fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
     }
 }
 
-/// PAM's own message if it gave one, otherwise the error code's description.
+/// Which of PAM's phases a failure came out of.
 ///
-/// Only for failures that happen **after** a credential has been proven —
-/// account management, the expired-password change, opening the session. There
-/// the text is genuinely useful ("account expired", "password too short") and
-/// the person reading it has already demonstrated they own the account.
+/// A parameter rather than a choice between two similarly-named functions,
+/// because the choice *is* the security property: `Authenticate` runs before any
+/// credential has been proven and must therefore tell the greeter nothing, while
+/// every phase after it runs on behalf of someone who has already demonstrated
+/// they own the account and where the text is the only thing that makes the
+/// failure actionable. Made a value, picking the wrong one is caught by
+/// [`to_greeter`]'s table test; left as two function names, it was caught by
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// `pam_start`. Service configuration only — almost always a missing
+    /// `/etc/pam.d/wdm`, which is worth saying out loud. `pam_start` records the
+    /// username, it does not resolve it, so the text here is the same whatever
+    /// name was typed and cannot be an account oracle.
+    Start,
+    /// `pam_authenticate`. The one flattened phase; see [`AUTH_FAILED`].
+    Authenticate,
+    /// `pam_acct_mgmt` — "account expired", "login not permitted at this time".
+    AcctMgmt,
+    /// `pam_chauthtok`, the expired-password change — "password too short".
+    Chauthtok,
+    /// `pam_open_session`.
+    OpenSession,
+}
+
+impl Phase {
+    /// How the journal line names this phase.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Start => "opening the PAM context",
+            Self::Authenticate => "authentication",
+            Self::AcctMgmt => "account management",
+            Self::Chauthtok => "the password change",
+            Self::OpenSession => "opening the session",
+        }
+    }
+}
+
+/// A failure PAM reported, rendered.
 ///
-/// Authentication failures go through [`describe_auth`] instead, and the split
-/// is the whole point: see there.
-pub(crate) fn describe(e: &pam_client2::Error) -> String {
-    e.message()
-        .map(str::to_owned)
-        .unwrap_or_else(|| e.to_string())
+/// A trait rather than [`to_greeter`] taking `pam_client2::Error` directly,
+/// because `Error::new` is `pub(crate)` in that crate: a test cannot build one,
+/// and `to_greeter` is the function in this file most worth having a test on.
+/// The `str` impl is what those tests pass, and it is also why the call sites
+/// hand over the error itself — there is no rendered intermediate for a
+/// copy-paster to return in place of the flattened string.
+pub(crate) trait Cause {
+    /// PAM's own message if it gave one, otherwise the error code's description.
+    fn text(&self) -> String;
+}
+
+impl Cause for pam_client2::Error {
+    fn text(&self) -> String {
+        self.message()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.to_string())
+    }
+}
+
+impl Cause for str {
+    fn text(&self) -> String {
+        self.to_owned()
+    }
 }
 
 /// What the greeter is told when `pam_authenticate` fails: always this.
@@ -666,16 +725,24 @@ pub(crate) fn describe(e: &pam_client2::Error) -> String {
 /// password and without ever succeeding at anything wdm would rate limit as a
 /// login.
 ///
-/// This used to be [`describe`], on the stated grounds that "PAM already
+/// This used to be PAM's own text, on the stated grounds that "PAM already
 /// conflates 'no such user' and 'wrong password' into `Authentication
-/// failure`". That is not true. Measured against this repository's own
-/// `/etc/pam.d/wdm`, an account that does not exist comes back as **"User not
-/// known to the underlying authentication module"** while a wrong password
-/// comes back as "Authentication failure" — so the comment asserting the leak
-/// was closed was itself the reason nobody looked.
+/// failure`". That is not true, and the two strings this host's stack actually
+/// produced are recorded — as data, in the one place they can be checked — by
+/// `tests::every_authentication_failure_reads_the_same_to_the_greeter`. The
+/// comment asserting the leak was closed was itself the reason nobody looked.
 ///
-/// The real reason is logged at `info` on the way past, so an administrator
-/// reading the journal still learns which it was. The greeter does not.
+/// The real reason is logged at `info`, which is a *requirement on the
+/// deployment*, not an outcome this function can promise: an administrator
+/// learns which it was only if wdm's log filter admits `info`. `main` therefore
+/// defaults `WDM_LOG` to `info` rather than leaving the floor at `error`, and
+/// setting `WDM_LOG=warn` deletes the record and makes the two cases genuinely
+/// indistinguishable to everyone.
+///
+/// The split also assumes the greeter account cannot read the journal it is
+/// being kept out of. Verified for the shipped `wdm` user, which has no
+/// supplementary groups and so is in neither `systemd-journal` nor `adm`; a
+/// deployment that puts the greeter account in either has reopened the channel.
 ///
 /// ponytail: this closes the *message* channel only. A nonexistent account can
 /// still be distinguished by timing, because a stack that never reaches
@@ -683,21 +750,61 @@ pub(crate) fn describe(e: &pam_client2::Error) -> String {
 /// floor on the whole authenticate phase — `pam_faildelay`, or a deadline wdm
 /// holds itself — which is a change to how long every failed login takes and
 /// wants measuring before it is chosen.
-pub(crate) const AUTH_FAILED: &str = "Authentication failure";
+const AUTH_FAILED: &str = "Authentication failure";
 
-/// The greeter-facing text for a failed `pam_authenticate`.
+/// The greeter-facing text for a PAM failure in `phase`.
 ///
-/// A function rather than using [`AUTH_FAILED`] directly, so the log line and
-/// the constant cannot drift apart at a call site that forgets one of them.
+/// [`Phase::Authenticate`] is flattened to [`AUTH_FAILED`]; every other phase
+/// returns PAM's own words. Either way the real cause goes to the journal here,
+/// so that the log line and the returned string cannot drift apart at a call
+/// site that remembers one of them and forgets the other.
 ///
-/// Takes the cause already rendered, rather than the `pam_client2::Error`,
-/// because `Error::new` is `pub(crate)` in that crate — a test cannot build one,
-/// and this is the function most worth having a test on.
-pub(crate) fn describe_auth(username: &str, cause: &str) -> String {
-    // The real cause goes to the journal only; it is deliberately not in the
-    // returned value, which is what the greeter sees.
-    log::info!("authentication failed for {username}: {cause}");
-    AUTH_FAILED.to_owned()
+/// `username` is escaped with `{:?}`. It arrives from the greeter's
+/// `create_session` and unadvertised names are deliberately accepted, so it is
+/// an arbitrary string; journald splits records on newlines, and an unescaped
+/// one would let anyone at the login screen forge journal entries attributed to
+/// wdm — including plausible *successes*, aimed at exactly the administrator
+/// this function points at the journal. `cause` needs no escaping: it is
+/// `pam_strerror` text or a module's message, and the former is a fixed table.
+#[must_use]
+pub(crate) fn to_greeter(phase: Phase, username: &str, cause: &(impl Cause + ?Sized)) -> String {
+    let cause = cause.text();
+    log::info!("{} failed for {username:?}: {cause}", phase.what());
+    match phase {
+        // Deliberately not `cause`: the greeter sees one string for every
+        // reason, or the login screen is an account oracle.
+        Phase::Authenticate => AUTH_FAILED.to_owned(),
+        _ => cause,
+    }
+}
+
+/// What the greeter is shown in place of a module's own text during
+/// `pam_authenticate`.
+///
+/// `pam_faillock` announces a lockout, and it can only announce one for an
+/// account that exists; `pam_sss` and `pam_ldap` say their piece and skip the
+/// password prompt entirely for a name they do not know. Forwarded verbatim,
+/// that channel is a sharper oracle than the one [`AUTH_FAILED`] closes — it
+/// answers before any credential is offered, and needs no timing.
+///
+/// A fixed string rather than nothing at all, because the message is also what
+/// stops a greeter retrying: an `Error` prompt lands in `Model::push_notice`,
+/// which sets `blocked`, which `Model::should_auto_retry` consults. Dropping
+/// these would restore the retry spin the response-timeout notice exists to
+/// prevent.
+///
+/// This is only for text emitted *before* `pam_authenticate` returns success.
+/// The expired-password change runs after it and keeps its own words, which is
+/// the case where a module genuinely has to talk to the user ("BAD PASSWORD",
+/// "password too short") and where the user has already proved the account is
+/// theirs.
+#[must_use]
+pub(crate) fn notice_to_greeter(username: &str, text: &str) -> String {
+    // `{username:?}` for the same reason `to_greeter` escapes it. `text` comes
+    // from a PAM module rather than from the network, but it is also the thing
+    // being withheld, so it is escaped too rather than trusted.
+    log::info!("suppressed pre-authentication notice for {username:?}: {text:?}");
+    "The login attempt could not be completed.".to_owned()
 }
 
 pub(crate) fn os_to_string(s: &OsStr) -> Option<String> {
@@ -717,38 +824,89 @@ mod tests {
 
     use super::*;
 
+    /// The exact strings this host's PAM stack produced, captured by running the
+    /// real helper against the real `/etc/pam.d/wdm`.
+    ///
+    /// The account oracle the flattening closes is the first two: a nonexistent
+    /// account yields "User not known to the underlying authentication module",
+    /// a wrong password yields "Authentication failure". Anyone at the login
+    /// screen could enumerate accounts by reading the reply, with no password
+    /// and nothing wdm rate limits as a login. These live here rather than in
+    /// [`AUTH_FAILED`]'s doc because here they are data a change has to survive,
+    /// and in two places a PAM wording change would drift.
+    const MEASURED: [&str; 5] = [
+        "User not known to the underlying authentication module",
+        "Authentication failure",
+        "Permission denied",
+        "Have exhausted maximum number of retries for service",
+        "Authentication service cannot retrieve authentication info",
+    ];
+
     #[test]
     fn every_authentication_failure_reads_the_same_to_the_greeter() {
-        // The account oracle this closes. `describe` returns PAM's own words,
-        // and on this repository's own /etc/pam.d/wdm those words distinguish
-        // the two cases — measured: a nonexistent account yields "User not
-        // known to the underlying authentication module", a wrong password
-        // yields "Authentication failure". Anyone at the login screen could
-        // therefore enumerate accounts by reading the reply, with no password
-        // and nothing wdm rate limits as a login.
-        //
-        // The exact strings this host's PAM stack produced for the two cases,
-        // captured by running the real helper against the real /etc/pam.d/wdm.
-        // Both must come out the other side identical.
-        for cause in [
-            "User not known to the underlying authentication module",
-            "Authentication failure",
-            "Permission denied",
-            "Have exhausted maximum number of retries for service",
-            "Authentication service cannot retrieve authentication info",
-        ] {
+        for cause in MEASURED {
             assert_eq!(
-                describe_auth("someone", cause),
+                to_greeter(Phase::Authenticate, "someone", cause),
                 AUTH_FAILED,
                 "{cause:?} reached the greeter as its own text, which distinguishes \
                  it from the others and makes the login screen an account oracle"
             );
         }
 
-        // The username must not leak either — it is the thing being probed.
-        assert!(
-            !describe_auth("alice", "User not known").contains("alice"),
-            "the reply named the account that was probed"
+        // Two different calls compared against each other rather than a
+        // `!contains("alice")` on a function returning a constant, which cannot
+        // fail whatever the constant becomes. This one still catches a reply
+        // that varies by account or by cause.
+        assert_eq!(
+            to_greeter(
+                Phase::Authenticate,
+                "alice",
+                "User not known to the underlying authentication module"
+            ),
+            to_greeter(Phase::Authenticate, "root", "Authentication failure"),
+            "the reply varied by account or by cause"
+        );
+
+        // Separately, so that changing the constant is a deliberate test edit
+        // rather than something the comparison above absorbs silently.
+        assert_eq!(AUTH_FAILED, "Authentication failure");
+    }
+
+    #[test]
+    fn only_authentication_is_flattened() {
+        // The other half of the contract, and the half nothing used to pin:
+        // routing acct_mgmt, the password change or open_session through the
+        // flattening would destroy "account expired" and "password too short"
+        // and no test would notice. The phase is a value precisely so that the
+        // wrong choice is a wrong value, which this catches.
+        for phase in [
+            Phase::Start,
+            Phase::AcctMgmt,
+            Phase::Chauthtok,
+            Phase::OpenSession,
+        ] {
+            for cause in MEASURED {
+                assert_eq!(
+                    to_greeter(phase, "someone", cause),
+                    cause,
+                    "{phase:?} flattened PAM's own words, which is the phase's \
+                     only useful output and is safe to show: the user reached it \
+                     by proving they own the account"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pre_authentication_notice_is_replaced_rather_than_forwarded() {
+        // pam_faillock only has a lockout to announce for an account that
+        // exists, so forwarding its text answers "does this account exist"
+        // before any password is offered. Two unrelated notices must be
+        // indistinguishable.
+        assert_eq!(
+            notice_to_greeter("alice", "Account locked due to 3 failed logins"),
+            notice_to_greeter("root", "Server message: user not found"),
+            "the notice varied by account or by module text"
         );
     }
 
