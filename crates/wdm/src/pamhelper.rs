@@ -990,8 +990,9 @@ impl WireConversation<'_> {
     /// Emit a message the greeter is not expected to answer.
     ///
     /// The style is preserved even when the text is not: `Error` is what sets
-    /// `blocked` in the greeter's model and stops it auto-retrying, so replacing
-    /// an error with an info would restore the retry spin.
+    /// `blocked` in the greeter's model — the mark that the failure was
+    /// explained, and so belongs on screen rather than being replaced by a fresh
+    /// prompt — so replacing an error with an info would lose the explanation.
     fn tell(&mut self, msg: &CStr, style: PromptStyle) {
         // PAM messages come from modules and are not guaranteed UTF-8.
         let text = msg.to_string_lossy().into_owned();
@@ -1092,7 +1093,7 @@ mod tests {
             username: "someone",
             authenticated,
             display_released: false,
-            next_id: crate::auth::reserve_prompt_ids(),
+            next_id: crate::auth::reserve_prompt_ids().expect("prompt id space exhausted"),
         }
     }
 
@@ -1316,7 +1317,19 @@ mod tests {
                 .args(&self.argv[1..])
                 .spawn()
                 .map_err(|e| e.to_string());
-            record(&self.log, "spawned");
+            // Recorded on the outcome, not on having tried. The ordered log is
+            // the whole assertion of the sequencing tests, and a `spawned`
+            // written before the result was known would let a binary that is not
+            // on this host read as a session that started — the one entry those
+            // tests cannot afford to be wrong about.
+            record(
+                &self.log,
+                if child.is_ok() {
+                    "spawned"
+                } else {
+                    "spawn_failed"
+                },
+            );
             child
         }
     }

@@ -127,7 +127,8 @@ impl Launch {
     /// directory's lifecycle.
     ///
     /// `extra_env` is what the greeter asked for. It is filtered through
-    /// [`greeter_may_set`] and applied *before* wdm's own session variables, so
+    /// [`wdm_protocol::env::is_honoured`] and applied *before* wdm's own session
+    /// variables, so
     /// a greeter can localise the session but can neither influence how it loads
     /// code nor contradict a fact about the seat.
     pub fn build(
@@ -393,7 +394,7 @@ fn build_env(
     // Applied before wdm's own facts, and filtered, so a greeter can localise a
     // session but cannot influence how it loads code or who it runs as.
     for (key, value) in extra_env {
-        if greeter_may_set(key, value) {
+        if wdm_protocol::env::is_honoured(key, value) {
             set(key, value.clone());
         } else {
             log::warn!("ignoring environment variable {key} requested by the greeter");
@@ -417,37 +418,6 @@ fn build_env(
     );
 
     env
-}
-
-/// Environment variables the greeter is allowed to contribute.
-///
-/// An allowlist, not a denylist. The greeter is unprivileged, untrusted code,
-/// and the session it is populating runs as the authenticated user through a
-/// login shell — so a variable it controls is a variable it can use to run code
-/// as that user. `LD_PRELOAD` and `LD_LIBRARY_PATH` are the obvious ones, but
-/// `PATH`, `SHELL`, `IFS`, `BASH_ENV` and `ENV` are equally good, and enumerating
-/// them is a game one eventually loses. Only presentation variables are allowed
-/// through, which is all a greeter has any business setting.
-fn greeter_may_set(key: &str, value: &str) -> bool {
-    const ALLOWED: &[&str] = &["LANG", "LANGUAGE"];
-    const ALLOWED_PREFIXES: &[&str] = &["LC_", "XKB_"];
-
-    if !(ALLOWED.contains(&key) || ALLOWED_PREFIXES.iter().any(|p| key.starts_with(p))) {
-        return false;
-    }
-
-    // Values are checked too, not just keys. glibc treats a locale name
-    // containing a slash as a path and loads the locale from there — it only
-    // refuses that for setuid binaries, which a user session is not — and
-    // libxkbcommon honours XKB_CONFIG_ROOT as a data root. Either would let the
-    // greeter point the authenticated user's session at files it controls.
-    if value.contains('/') || value.contains('\0') {
-        return false;
-    }
-
-    // A locale or layout name is short. A long value is not one, and is a
-    // plausible attempt at something else.
-    value.len() <= 64
 }
 
 #[cfg(test)]
@@ -585,13 +555,9 @@ mod tests {
             "GIO_MODULE_DIR",
         ];
 
-        for key in dangerous {
-            assert!(
-                !greeter_may_set(key, "x"),
-                "{key} must not be greeter-settable"
-            );
-        }
-
+        // The filter's own shape is pinned beside it, in
+        // `wdm_protocol::env::is_honoured`'s tests. What is checked here is that
+        // `build_env` is what applies it.
         let env = build_env(
             &session(SessionType::Wayland),
             "testuser",
@@ -615,41 +581,39 @@ mod tests {
     }
 
     #[test]
-    fn allowlisted_keys_still_reject_path_values() {
-        // glibc loads a locale from a path if the name contains a slash, and
-        // libxkbcommon honours XKB_CONFIG_ROOT as a data root. Allowing the key
-        // is not the same as allowing any value for it.
-        assert!(greeter_may_set("LANG", "de_DE.UTF-8"));
-        assert!(greeter_may_set("LC_ALL", "en_GB.UTF-8"));
-        assert!(greeter_may_set("XKB_DEFAULT_LAYOUT", "de"));
-
-        assert!(!greeter_may_set("LC_ALL", "/tmp/evil/locale"));
-        assert!(!greeter_may_set("LANG", "../../tmp/evil"));
-        assert!(!greeter_may_set("XKB_CONFIG_ROOT", "/tmp/evil"));
-        assert!(!greeter_may_set("LANG", &"a".repeat(4096)));
-    }
-
-    #[test]
-    fn the_length_limit_is_64_bytes_not_64_characters() {
-        // The XML promises "values longer than 64 bytes" are rejected, so the
-        // boundary is part of the contract a greeter is written against. The
-        // 4096-byte case above is far enough over the line that an off-by-one
-        // would sail past it, and `str::len` returning bytes rather than chars
-        // is the sort of thing a refactor to `chars().count()` silently
-        // reverses.
-        assert!(greeter_may_set("LANG", &"a".repeat(64)));
-        assert!(!greeter_may_set("LANG", &"a".repeat(65)));
-        assert!(greeter_may_set("LANGUAGE", &"a".repeat(64)));
-        assert!(!greeter_may_set("LANGUAGE", &"a".repeat(65)));
-
-        // 33 two-byte characters: under the limit counted as characters, over it
-        // counted as bytes. It is bytes that decide how much of the session's
-        // environment a greeter controls, so this must be refused.
+    fn build_env_rejects_path_and_oversized_values_on_allowlisted_keys() {
+        // The filter's own boundaries are pinned in
+        // `wdm_protocol::env::is_honoured`'s tests. What this checks is that the
+        // environment `build_env` hands the exec is the filtered one — an
+        // allowlisted *key* is not an allowlisted *value*, and it is here that
+        // the difference reaches the session.
+        let long = "a".repeat(65);
         let multibyte = "é".repeat(33);
         assert_eq!(multibyte.len(), 66);
-        assert!(!greeter_may_set("LC_ALL", &multibyte));
-        // And 32 of them, at 64 bytes, are still allowed.
-        assert!(greeter_may_set("LC_ALL", &"é".repeat(32)));
+
+        let env = build_env(
+            &session(SessionType::Wayland),
+            "testuser",
+            Path::new("/home/testuser"),
+            Path::new("/bin/sh"),
+            7,
+            Vec::new(),
+            &[
+                ("LANG".to_owned(), "de_DE.UTF-8".to_owned()),
+                ("LC_ALL".to_owned(), "/tmp/evil/locale".to_owned()),
+                ("XKB_CONFIG_ROOT".to_owned(), "/tmp/evil".to_owned()),
+                ("LC_NUMERIC".to_owned(), long.clone()),
+                ("LC_MONETARY".to_owned(), multibyte),
+                ("LC_TIME".to_owned(), "é".repeat(32)),
+            ],
+        );
+
+        assert_eq!(env_of(&env, "LANG").as_deref(), Some("de_DE.UTF-8"));
+        assert_eq!(env_of(&env, "LC_TIME").as_deref(), Some(&*"é".repeat(32)));
+        assert!(env_of(&env, "LC_ALL").is_none());
+        assert!(env_of(&env, "XKB_CONFIG_ROOT").is_none());
+        assert!(env_of(&env, "LC_NUMERIC").is_none());
+        assert!(env_of(&env, "LC_MONETARY").is_none());
     }
 
     #[test]

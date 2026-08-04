@@ -24,8 +24,8 @@
 //! [`RESPONSE_TIMEOUT`] the helper composes an `error` prompt of its own before
 //! failing the attempt. That matters to readers of the other end —
 //! `handle_auth_event` routes it exactly like PAM's, which is the point. It is
-//! the event that tells a greeter the failure was explained and stops it
-//! auto-retrying into an account lockout.
+//! the event that tells a greeter the failure was explained, so a UI leaves the
+//! reason on screen rather than replacing it with a fresh prompt.
 //!
 //! Cancellation is expressed by dropping [`AuthHandle`], as it always was. The
 //! mechanism is now a socket shutdown rather than an `mpsc` disconnect: the
@@ -66,12 +66,12 @@ pub const SERVICE: &str = "wdm";
 
 /// Source of prompt ids, shared by every attempt in the process.
 ///
-/// An id must identify the question it was issued for, which means it may never
-/// be reused: a late `respond` carrying id 0 from a cancelled conversation must
-/// not match the first prompt of the *next* one, or one user's secret is fed to
-/// another user's PAM stack. `Login::reset()` clears `pending_prompt`, so the
-/// next attempt is free to register the same id — nothing downstream notices the
-/// collision.
+/// An id must identify the question it was issued for, which means it may not be
+/// reused within the life of the process: a late `respond` carrying id 0 from a
+/// cancelled conversation must not match the first prompt of the *next* one, or
+/// one user's secret is fed to another user's PAM stack. `Login::reset()` clears
+/// `pending_prompt`, so the next attempt is free to register the same id —
+/// nothing downstream notices the collision.
 ///
 /// The ids are minted in the helper, which is a fresh `exec` per attempt and so
 /// cannot hold a counter that survives one. The counter therefore lives here, in
@@ -79,6 +79,18 @@ pub const SERVICE: &str = "wdm";
 /// travels on [`Msg::Start`], and the helper counts up from it. That is the
 /// whole of the mechanism, and it stopped being true for a while when PAM moved
 /// out of process — the doc claiming a shared counter outlived the counter.
+///
+/// "Not reused" is bounded by the counter, not by wishing: the wire field is a
+/// `uint`, so there are `u32::MAX / PROMPT_ID_BLOCK` — about 1.05 million —
+/// blocks in one process, and a greeter that opens a conversation as fast as
+/// `login.rs`'s `MIN_ATTEMPT_INTERVAL` allows reaches the end of them in
+/// roughly twelve days of uptime. That is not a hypothetical adversary; it is
+/// the one the interval was added for. Wrapping there would reissue blocks from
+/// near 0 with the collision the ids exist to prevent, and `fetch_max` in
+/// [`observe_prompt_id`] cannot help because the wrapped value is *below*
+/// everything already issued. So exhaustion is terminal instead:
+/// [`reserve_prompt_ids`] returns `None`, the attempt is refused, and the only
+/// cure is a restart — which resets the counter along with everything else.
 static NEXT_PROMPT_ID: AtomicU32 = AtomicU32::new(0);
 
 /// How many ids one attempt is given.
@@ -95,8 +107,25 @@ static NEXT_PROMPT_ID: AtomicU32 = AtomicU32::new(0);
 const PROMPT_ID_BLOCK: u32 = 4096;
 
 /// Reserve one attempt's block of prompt ids, returning its first id.
-pub(crate) fn reserve_prompt_ids() -> u32 {
-    NEXT_PROMPT_ID.fetch_add(PROMPT_ID_BLOCK, Ordering::Relaxed)
+///
+/// `None` once the counter cannot advance a whole block without wrapping. See
+/// [`NEXT_PROMPT_ID`]: a wrapped block is a block of ids that have already been
+/// answered, so there is nothing to do with exhaustion but refuse.
+pub(crate) fn reserve_prompt_ids() -> Option<u32> {
+    reserve_block(&NEXT_PROMPT_ID)
+}
+
+/// [`reserve_prompt_ids`] against an arbitrary counter.
+///
+/// Split out only so a test can reach the exhaustion boundary: [`NEXT_PROMPT_ID`]
+/// is process-global and every other test in this binary draws from it, so a test
+/// that wound it to `u32::MAX` would take them with it.
+fn reserve_block(counter: &AtomicU32) -> Option<u32> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(PROMPT_ID_BLOCK)
+        })
+        .ok()
 }
 
 /// Note that `id` has been issued, so no future block can contain it.
@@ -299,6 +328,21 @@ impl AuthHandle {
         session: SessionDescription,
         events: calloop::channel::Sender<AuthEvent>,
     ) -> io::Result<Self> {
+        // Before the helper is spawned, because an exhausted counter has no
+        // recovery and there is no point starting a conversation that cannot be
+        // given ids. See NEXT_PROMPT_ID for how it is reached.
+        let id_base = reserve_prompt_ids().ok_or_else(|| {
+            log::error!(
+                "prompt id space exhausted after {} attempts; refusing to \
+                 authenticate {username:?} until wdm is restarted",
+                u32::MAX / PROMPT_ID_BLOCK
+            );
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "prompt id space exhausted; wdm must be restarted",
+            )
+        })?;
+
         let (ours, theirs) = seqpacket_pair()?;
         let child = spawn_helper(helper_command(), theirs)?;
         log::debug!("pam helper for {username:?} started as pid {}", child.id());
@@ -315,9 +359,9 @@ impl AuthHandle {
             session_type: session.session_type,
             desktop: session.desktop,
             // The helper mints the ids and cannot survive to remember which it
-            // used, so the block is reserved here, where the counter outlives
+            // used, so the block is reserved above, where the counter outlives
             // every attempt. See NEXT_PROMPT_ID.
-            id_base: reserve_prompt_ids(),
+            id_base,
         });
 
         Ok(handle)
@@ -859,7 +903,22 @@ impl Cause for str {
 ///   and is described where it would be made, in `login::create_session`.
 /// - The floor is a floor. A network stack — `pam_sss` against a directory,
 ///   Kerberos against a KDC — is routinely slower than two seconds, and there
-///   the observed time is PAM's own; see `login::failure_delay`.
+///   the observed time is PAM's own; see `login::failure_delay`. Closing it
+///   means a *ceiling* as well, and a ceiling needs a number no constant can
+///   hold: it has to be at least as long as this deployment's slowest honest
+///   refusal, which is a property of the directory server and the network, not
+///   of wdm. Two ways to get one. Measure it — keep a running maximum of
+///   observed authenticate durations, per stack, and round the floor up to it —
+///   which costs persistent state that survives a restart, and hands an
+///   attacker who can slow the directory a way to raise everyone's floor. Or
+///   move the deadline into the helper, which is the only process that knows
+///   when `pam_authenticate` was entered and returned, and can pad from there
+///   rather than from wdm's send; that removes the network round trip from the
+///   measurement but not the directory's own variance. Neither is taken because
+///   the exposure is a *timing* distinction between two failures, on a login
+///   screen that already reports both at the same rate-limited pace, and both
+///   fixes cost more than the channel is worth until someone shows it being
+///   used.
 const AUTH_FAILED: &str = "Authentication failure";
 
 /// The greeter-facing text for a PAM failure in `phase`.
@@ -1062,8 +1121,8 @@ mod tests {
         // The whole point of the counter: a late response from a cancelled
         // conversation must not match a prompt in the next one. Blocks, not
         // single ids, because the ids themselves are minted in the helper.
-        let a = reserve_prompt_ids();
-        let b = reserve_prompt_ids();
+        let a = reserve_prompt_ids().expect("the counter is nowhere near exhausted");
+        let b = reserve_prompt_ids().expect("the counter is nowhere near exhausted");
         assert_ne!(a, b);
         assert!(
             b >= a + PROMPT_ID_BLOCK,
@@ -1075,9 +1134,48 @@ mod tests {
         let spilled = b + PROMPT_ID_BLOCK + 7;
         observe_prompt_id(spilled);
         assert!(
-            reserve_prompt_ids() > spilled,
+            reserve_prompt_ids().expect("the counter is nowhere near exhausted") > spilled,
             "a block was reissued over ids that had already been sent"
         );
+    }
+
+    #[test]
+    fn an_exhausted_prompt_id_counter_refuses_rather_than_wraps() {
+        // `fetch_add` on a u32 wraps in every profile, and a wrapped block is a
+        // block of ids the greeter may still hold outstanding responses for —
+        // the exact collision the counter exists to prevent, and one
+        // `observe_prompt_id`'s `fetch_max` cannot repair, because the wrapped
+        // value is below every id already issued. A greeter that opens a
+        // conversation once a second reaches it in about twelve days, so it is
+        // not out of reach of the adversary the rate limit was written for.
+        //
+        // NEXT_PROMPT_ID is process-global and every other test here draws from
+        // it, so the boundary is reached on a counter of this test's own —
+        // through `reserve_block`, which is what `reserve_prompt_ids` runs.
+        let counter = AtomicU32::new(u32::MAX - PROMPT_ID_BLOCK + 1);
+
+        assert_eq!(
+            reserve_block(&counter),
+            None,
+            "a block that cannot fit was handed out"
+        );
+        // And it stays refused: no amount of asking rolls it over.
+        assert_eq!(reserve_block(&counter), None);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u32::MAX - PROMPT_ID_BLOCK + 1,
+            "a failed reservation moved the counter"
+        );
+
+        // One block below the ceiling is still served, so the refusal is the
+        // boundary and not an off-by-one that costs a block early.
+        let counter = AtomicU32::new(u32::MAX - PROMPT_ID_BLOCK);
+        assert_eq!(
+            reserve_block(&counter),
+            Some(u32::MAX - PROMPT_ID_BLOCK),
+            "the last block that fits was refused"
+        );
+        assert_eq!(reserve_block(&counter), None);
     }
 
     #[test]
@@ -1092,7 +1190,7 @@ mod tests {
             let (ours, helper) = fake_helper();
             let (events_tx, events_rx) = calloop::channel::channel();
             let mut events = EventStream::new(events_rx);
-            let base = reserve_prompt_ids();
+            let base = reserve_prompt_ids().expect("the counter is nowhere near exhausted");
 
             let _handle = AuthHandle::adopt(ours, None, "testuser", events_tx);
             // What a helper seeded from that base emits for its first question.
@@ -1115,7 +1213,7 @@ mod tests {
 
         // The attempt is cancelled and the next one starts. Its block must not
         // contain the id the greeter may still be about to answer.
-        let second = reserve_prompt_ids();
+        let second = reserve_prompt_ids().expect("the counter is nowhere near exhausted");
         assert!(
             second > first,
             "the next attempt was handed id {second}, which the previous \
