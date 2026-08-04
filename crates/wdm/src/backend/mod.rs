@@ -69,6 +69,15 @@ pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
                     // pending respawn is moot too, and would otherwise fire in
                     // the next login generation.
                     data.state.pending_actions.clear();
+                    // Backend requests go the same way, and for a sharper
+                    // reason: a VBlank(crtc) queued between the last
+                    // drain_requests and the handoff is acted on in the *next*
+                    // generation, against a freshly built Device where that CRTC
+                    // handle may belong to a different Head — so frame_submitted
+                    // is called for a frame nobody queued and logs an error. A
+                    // DeviceAdded or RescanConnectors left here is equally a
+                    // statement about a device that no longer exists.
+                    data.state.requests.clear();
                     disarm_respawn(data, loop_handle);
                     return Handled::HandOff(launch);
                 }

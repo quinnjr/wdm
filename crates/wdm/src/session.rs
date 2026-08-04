@@ -1,10 +1,15 @@
 //! Launching a user's session after a successful login.
 //!
 //! Everything that needs root — resolving the account, computing the
-//! supplementary group list, opening the VT — happens in the parent before the
-//! fork, so the child does only async-signal-safe work. That matters because
-//! wdm has PAM threads alive at this point, and a forked child of a
-//! multithreaded process may not allocate or take locks.
+//! supplementary group list, resolving the VT's device path — happens in the
+//! parent before the fork, so the child does only async-signal-safe work. That
+//! matters because wdm has PAM threads alive at this point, and a forked child
+//! of a multithreaded process may not allocate or take locks.
+//!
+//! The VT itself is deliberately *opened* in the child, not here: `TIOCSCTTY`
+//! only grants a controlling terminal to a session leader, and `setsid` is in
+//! the child too. What the parent prepares is the `CString` path, because
+//! building one is an allocation and the child may not make it.
 //!
 //! Releasing DRM master is *not* done here. The caller closes its libseat
 //! session before calling [`Launch::spawn`], because dropping master from the
@@ -554,6 +559,29 @@ mod tests {
         assert!(!greeter_may_set("LANG", "../../tmp/evil"));
         assert!(!greeter_may_set("XKB_CONFIG_ROOT", "/tmp/evil"));
         assert!(!greeter_may_set("LANG", &"a".repeat(4096)));
+    }
+
+    #[test]
+    fn the_length_limit_is_64_bytes_not_64_characters() {
+        // The XML promises "values longer than 64 bytes" are rejected, so the
+        // boundary is part of the contract a greeter is written against. The
+        // 4096-byte case above is far enough over the line that an off-by-one
+        // would sail past it, and `str::len` returning bytes rather than chars
+        // is the sort of thing a refactor to `chars().count()` silently
+        // reverses.
+        assert!(greeter_may_set("LANG", &"a".repeat(64)));
+        assert!(!greeter_may_set("LANG", &"a".repeat(65)));
+        assert!(greeter_may_set("LANGUAGE", &"a".repeat(64)));
+        assert!(!greeter_may_set("LANGUAGE", &"a".repeat(65)));
+
+        // 33 two-byte characters: under the limit counted as characters, over it
+        // counted as bytes. It is bytes that decide how much of the session's
+        // environment a greeter controls, so this must be refused.
+        let multibyte = "é".repeat(33);
+        assert_eq!(multibyte.len(), 66);
+        assert!(!greeter_may_set("LC_ALL", &multibyte));
+        // And 32 of them, at 64 bytes, are still allowed.
+        assert!(greeter_may_set("LC_ALL", &"é".repeat(32)));
     }
 
     #[test]

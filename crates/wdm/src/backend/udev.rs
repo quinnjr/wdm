@@ -33,7 +33,9 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
-use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc};
+use smithay::reexports::drm::control::{
+    Device as ControlDevice, ResourceHandles, connector, crtc,
+};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, backend::GlobalId};
@@ -76,8 +78,7 @@ struct Device {
     /// rebuilding a full-screen image every frame on the one path that runs when
     /// everything else has failed would be gratuitous.
     error_screen: Option<(String, Size<i32, Physical>, MemoryRenderBuffer)>,
-    /// Wayland output globals, dropped with the device so clients see the
-    /// outputs go away.
+    /// The DRM event source, removed before the device is dropped.
     drm_token: RegistrationToken,
     /// udev reports device removal by device id, not by path, so the id is what
     /// wdm has to match against.
@@ -577,7 +578,11 @@ impl Udev {
                 continue;
             }
 
-            match self.add_output(&info, &name, output_config.as_ref(), data) {
+            // `resources` is handed down rather than re-read in free_crtc: it is
+            // the same ioctl this function already made, and the whole point of
+            // the probe filtering above is not to make DRM round trips per
+            // connector on the thread that also serves input and the greeter.
+            match self.add_output(&info, &name, output_config.as_ref(), &resources, data) {
                 Ok(()) => log::info!("{name} is up"),
                 Err(e) => log::error!("bringing up {name}: {e}"),
             }
@@ -599,6 +604,7 @@ impl Udev {
         info: &connector::Info,
         name: &str,
         output_config: Option<&config::Output>,
+        resources: &ResourceHandles,
         data: &mut LoopData,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let device = self.device.as_mut().ok_or("no device")?;
@@ -606,7 +612,7 @@ impl Udev {
         let mode = pick_mode(info, output_config.and_then(|c| c.mode))
             .ok_or("connector reports no usable mode")?;
 
-        let crtc = free_crtc(device, info).ok_or("no free crtc for this connector")?;
+        let crtc = free_crtc(device, resources, info).ok_or("no free crtc for this connector")?;
 
         let (physical_width, physical_height) = info.size().unwrap_or((0, 0));
         let output = Output::new(
@@ -789,13 +795,15 @@ impl Udev {
         };
 
         let give_up = data.state.give_up_reason.as_deref();
-        let crtcs: Vec<crtc::Handle> = device.outputs.keys().copied().collect();
         let mut drew = false;
 
-        for crtc in crtcs {
-            let Some(head) = device.outputs.get_mut(&crtc) else {
-                continue;
-            };
+        // Iterated in place rather than through a Vec of CRTC handles: this runs
+        // on every 16ms tick, and the borrow checker only needed convincing that
+        // `outputs`, `renderer` and `error_screen` are disjoint fields.
+        for head in device.outputs.values_mut() {
+            // Cloned because `render_frame` borrows `head.compositor` for as
+            // long as its result lives, and the error logs below want the name.
+            // `Output` is an Arc inside, so this is not a real copy.
             let output = head.output.clone();
 
             let elements: Vec<WdmElement<GlesRenderer>> = match give_up {
@@ -827,13 +835,20 @@ impl Udev {
                     }
 
                     let (_, _, buffer) = device.error_screen.as_ref().expect("just populated");
+                    // The size is given explicitly, and in *logical* pixels: the
+                    // buffer is rasterised at the physical mode size with a
+                    // buffer scale of 1, so leaving this None makes smithay read
+                    // the mode size as logical and then multiply it by the
+                    // output scale. See render::error_element_size.
+                    let logical =
+                        crate::render::error_element_size(size, output.current_scale().fractional_scale());
                     match MemoryRenderBufferRenderElement::from_buffer(
                         &mut device.renderer,
                         (0.0, 0.0),
                         buffer,
                         None,
                         None,
-                        None,
+                        Some(logical),
                         Kind::Unspecified,
                     ) {
                         Ok(element) => vec![WdmElement::Image(element)],
@@ -1011,9 +1026,17 @@ fn select_mode(modes: &[ModeCandidate], wanted: Option<config::Mode>) -> Option<
 }
 
 /// Find a CRTC this connector can drive that is not already in use.
-fn free_crtc(device: &Device, info: &connector::Info) -> Option<crtc::Handle> {
+///
+/// `resources` comes from the caller's own `resource_handles()` rather than
+/// being re-read here: this runs once per connector being added, and re-reading
+/// would be one DRM ioctl per connector on every cable event — exactly the
+/// stall `scan_connectors` avoids by not force-probing.
+fn free_crtc(
+    device: &Device,
+    resources: &ResourceHandles,
+    info: &connector::Info,
+) -> Option<crtc::Handle> {
     let drm = device.output_manager.device();
-    let resources = drm.resource_handles().ok()?;
 
     for encoder_handle in info.encoders() {
         let Ok(encoder) = drm.get_encoder(*encoder_handle) else {

@@ -210,13 +210,21 @@ fn render(
             }
 
             let (_, _, buffer) = error_screen.as_ref().expect("just populated");
+            // Explicit logical size, as in the DRM backend: `None` would make
+            // smithay read the buffer's physical size as logical and scale it up
+            // again. This backend hardcodes scale 1 so the two agree here — which
+            // is precisely why the DRM backend's version of this went unnoticed.
+            let logical = crate::render::error_element_size(
+                size,
+                output.current_scale().fractional_scale(),
+            );
             match MemoryRenderBufferRenderElement::from_buffer(
                 backend.renderer(),
                 (0.0, 0.0),
                 buffer,
                 None,
                 None,
-                None,
+                Some(logical),
                 Kind::Unspecified,
             ) {
                 Ok(element) => vec![WdmElement::Image(element)],

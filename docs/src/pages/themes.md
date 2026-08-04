@@ -42,12 +42,26 @@ works and there is no ready callback to wait for.
 | `wdm.is_authenticated` | whether the last conversation succeeded |
 | `wdm.in_authentication` | whether one is in progress |
 | `wdm.link_dead` | true once the connection to wdm is gone; it never becomes false again |
-| `wdm._prompt` | the pending prompt's text, or `null` — the underscore marks it as owned by the bridge rather than part of the API's shape, but a theme may read it |
+| `wdm._prompt` | the pending prompt as `{ id, text, secret }`, or `null` — the underscore marks it as owned by the bridge rather than part of the API's shape, but a theme may read it |
 
-`wdm._prompt` is what lets a theme tell "answer the question on screen" from
-"start again": the default theme reads it to decide whether Enter should submit
-a response or restart the conversation. It is asserted by a drift test, so it is
-contract even though it is spelled as private.
+`wdm._prompt` is an **object, not a string**: `text` is what to display, `id` is
+the prompt's id, and `secret` is whether the answer should be masked — the same
+fact `show_prompt`'s `kind` carries, available to code that did not come through
+that callback. A theme that assigns the property straight into the DOM
+(`el.textContent = wdm._prompt`) renders `[object Object]`; read `.text`.
+
+`wdm._prompt` is also what lets a theme tell "answer the question on screen"
+from "start again": the default theme reads it to decide whether Enter should
+submit a response or start a conversation. It is asserted by a drift test, so it
+is contract even though it is spelled as private.
+
+`wdm._post`, which the injected object also carries, is **not**. It is the
+bridge's own transport — the raw `(verb, arg)` channel the methods above are
+written on top of — and it performs none of the checks they do. Calling
+`wdm._post('start_session', id)` by hand skips exactly the argument validation
+that makes "calling these out of order throws" true below, and produces a
+message the compositor's parser refuses and a log line nobody is reading. Use
+the methods.
 
 `wdm.link_dead` latches. When it is true, nothing a theme sends reaches wdm —
 `respond` and `start_session` post into a dead socket and are silently lost —
@@ -145,12 +159,14 @@ A theme must tolerate a callback arriving **twice**, and a callback it was owed
 So write handlers that are idempotent, and do not read the absence of a
 `show_message` as PAM having sent none.
 
-The shipped default theme also caps what it *displays* at **six** messages. Past
+The shipped default theme also caps what it *displays* at **six per severity**.
+The cap is applied per element and `show_message` routes by `kind` into two of
+them, so the real ceiling is six errors *and* six infos, not six in total. Past
 that it drops the second-oldest, never the first: the oldest is the one carrying
 the lockout reason, and there is no scrolling on this screen by design. A theme
 copying it inherits that cap, and it means the shipped theme is not lossless —
-a stack that emits more than six messages in one attempt shows the first and the
-five most recent.
+a stack that emits more than six messages of one severity in one attempt shows
+the first and the five most recent of them.
 
 ## What a theme is responsible for
 
@@ -166,6 +182,14 @@ those would be fighting every theme that disagreed. So a theme must:
   and assigns only an id it has found in `wdm.sessions`: a recorded id can name
   a session that has since been uninstalled, and setting a `<select>` to a value
   no `<option>` carries leaves the dropdown showing nothing at all.
+- **Refuse an empty first answer.** Enter on an empty field is not a login
+  attempt and must not cost one: submitting nothing runs the whole PAM stack
+  against an empty password, fails, and is charged to the user by
+  `pam_faillock`, so three stray presses of Enter at an unattended screen can
+  lock the account. Guard only the **first** prompt — once a conversation is
+  underway an empty answer can be a legitimate choice, and a stack that asks
+  something optional is entitled to be answered with nothing. Both shipped
+  greeters implement this.
 - **Restart the conversation when the user changes.** PAM's is per user, and a
   half-answered one for somebody else cannot be reused.
 - **Keep `show_message` on screen past `authentication_complete`.** This is

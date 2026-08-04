@@ -11,7 +11,7 @@
 
 auth        include     system-login
 -auth       optional    pam_gnome_keyring.so
--auth       optional    pam_kwallet5.so
+#-auth      optional    pam_kwallet5.so
 
 account     include     system-login
 
@@ -28,7 +28,13 @@ session     include     system-login
 # authenticates successfully and then loses the display manager. pam_gnome_keyring
 # forks too but execs, which resets the inherited state, so it is safe and stays.
 #
-# Re-enable it only once wdm runs the PAM session somewhere that holds no
-# graphics state. Until then this line is a crash on any machine with a driver
-# whose atexit handlers touch the GPU.
+# The `-auth` line above is commented out for the same reason, one step earlier:
+# pam_kwallet5's auth module does nothing but stash the password in a pipe for
+# the session module to read, so with the session line gone it does work whose
+# result nothing collects. The two go and come back together — leaving the auth
+# line live would make re-enabling kwallet two half-edits instead of one.
+#
+# Re-enable both only once wdm runs the PAM session somewhere that holds no
+# graphics state. Until then the session line is a crash on any machine with a
+# driver whose atexit handlers touch the GPU.
 #-session    optional    pam_kwallet5.so auto_start

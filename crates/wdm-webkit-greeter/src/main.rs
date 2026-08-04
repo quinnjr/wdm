@@ -909,6 +909,39 @@ mod tests {
             "the bridge stopped assigning wdm.link_dead: {assignment}"
         );
 
+        // `_prompt` is the one contract field that is not a scalar, and the
+        // checks above cannot see that: they match the *name*, and an object
+        // renamed to a string keeps its name. The default theme only ever tests
+        // it for truthiness, so a bridge that started assigning the bare prompt
+        // text would pass every test in this crate while a third-party theme
+        // written against the documented shape rendered "[object Object]" — or,
+        // going the other way, stopped finding `.text` at all. Its members are
+        // therefore pinned here alongside its name.
+        //
+        // Not `id`: the theme has no use for it — `wdm.respond()` answers
+        // whatever is pending — so it is the one member the bridge could drop
+        // without breaking anything documented.
+        let mut prompt = wdm_greeter_client::Prompt::default();
+        prompt.id = 1;
+        prompt.text = "Password:".to_owned();
+        prompt.secret = true;
+        let mut asked = Model::default();
+        asked.prompt = Some(prompt);
+        let mut bridge = Bridge::default();
+        bridge.diff(&asked);
+        let assignment = bridge.flush().expect("nothing was queued").script;
+        assert!(
+            assignment.contains("window.wdm._prompt = {"),
+            "wdm._prompt is no longer assigned an object: {assignment}"
+        );
+        for member in ["\"text\":", "\"secret\":"] {
+            assert!(
+                assignment.contains(member),
+                "wdm._prompt lost {member} — themes.md documents the shape, not \
+                 just the name: {assignment}"
+            );
+        }
+
         // The three callbacks are the other direction: the bridge names them,
         // and a theme that has stopped defining one goes quiet rather than
         // failing.
@@ -918,6 +951,34 @@ mod tests {
                 "the default theme stopped defining {callback}"
             );
         }
+    }
+
+    #[test]
+    fn the_default_theme_only_spends_a_buffered_answer_on_a_masked_prompt() {
+        // A drift check on the one thing the theme holds that the greeter
+        // cannot see: the answer typed before PAM asked for it. It is typed
+        // into an input the theme renders as type="password", and the bridge
+        // sends `kind` as "password" only for a secret prompt — so a
+        // `show_prompt` handler that spends the buffer without looking at
+        // `kind` answers an echo-on question (pam_oath, a username re-prompt)
+        // with the user's password, which the PAM stack logs in the clear.
+        //
+        // Matched on the guard rather than the wording around it, and with
+        // comments stripped, so the check cannot pass on the comment that
+        // describes the rule instead of the code that applies it.
+        let theme = theme_code();
+        let guard = theme
+            .split_once("window.show_prompt")
+            .expect("the default theme stopped defining show_prompt")
+            .1;
+        let spend = guard
+            .find("wdm.respond")
+            .expect("show_prompt no longer answers anything");
+        assert!(
+            guard[..spend].contains("kind === \"password\""),
+            "the default theme spends its buffered answer without checking \
+             whether the prompt is masked"
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! The wire between wdm and its PAM helper.
 //!
-//! wdm runs PAM in a separate, freshly `exec`'d process — see
-//! [`crate::pamhelper`] for why — so the conversation that used to be an
-//! `mpsc` channel between two threads is now a socket between two processes.
-//! This module is the encoding, and nothing else: no PAM, no I/O policy, so it
-//! can be round-tripped in a test without either side existing.
+//! wdm will run PAM in a separate, freshly `exec`'d process, so the
+//! conversation that is today an `mpsc` channel between two threads becomes a
+//! socket between two processes. Nothing runs PAM out of process yet — `auth.rs`
+//! still uses the thread — so this describes where the codec is going, not where
+//! it is. This module is the encoding, and nothing else: no PAM, no I/O policy,
+//! so it can be round-tripped in a test without either side existing.
 //!
 //! ## Why a hand-rolled codec
 //!
@@ -23,11 +24,11 @@
 //! writes half a *packet*, which fails to decode rather than blocking the
 //! reader forever waiting for the rest.
 
-// Nothing sends these yet. The codec is complete and tested on its own, but the
-// two peers that use it — the helper, and the rewritten `AuthHandle` — are not
-// written, so every variant is dead until they are. This allow comes off in the
-// commit that adds `pamhelper`, and if it is still here without one, the wire
-// was built and then abandoned.
+// ponytail: nothing sends these yet. The codec is complete and tested on its
+// own, but the two peers that use it — the helper, and the rewritten
+// `AuthHandle` — are not written, so every variant is dead until they are. This
+// allow comes off in the commit that adds `pamhelper`, and if it is still here
+// without one, the wire was built and then abandoned.
 #![allow(dead_code)]
 
 use zeroize::Zeroize;
@@ -37,10 +38,16 @@ use crate::auth::PromptStyle;
 /// Largest message the wire accepts, in bytes.
 ///
 /// Everything crossing here is a prompt, a password or a session's environment,
-/// all of which are small. The bound exists so that a corrupt length field
-/// cannot make the reader allocate arbitrarily; it is a sanity limit, not a
-/// tuned one. `SOCK_SEQPACKET` on Linux will refuse to send more than the
-/// socket buffer anyway, so a message this large fails at the sender.
+/// all of which are small. It is a sanity limit, not a tuned one:
+/// `SOCK_SEQPACKET` on Linux will refuse to send more than the socket buffer
+/// anyway, so a message this large fails at the sender.
+///
+/// This bounds the *datagram*. What stops a corrupt length field inside one from
+/// making the decoder allocate arbitrarily is [`Reader`], which resolves every
+/// field against the bytes actually present and fails rather than reserving.
+/// The two are separate guards and neither implies the other — this constant is
+/// `pub`, so it is checked in [`Msg::decode`] rather than left as documentation
+/// a caller could reasonably take for enforcement.
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
 /// A message in either direction.
@@ -281,6 +288,13 @@ impl Msg {
     /// The caller is expected to zeroize `bytes` afterwards when it may have
     /// held a response; this borrows rather than consuming so that it can.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        // Refused before a tag is even read. Nothing legitimate is this large,
+        // and the alternative is that MAX_MESSAGE is a `pub` constant carrying a
+        // safety rationale that nothing on this side honours.
+        if bytes.len() > MAX_MESSAGE {
+            return None;
+        }
+
         let mut r = Reader::new(bytes);
         let msg = match r.u8()? {
             TAG_RESPONSE => Self::Response {
@@ -445,6 +459,28 @@ mod tests {
         put_u32(&mut bytes, u32::MAX);
         bytes.extend_from_slice(b"short");
         assert!(Msg::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn an_oversized_datagram_is_refused_before_it_is_parsed() {
+        // MAX_MESSAGE is `pub` and documents itself as a bound, so it has to be
+        // one. A well-formed message that is merely too big is still refused —
+        // the limit is on the datagram, not on whether the contents make sense.
+        // A reason long enough to push the whole encoded message one byte over.
+        let overhead = Msg::Failed(String::new()).encode().len();
+        let padding = MAX_MESSAGE + 1 - overhead;
+        let bytes = Msg::Failed("x".repeat(padding)).encode();
+        assert_eq!(bytes.len(), MAX_MESSAGE + 1);
+        assert!(
+            Msg::decode(&bytes).is_none(),
+            "a datagram over MAX_MESSAGE decoded anyway"
+        );
+
+        // And exactly at the limit still decodes, so the bound is not off by one
+        // in the direction that silently drops real messages.
+        let at_limit = Msg::Failed("x".repeat(padding - 1)).encode();
+        assert_eq!(at_limit.len(), MAX_MESSAGE);
+        assert!(Msg::decode(&at_limit).is_some());
     }
 
     #[test]

@@ -25,6 +25,13 @@ const PADDING: i32 = 32;
 pub const MENU_ROWS: usize = 6;
 const MENU_ROW_HEIGHT: i32 = 28;
 
+/// Characters of an echoed answer kept on screen, counted from the end.
+///
+/// Comfortably more than the field is wide, so the clip and not this decides
+/// what the user sees; this is only what stops the layout pass growing with an
+/// answer nothing bounds.
+const VISIBLE_TAIL: usize = 64;
+
 const TITLE_SIZE: f32 = 26.0;
 const BODY_SIZE: f32 = 17.0;
 const SMALL_SIZE: f32 = 14.0;
@@ -99,29 +106,46 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     y += SMALL_SIZE * 1.8;
 
     let field_height = (BODY_SIZE * 1.9) as i32;
-    canvas.rect(
-        panel_x + PADDING,
-        y as i32,
-        PANEL_WIDTH - PADDING * 2,
-        field_height,
-        FIELD,
-    );
+    let field_x = panel_x + PADDING;
+    let field_width = PANEL_WIDTH - PADDING * 2;
+    canvas.rect(field_x, y as i32, field_width, field_height, FIELD);
 
     let shown = if view.secret {
         // Fixed-width mask: revealing the length of a password is a small leak,
         // but showing nothing at all leaves the user unsure the keyboard works.
         "•".repeat(view.answer.chars().count().min(32))
     } else {
-        view.answer.to_owned()
+        // An echoed answer is windowed to its tail rather than shown whole, for
+        // the same reason the mask is capped. Nothing bounds what PAM's echo-on
+        // questions get typed into them, and the whole string was laid out and
+        // blended on every keystroke — O(n) per key, O(n²) over the answer — on
+        // the one path a login screen actually exercises. The tail is the end
+        // the caret is at, so typing still echoes what was just typed.
+        let count = view.answer.chars().count();
+        view.answer
+            .chars()
+            .skip(count.saturating_sub(VISIBLE_TAIL))
+            .collect()
     };
 
     let text_y = y + (field_height as f32 - BODY_SIZE) / 2.0 - 2.0;
     let shown = text::Shaped::new(&shown, BODY_SIZE);
-    shown.draw(canvas, left + 8.0, text_y, TEXT);
+    // Clipped to the field: the window above bounds the work, but a wide glyph
+    // run still overhangs, and `Shaped::draw` on its own is bounded only by the
+    // canvas — so the overhang landed on the rest of the form.
+    let field = text::Clip {
+        x0: field_x,
+        y0: y as i32,
+        x1: field_x + field_width,
+        y1: y as i32 + field_height,
+    };
+    shown.draw_clipped(canvas, left + 8.0, text_y, TEXT, Some(field));
 
-    // Caret, so an empty field still looks focused.
-    let caret_x = left + 8.0 + shown.width() + 1.0;
-    canvas.rect(caret_x as i32, text_y as i32, 2, BODY_SIZE as i32, ACCENT);
+    // Caret, so an empty field still looks focused. Pinned inside the field for
+    // the same reason: `Canvas::rect` clips to the canvas, not to the widget.
+    let caret_x = (left + 8.0 + shown.width() + 1.0) as i32;
+    let caret_x = caret_x.min(field.x1 - 2);
+    canvas.rect(caret_x, text_y as i32, 2, BODY_SIZE as i32, ACCENT);
 
     y += field_height as f32 + BODY_SIZE * 1.4;
 
@@ -389,6 +413,70 @@ mod tests {
                 ..view()
             },
         );
+    }
+
+    #[test]
+    fn an_echoed_answer_stays_inside_its_field() {
+        if !text::have_font() {
+            // The whole point is where the ink lands, so a host with no font
+            // must say it proved nothing rather than pass quietly.
+            eprintln!("skipped: no font available");
+            return;
+        }
+
+        // The defect this guards: an echo-on prompt's answer was drawn whole
+        // and clipped only by the canvas, so a long one wrote across the form
+        // and off the panel.
+        let (w, h) = (800, 600);
+        let empty = render(w, h, "");
+        let long = render(w, h, &"W".repeat(4096));
+
+        let differing: Vec<(i32, i32)> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let o = ((y * w + x) * 4) as usize;
+                empty.data[o..o + 4] != long.data[o..o + 4]
+            })
+            .collect();
+
+        assert!(
+            !differing.is_empty(),
+            "nothing was echoed, so containment proves nothing"
+        );
+
+        let panel_x = (w - PANEL_WIDTH) / 2;
+        let panel_y = (h - PANEL_HEIGHT) / 2;
+        let (top, bottom) = (
+            differing.iter().map(|p| p.1).min().unwrap(),
+            differing.iter().map(|p| p.1).max().unwrap(),
+        );
+        for &(x, y) in &differing {
+            assert!(
+                x >= panel_x + PADDING
+                    && x < panel_x + PANEL_WIDTH - PADDING
+                    && y >= panel_y
+                    && y < panel_y + PANEL_HEIGHT,
+                "the answer drew outside the panel at {x},{y}"
+            );
+        }
+        assert!(
+            bottom - top < (BODY_SIZE * 1.9) as i32,
+            "the answer drew outside the field's height: rows {top}..={bottom}"
+        );
+    }
+
+    /// Paint one form whose only variable is the echoed answer.
+    fn render(w: i32, h: i32, answer: &str) -> Canvas {
+        let mut canvas = Canvas::new(w, h);
+        paint(
+            &mut canvas,
+            &View {
+                answer,
+                secret: false,
+                ..view()
+            },
+        );
+        canvas
     }
 
     #[test]

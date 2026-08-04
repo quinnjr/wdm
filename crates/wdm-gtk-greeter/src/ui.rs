@@ -75,8 +75,13 @@ pub struct Ui {
     /// True once `start_session` has been sent; the compositor tears this
     /// process down shortly afterwards.
     launched: Cell<bool>,
-    /// Guards the automatic retry, so a user switch mid-flight does not stack
-    /// conversations.
+    /// Whether a conversation is in flight.
+    ///
+    /// Guards `begin_auth` against re-entry, so a second `submit` while PAM is
+    /// still working does not open a conversation on top of the live one, and
+    /// makes the end-of-conversation reset in `refresh` fire once on the
+    /// transition rather than on every later revision — which would clear the
+    /// entry under someone already typing their next attempt.
     attempting: Cell<bool>,
     /// The user and session lists arrive exactly once, in the enumerate phase
     /// Link::connect already waited for, so loading them is a latch. Asking the
@@ -413,12 +418,17 @@ impl Ui {
         if self.launched.get() {
             return;
         }
-        // Idempotent while an attempt is in flight. `reload_lists` emits
-        // notify::selected, whose handler starts a conversation, and build()
-        // then asks for one itself — without this the greeter opens two before
-        // the user has touched anything, burning a rate-limit slot and making
-        // PAM do every attempt twice. The paths that restart deliberately
-        // (user switch, auto-retry) clear the flag first.
+        // Idempotent while an attempt is in flight, which is what makes a second
+        // `submit` harmless: between `create_session` and PAM's first question
+        // there is no prompt to answer, so another Enter — or a click on the
+        // button — takes the "start an attempt" branch again, and without this
+        // the greeter would open a second conversation, burning a rate-limit
+        // slot and making PAM do every attempt twice. `submit` tests the same
+        // flag before it gets here; this is the assertion that `begin_auth`
+        // itself is safe to call twice, so that guard is an optimisation and not
+        // the only thing standing between a fast typist and a doubled attempt.
+        // `abandon_attempt`, the one path that deliberately starts over, clears
+        // the flag first.
         if self.attempting.get() {
             return;
         }
@@ -522,15 +532,27 @@ impl Ui {
     /// for the next 16ms tick to show it is a needless frame of staleness — so
     /// refresh here, after every borrow is released.
     ///
-    /// That makes flush -> refresh -> flush a cycle: refresh's auto-retry branch
-    /// calls begin_auth and flushes again. The revision guard does *not* bound
-    /// it — begin_auth ends in begin_attempt, which bumps the revision, so the
-    /// guard never fires on the nested call. In practice it stops because a
-    /// request flushed a microsecond ago has no reply to dispatch yet and `pump`
-    /// returns false, which is a property of the Wayland round-trip rather than
-    /// anything this code enforces. `depth` enforces it: past a handful of
-    /// nested entries the retry is abandoned and the timer in main.rs picks the
-    /// model up on its next tick, 16ms later.
+    /// That makes flush -> refresh -> flush a cycle. The one branch that closes
+    /// it today is the buffered answer: `refresh` spends `pending_answer` on the
+    /// prompt that just arrived, sends `respond`, and flushes to get it moving
+    /// rather than waiting for the next tick.
+    ///
+    /// Two things bound that, and neither is `depth`. The buffer is spent with
+    /// `take()`, so the branch cannot be entered twice for one answer; and the
+    /// branch does not call `begin_attempt`, so it does not bump the revision —
+    /// which means `refresh`'s `applied` guard is live on the nested call and
+    /// returns immediately unless the pump genuinely delivered something new.
+    /// (This is where the old auto-retry differed: it went through
+    /// `begin_attempt`, bumped the revision itself, and walked straight past the
+    /// guard on every nested entry.)
+    ///
+    /// `depth` is still load-bearing, because both of those bounds are
+    /// properties of the branches that happen to exist rather than of this
+    /// function. Any future path that changes the model and flushes — the
+    /// auto-retry was exactly that — re-arms the recursion, and a login screen
+    /// that overflows its stack is a machine nobody can log into. Past a handful
+    /// of nested entries the flush is abandoned and the timer in main.rs picks
+    /// the model up on its next tick, 16ms later.
     fn flush(&self) {
         const MAX_DEPTH: u32 = 4;
 
@@ -616,7 +638,12 @@ impl Ui {
             // stack that asks twice must get the second answer from the user,
             // and a password silently resubmitted to a second question would be
             // the same secret sent somewhere it was never typed for.
-            let buffered = self.pending_answer.borrow_mut().take();
+            //
+            // Which is enforced, not merely intended: see [`spend_buffered`].
+            // The buffer is emptied either way and only ever answers a masked
+            // question, because it was typed into an entry this greeter builds
+            // masked and an echo-on prompt is a different question.
+            let buffered = spend_buffered(self.pending_answer.borrow_mut().take(), prompt.secret);
             if let Some(answer) = buffered {
                 {
                     let model = self.model.borrow();
@@ -632,6 +659,13 @@ impl Ui {
             }
 
             self.prompt.set_label(&prompt.text);
+            // Whatever is already in the entry was typed while it was masked,
+            // so it is a password. Unmasking it for an echo-on question would
+            // put it on screen — the same hazard `spend_buffered` refuses the
+            // buffer for, one field along.
+            if !prompt.secret {
+                self.entry.set_text("");
+            }
             // PAM decides whether the answer is a secret; a token or a username
             // prompt is echoed, a password is not.
             self.entry.set_visibility(!prompt.secret);
@@ -671,9 +705,17 @@ impl Ui {
     /// Drop the form back to "your move": no attempt in flight, the entry live
     /// again, and a prompt that says what to do next.
     ///
-    /// Shared by the two places that end an attempt without starting another —
-    /// `refresh()`'s "PAM explained itself" branch and `launch()`'s no-session
-    /// fallback — so the state they leave behind cannot drift apart.
+    /// The one description of that state, shared by everything that arrives at
+    /// it, so they cannot drift apart: `build()` on first paint, since nothing
+    /// opens a conversation on the user's behalf any more; `abandon_attempt()`
+    /// when the user switches account; `submit()` when the link is dead and the
+    /// attempt cannot be made at all; `refresh()` when a conversation has ended
+    /// without authenticating; and `launch()`'s no-session fallback.
+    ///
+    /// First paint reaching here is why [`wait_prompt`] takes `attempted`: the
+    /// idle state and the state after a refusal are the same widgets in the same
+    /// configuration, and the only thing that differs is whether there is
+    /// anything to try *again*.
     ///
     /// What that prompt says is [`wait_prompt`]'s decision — one of the states
     /// that reaches here is a lost connection, and there is nothing to try
@@ -685,9 +727,11 @@ impl Ui {
     /// which is exactly the state the no-session fallback is in.
     ///
     /// It is turned *off* here for the one state that is terminal rather than
-    /// merely idle. A lost link reaches this through `refresh`'s "PAM explained
-    /// itself" branch — `link_lost` pushes a notice and ends the conversation —
-    /// so this is where the transition is observed, and an entry the user can
+    /// merely idle. A lost link reaches this through `refresh`'s
+    /// end-of-conversation branch — `link_lost` pushes a notice and sets
+    /// `conversation_over` — or through `submit`'s dead-link guard, whichever
+    /// the user hits first, so this is where the transition is observed on every
+    /// path into it, and an entry the user can
     /// still type into is an invitation to an attempt `submit` will only refuse.
     /// The default webkit theme disables the same controls in `giveUp`.
     fn wait_for_user(&self) {
@@ -808,6 +852,21 @@ fn unusable_reason(no_users: bool, no_sessions: bool) -> Option<&'static str> {
     }
 }
 
+/// What a buffered answer may be spent on: a masked prompt, and nothing else.
+///
+/// The buffer holds what was typed into an entry this greeter builds masked and
+/// keeps masked between attempts, so it is a password. wdm forwards
+/// `PAM_PROMPT_ECHO_ON` as a non-secret prompt, and a stack whose first
+/// answerable question is echo-on — pam_oath's token, a username re-prompt —
+/// would otherwise be handed that password as the answer to a question it was
+/// never typed for, where the stack's own failure logging records it in the
+/// clear. So an echo-on prompt gets nothing and is put on screen for the user
+/// to answer, and the buffer is dropped rather than held for a later question:
+/// it was typed for the one that did not arrive.
+fn spend_buffered(buffered: Option<String>, secret: bool) -> Option<String> {
+    buffered.filter(|_| secret)
+}
+
 /// What to tell the user when an attempt has ended and none has replaced it.
 ///
 /// "Try again" is offered only while there is something to try against: after
@@ -894,6 +953,26 @@ mod tests {
         restore_enumerate_error(&mut model, Some("session ended: crashed".to_owned()));
 
         assert_eq!(model.error.as_deref(), Some("Authentication failure"));
+    }
+
+    #[test]
+    fn a_buffered_password_is_only_spent_on_a_masked_prompt() {
+        // The defect this guards: `refresh` took the buffer for any prompt at
+        // all. The entry is masked while it is typed into, so the buffer is a
+        // password; an echo-on first question — pam_oath, a username re-prompt
+        // — was answered with it, putting the password into the PAM stack's
+        // failure logging in the clear.
+        assert_eq!(
+            spend_buffered(Some("hunter2".to_owned()), true).as_deref(),
+            Some("hunter2"),
+            "the masked prompt is the one the buffer exists for"
+        );
+        // Dropped rather than kept: it was typed for the question that did not
+        // arrive, so the next one must be answered by the user. `refresh` then
+        // falls through and displays the prompt, which is the widget half and
+        // needs a display to observe.
+        assert_eq!(spend_buffered(Some("hunter2".to_owned()), false), None);
+        assert_eq!(spend_buffered(None, true), None);
     }
 
     #[test]
@@ -1019,32 +1098,57 @@ mod tests {
         // wdm-webkit-greeter's `the_default_theme_uses_the_api_it_is_shipped_with`.
         // The reference greeter paints these in Rust of its own and the default
         // theme writes them in JavaScript, so neither can share the constants
-        // above; what they can do is fail the build when one of the three is
-        // changed alone. Matched on the message text only — the code around it
-        // in either file is free to change.
+        // above; what they can do is fail the build when one of them is changed
+        // alone. Matched on the message text only — the code around it in either
+        // file is free to change.
+        //
+        // Everything the three greeters say to the user in words of their own
+        // belongs here: the two `unusable_reason` values, all four states of
+        // `wait_prompt`, and the empty-submit refusal. A message that is not in
+        // this test is a message the default theme can be left behind on, and
+        // the way that is discovered is a user reading two different sentences
+        // for the same condition on two machines.
         let reference = include_str!("../../wdm-greeter/src/main.rs");
         let theme = include_str!("../../wdm-webkit-greeter/themes/default/theme.js");
 
-        for reason in [
+        // What all three say. The last is the empty-submit refusal, which the
+        // reference greeter writes into `self.error` and this greeter writes
+        // straight onto the prompt label; it is spelled out rather than read
+        // from a constant because `submit` inlines it, and extracting it would
+        // be a helper with one caller when the literal is the thing that drifts.
+        for shared in [
             unusable_reason(true, false).unwrap(),
             unusable_reason(false, true).unwrap(),
+            "Enter your password",
         ] {
             assert!(
-                reference.contains(reason),
-                "wdm-greeter no longer says {reason:?}"
+                reference.contains(shared),
+                "wdm-greeter no longer says {shared:?}"
             );
             assert!(
-                theme.contains(reason),
-                "the default theme no longer says {reason:?}"
+                theme.contains(shared),
+                "the default theme no longer says {shared:?}"
             );
         }
 
-        // Only the theme is checked for this one: the reference greeter has no
-        // wording for a lost link at all — it ends when its dispatch does.
-        let lost = wait_prompt(false, true);
-        assert!(
-            theme.contains(lost),
-            "the default theme no longer says {lost:?}"
-        );
+        // Only the theme is checked for the idle-state wording: the reference
+        // greeter has no line of its own for any of these. It shows PAM's
+        // prompt verbatim and "Waiting…" when there is none, and it has no
+        // wording for a lost link at all — it ends when its dispatch does. So
+        // this is a two-way check where the loop above is three-way, and that
+        // is a fact about the reference greeter rather than an oversight.
+        //
+        // Every arm, not just the terminal one: `wait_prompt` gained "Password"
+        // when the greeter stopped opening a conversation before the user asked,
+        // and that arm is what the login screen sits in for as long as nobody
+        // touches the machine — the most-seen string in the whole greeter, and
+        // the one that was unchecked.
+        for (link_alive, attempted) in [(false, false), (false, true), (true, false), (true, true)] {
+            let line = wait_prompt(link_alive, attempted);
+            assert!(
+                theme.contains(line),
+                "the default theme no longer says {line:?}"
+            );
+        }
     }
 }

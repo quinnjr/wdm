@@ -234,6 +234,16 @@ impl Login {
         self.auth = None;
         self.pending_prompt = None;
         self.chosen = None;
+
+        // Timers live on the long-lived LoopHandle, which outlives this login
+        // generation and every one after it. Bumping the generation only makes
+        // the closure a no-op when it fires; the source itself stays registered,
+        // so a cooldown armed before a successful login is still sitting in the
+        // event loop for the whole of the user's session. Drop it here, the same
+        // way report_failure_after drops the one it is replacing.
+        if let Some(token) = self.failure_timer.take() {
+            self.loop_handle.remove(token);
+        }
     }
 
     /// Forget every bound object, used when the greeter process is gone.
@@ -380,6 +390,26 @@ impl Login {
             }
 
             AuthEvent::Failed(reason) => {
+                // Same guard as the Prompt and Ok arms, and load-bearing for two
+                // separate reasons. Cancelling is how the PAM thread is told to
+                // stop: `reset` drops the handle, the conversation's `recv`
+                // fails, and PAM unwinds through CONV_ERR into exactly this
+                // event. Without the guard a cancel produces the `auth_failed`
+                // the XML promises will not follow — `report_failure_after`
+                // captures the *post*-reset generation, so the timer's
+                // generation-and-phase check passes and the still-bound greeter
+                // is told its abandoned attempt failed.
+                //
+                // It would also charge the cancellation: switching user in a
+                // greeter cancels, so every account switch would accrue a
+                // failure and a cooldown for a login nobody attempted — the same
+                // class of bug as an idle greeter walking an account into
+                // pam_faillock's lockout.
+                if self.auth.is_none() {
+                    log::debug!("discarding auth_failed for an abandoned attempt");
+                    return Action::None;
+                }
+
                 self.auth = None;
                 self.pending_prompt = None;
 
@@ -987,6 +1017,7 @@ mod tests {
         pub const USER: u16 = 0;
         pub const DONE: u16 = 4;
         pub const AUTH_OK: u16 = 6;
+        pub const AUTH_FAILED: u16 = 7;
         pub const DEFAULT_SESSION: u16 = 8;
 
         pub struct Message {
@@ -1318,6 +1349,7 @@ mod tests {
             ),
             (wire::DONE, "done", &[][..]),
             (wire::AUTH_OK, "auth_ok", &[][..]),
+            (wire::AUTH_FAILED, "auth_failed", &[str_arg][..]),
             (wire::DEFAULT_SESSION, "default_session", &[str_arg][..]),
         ] {
             let event = events
@@ -1407,6 +1439,85 @@ mod tests {
                 .iter()
                 .any(|m| m.opcode == wire::DONE),
             "the enumerate phase never ended"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_attempt_is_neither_reported_nor_charged() {
+        // The XML says of `cancel`: "Aborts the PAM conversation. No auth_ok or
+        // auth_failed follows." But cancelling is *implemented* by dropping the
+        // AuthHandle, which makes the PAM thread's `recv` fail, which unwinds
+        // through CONV_ERR and arrives here as AuthEvent::Failed. So the one
+        // event the protocol promises will not follow a cancel is precisely the
+        // event a cancel generates.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+
+        h.state.login.phase = Phase::Authenticating;
+        let before = h.state.login.failures;
+
+        // What Wdm::cancel does, and what a greeter reaches by destroying its
+        // object or by dying and being respawned.
+        h.state.login.reset();
+        h.state.login.handle_auth_event(AuthEvent::Failed(
+            "Authentication failure".to_owned(),
+        ));
+
+        // The accounting half. Switching user in a greeter cancels, so charging
+        // a cancellation accrues rate-limit penalties for logins nobody
+        // attempted.
+        assert_eq!(
+            h.state.login.failures, before,
+            "a cancelled attempt was charged as a failure"
+        );
+        assert!(
+            h.state.login.cooldown_until.is_none(),
+            "a cancelled attempt armed the rate limit"
+        );
+
+        // The reporting half. The broadcast itself is deferred onto a timer, and
+        // this harness never dispatches its event loop, so the wire alone cannot
+        // see it — assert instead that nothing was ever armed to send it. Phase
+        // and timer together are what report_failure_after sets, and the timer's
+        // own guard (generation and Cooldown) would pass, because reset bumped
+        // the generation *before* the event arrived.
+        assert_eq!(
+            h.state.login.phase,
+            Phase::Idle,
+            "a cancelled attempt entered Cooldown, which arms auth_failed"
+        );
+        assert!(
+            h.state.login.failure_timer.is_none(),
+            "a cancelled attempt armed a deferred auth_failed"
+        );
+
+        // And the immediate path — report_failure_after broadcasts inline when
+        // the timer cannot be armed — really did not fire.
+        h.dispatch();
+        client.pump();
+        assert!(
+            !client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::AUTH_FAILED),
+            "auth_failed reached a greeter that had cancelled"
+        );
+    }
+
+    #[test]
+    fn reset_tears_down_the_backoff_timer() {
+        // Timers are registered on the long-lived LoopHandle, which survives the
+        // handoff into the user's session. The generation check only makes the
+        // closure a no-op; the source stays registered and would sit in the next
+        // login generation's event loop.
+        let mut login = login();
+        login.report_failure_after("nope".to_owned(), Duration::from_secs(10));
+        assert!(login.failure_timer.is_some(), "nothing was armed to test");
+
+        login.reset();
+        assert!(
+            login.failure_timer.is_none(),
+            "a backoff timer outlived the attempt that armed it"
         );
     }
 

@@ -4,7 +4,15 @@
 //! invoked from inside libpam. It cannot be driven from an event loop, so each
 //! authentication attempt gets a thread. The conversation forwards each question
 //! to the event loop over a [`calloop::channel`] and blocks on an [`mpsc`]
-//! receiver for the answer.
+//! receiver for the answer — with a deadline, [`RESPONSE_TIMEOUT`], so a greeter
+//! that stops answering cannot pin a thread and a PAM transaction forever.
+//!
+//! On that deadline wdm composes an `error` prompt of its own before returning
+//! `PAM_CONV_ERR`, so not every [`AuthEvent::Prompt`] originates from a PAM
+//! module. That matters to readers of the other end: `handle_auth_event` routes
+//! wdm's synthetic prompt exactly like PAM's, which is the point — it is the
+//! event that tells a greeter the failure was explained and stops it
+//! auto-retrying into an account lockout.
 //!
 //! Cancellation is expressed by dropping [`AuthHandle`]: both command senders
 //! close, the conversation's `recv` fails, it returns `PAM_CONV_ERR`, and PAM
@@ -271,9 +279,11 @@ impl AuthHandle {
 
 /// The auth thread body.
 ///
-/// Runs to completion in one of four ways: authentication fails, session
-/// opening fails, the session ends normally, or the handle is dropped and every
-/// `recv` starts failing.
+/// Runs to completion in one of five ways: authentication fails, session
+/// opening fails, the session ends normally, the handle is dropped and every
+/// `recv` starts failing, or a prompt goes unanswered for [`RESPONSE_TIMEOUT`]
+/// and the conversation abandons it — which reaches the event loop as an
+/// ordinary [`AuthEvent::Failed`], preceded by the `error` prompt that says why.
 fn run(
     username: &str,
     tty: &str,
@@ -775,6 +785,57 @@ mod tests {
 
         let answer = worker.join().unwrap().unwrap();
         assert_eq!(answer.to_str().unwrap(), "fresh");
+    }
+
+    #[test]
+    fn stale_responses_cannot_extend_the_deadline() {
+        // RESPONSE_TIMEOUT is documented as measured from when the prompt was
+        // emitted, not from the last message received, and that is the whole
+        // leak guard: a peer that can restart the clock by sending anything can
+        // pin the thread and the PAM transaction forever. The guarantee comes
+        // from computing `deadline` once, before the loop — move it inside and
+        // both of the other timeout tests stay green, because one never
+        // approaches the deadline and the other sends nothing at all.
+        let (mut conv, responses, events) = conversation_with_timeout(Duration::from_millis(50));
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let mut prompts = PromptStream::new(events);
+        let (id, _, _) = prompts.next();
+
+        // Mismatched ids, so each one is discarded and the loop goes round
+        // again. Faster than the timeout, so a per-message deadline would never
+        // be reached and this test would hang rather than fail — which the join
+        // below turns into a visible timeout either way.
+        let chatter = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < until {
+                if responses
+                    .send(PromptResponse {
+                        id: id.wrapping_add(1000),
+                        secret: "stale".to_owned(),
+                    })
+                    .is_err()
+                {
+                    // The conversation gave up and dropped the receiver, which
+                    // is the outcome under test.
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(worker.join().unwrap().unwrap_err(), ErrorCode::CONV_ERR);
+        let waited = started.elapsed();
+        chatter.join().unwrap();
+
+        // Near the deadline, not a multiple of it. Generous upwards because a
+        // loaded CI box schedules threads late; the assertion that matters is
+        // that it did not run for the two seconds of chatter.
+        assert!(
+            waited < Duration::from_millis(1500),
+            "stale responses extended the deadline: waited {waited:?}"
+        );
     }
 
     #[test]

@@ -186,6 +186,15 @@ fn create_cache_dir_at(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::i
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
 
+    // Only the leaf gets 0700. `DirBuilder::mode` applies to *every* component
+    // it creates, so a recursive create of the whole path on a system without
+    // /var/cache would leave /var/cache itself root-owned and root-only, and
+    // every other package that expects to write there would break. The parent is
+    // created at the default mode, and normally exists already.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(dir)?;
@@ -194,12 +203,15 @@ fn create_cache_dir_at(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::i
     // path, and the descriptor is opened `O_NOFOLLOW`.
     //
     // This directory outlives a boot and is owned by an unprivileged account for
-    // all of it, which the runtime directory on tmpfs is not. A greeter that is
-    // compromised once could replace it with a symlink and wait: the next boot,
-    // root would chmod and chown whatever that symlink pointed at. `O_NOFOLLOW`
-    // turns that into ELOOP here instead, and `recursive(true)` is what makes it
-    // reachable — it returns Ok for an existing path rather than EEXIST, so a
-    // symlink survives the create and has to be caught on the open.
+    // all of it, which the runtime directory on tmpfs is not. If the greeter
+    // account ever gains write access to the parent — a packaging mistake, or a
+    // deployment that puts the cache somewhere group-writable; /var/cache itself
+    // is root-owned 0755, so this is a precondition and not a given — then a
+    // compromised greeter could replace the directory with a symlink and wait
+    // for the next boot, when root would chmod and chown whatever it pointed at.
+    // `O_NOFOLLOW` turns that into ELOOP here instead, and `recursive(true)` is
+    // what makes it reachable — it returns Ok for an existing path rather than
+    // EEXIST, so a symlink survives the create and has to be caught on the open.
     let handle = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1254,6 +1266,28 @@ mod tests {
         create_cache_dir_at(&dir, uid, gid).unwrap();
         let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(std::os::unix::fs::MetadataExt::mode(&meta) & 0o777, 0o700);
+    }
+
+    #[test]
+    fn creating_the_cache_dir_does_not_lock_down_its_parent() {
+        // DirBuilder::mode applies to every component it creates, so a recursive
+        // create with 0700 on a system without /var/cache would leave that
+        // root-owned and root-only and break every other package that writes
+        // there. Only the leaf may be tightened.
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("var-cache");
+        let dir = parent.join("wdm");
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        create_cache_dir_at(&dir, uid, gid).unwrap();
+
+        let parent_mode =
+            std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&parent).unwrap()) & 0o777;
+        assert_ne!(parent_mode, 0o700, "the parent must not inherit the leaf's mode");
+        assert!(parent_mode & 0o055 != 0, "the parent stays traversable: {parent_mode:o}");
+
+        let leaf = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&dir).unwrap()) & 0o777;
+        assert_eq!(leaf, 0o700);
     }
 
     #[test]

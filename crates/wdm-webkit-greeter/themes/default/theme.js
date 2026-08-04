@@ -1,6 +1,6 @@
 // The default theme's logic, and the reference for what a theme must do.
 //
-// The greeter calls four globals — show_prompt, show_message,
+// The greeter calls three globals — show_prompt, show_message,
 // authentication_complete and nothing else — and everything a theme asks for
 // goes through window.wdm. There is no other channel.
 
@@ -67,10 +67,13 @@ const replaceText = (id, text) => {
 // too long, so the oldest news the user still needs stays put while the newest
 // arrives.
 //
-// ponytail: more than six messages in one conversation lose the second onward,
-// silently — a stack running pam_faillock, pam_pwquality, a motd and a
-// last-login line can reach that in a single attempt. The screen has no scroll
-// by design, which is what forces a cap at all; a scrollable message region
+// ponytail: more than six messages of one severity in a single conversation
+// lose the second onward, silently — a stack running pam_faillock,
+// pam_pwquality, a motd and a last-login line can reach that in a single
+// attempt. Six *per severity*, not six in total: the cap is applied to the
+// element, and show_message routes by severity into two of them, so the real
+// ceiling is six errors and six infos side by side. The screen has no scroll by
+// design, which is what forces a cap at all; a scrollable message region
 // removes the need for one.
 const MAX_MESSAGES = 6;
 const appendText = (id, text, kind) => {
@@ -215,21 +218,31 @@ window.show_prompt = (text, kind) => {
   // question that wants one, so from their side they typed a password, pressed
   // Enter, and it was checked.
   //
-  // Cleared before it is sent, not after: it is worth exactly one prompt. A
-  // stack that asks twice must get the second answer from the user, and
-  // silently resending the password would be putting that secret somewhere it
-  // was never typed for.
-  if (pendingAnswer !== null) {
-    const answer = pendingAnswer;
-    pendingAnswer = null;
+  // Only ever spent on a masked question, which is what `kind` is checked for.
+  // It was typed into an input this theme renders as type="password", so it is
+  // a password; wdm forwards PAM_PROMPT_ECHO_ON as a non-password kind, and a
+  // stack whose first answerable question is echo-on — pam_oath's token, a
+  // username re-prompt — would otherwise be answered with that password, which
+  // the stack then logs in the clear.
+  //
+  // Cleared either way, and before it is sent rather than after: it is worth
+  // exactly one prompt. A stack that asks twice must get the second answer from
+  // the user, and a buffer that outlives the prompt it was refused for is a
+  // password held for a question nobody asked.
+  const buffered = pendingAnswer;
+  pendingAnswer = null;
+  if (buffered !== null && kind === "password") {
     el("prompt").textContent = "Checking…";
     el("answer").disabled = true;
-    wdm.respond(answer);
+    wdm.respond(buffered);
     return;
   }
 
   el("prompt").textContent = text;
   el("answer").type = kind === "password" ? "password" : "text";
+  // Cleared before the type changes for the same reason the buffer is refused:
+  // anything typed while the input was masked is a password, and an echo-on
+  // question would put it on screen.
   el("answer").value = "";
   el("answer").disabled = false;
   el("answer").focus();
@@ -285,8 +298,16 @@ form.addEventListener("submit", (event) => {
   // With a prompt pending this answers it; otherwise it is the user asking to
   // log in, which is the only thing that opens a conversation.
   if (wdm._prompt) {
+    // Read, clear, then send. Disabling the input does not empty it, and an
+    // answer left in the DOM sits in the WebKit web process — a separate
+    // address space from the greeter — for as long as the page is up, which on
+    // the success path is until the compositor tears this process down for the
+    // handoff. The clear on the way in is what makes every later state empty
+    // without any of them having to remember to clear it.
+    const answer = el("answer").value;
+    el("answer").value = "";
     el("answer").disabled = true;
-    wdm.respond(el("answer").value);
+    wdm.respond(answer);
   } else {
     // Enter on an empty field is not a login attempt and must not cost one:
     // it would run the whole PAM stack against an empty password, fail, and

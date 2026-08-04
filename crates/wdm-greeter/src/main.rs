@@ -12,7 +12,6 @@
 mod text;
 mod ui;
 
-use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -168,8 +167,6 @@ struct App {
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
     greeter: Option<WdmGreeterV1>,
-    /// Outputs by registry name, so a rank can be resolved to an object.
-    outputs: HashMap<u32, WlOutput>,
 
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
@@ -229,7 +226,6 @@ impl App {
             shm: None,
             layer_shell: None,
             greeter: None,
-            outputs: HashMap::new(),
             surface: None,
             layer_surface: None,
             buffers: None,
@@ -444,30 +440,45 @@ impl App {
                 self.error = Some(text);
                 self.blocked = true;
             }
+            // A question, of one kind or the other. PAM decides which is a
+            // secret: a password is masked, a token or a username re-prompt is
+            // echoed.
             style => {
+                let secret = style == PromptStyle::Secret;
                 // The answer the user gave before PAM had asked for it. Spent
                 // on the first question that wants one, so from their side they
                 // typed a password, pressed Enter, and it was checked.
                 //
-                // `take()` rather than a peek: it is worth exactly one prompt. A
-                // stack that asks twice must get the second answer from the
-                // user, and silently resending the password would be putting
-                // that secret somewhere it was never typed for.
-                if let (Some(answer), Some(greeter)) =
-                    (self.pending_answer.take(), &self.greeter)
-                {
+                // Only ever spent on a masked question, and that is enforced,
+                // not merely intended: see [`spend_buffered`]. The buffer is
+                // emptied either way — it is worth exactly one prompt, a stack
+                // that asks twice must get the second answer from the user, and
+                // a buffer that outlives the prompt it was refused for is a
+                // password held for a question nobody asked.
+                let buffered = spend_buffered(self.pending_answer.take(), secret);
+                if let (Some(answer), Some(greeter)) = (buffered, &self.greeter) {
                     greeter.respond(id, answer);
                     self.prompt = None;
-                    self.answer.clear();
                     self.needs_redraw = true;
                     return;
                 }
-                self.prompt = Some(Prompt {
-                    id,
-                    text,
-                    secret: style == PromptStyle::Secret,
-                });
-                self.answer.clear();
+
+                // The field is cleared only for an echoed question, and for the
+                // same hazard `spend_buffered` refuses the buffer for: whatever
+                // is in it was typed while it was masked, so unmasking it now
+                // would put a password on screen.
+                //
+                // Kept otherwise, deliberately. `submit` ignores Enter while a
+                // `create_session` is outstanding but keystrokes still land in
+                // `answer`, and wdm may hold the first prompt back for a whole
+                // rate-limit cooldown — the protocol warns a greeter must not
+                // assume a prompt arrives promptly — so clearing here made
+                // everything typed during that window vanish with no echo
+                // change and no message.
+                if !secret {
+                    self.answer.clear();
+                }
+                self.prompt = Some(Prompt { id, text, secret });
             }
         }
         self.needs_redraw = true;
@@ -480,6 +491,14 @@ impl App {
     /// clock — restarting would clear that explanation from the screen and
     /// reset the form under the user, so the failure is left standing and
     /// Enter starts the next attempt deliberately.
+    ///
+    /// Meaningful only when called from `auth_failed`, which is its only
+    /// caller. The shared client's `Model::should_auto_retry` also demands
+    /// `conversation_over && prompt.is_none() && !authenticated`; here those
+    /// three are facts of the call site rather than conditions — `auth_failed`
+    /// *is* the end of the conversation, and it has already cleared `prompt`
+    /// and `authenticating` by the time it asks. Calling this from anywhere
+    /// else would be asking a question it does not answer.
     fn should_auto_retry(&self) -> bool {
         !self.blocked
     }
@@ -731,38 +750,39 @@ impl Dispatch<WlRegistry, ()> for App {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => match interface.as_str() {
-                "wl_compositor" => {
-                    state.compositor = Some(registry.bind(name, version.min(5), qh, ()));
-                }
-                "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
-                "zwlr_layer_shell_v1" => {
-                    state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
-                }
-                "wdm_greeter_v1" => {
-                    state.greeter =
-                        Some(registry.bind(name, version.min(GREETER_VERSION), qh, ()));
-                }
-                "wl_seat" => {
-                    registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ());
-                }
-                "wl_output" => {
-                    state
-                        .outputs
-                        .insert(name, registry.bind(name, version.min(4), qh, name));
-                }
-                _ => {}
-            },
+        // Only `global` is acted on. A `global_remove` for an output used to
+        // prune a map of them; nothing holds outputs now, and every other
+        // global here lives as long as the compositor does.
+        let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        else {
+            return;
+        };
 
-            wl_registry::Event::GlobalRemove { name } => {
-                state.outputs.remove(&name);
+        match interface.as_str() {
+            "wl_compositor" => {
+                state.compositor = Some(registry.bind(name, version.min(5), qh, ()));
             }
-
+            "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
+            "zwlr_layer_shell_v1" => {
+                state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+            }
+            "wdm_greeter_v1" => {
+                state.greeter = Some(registry.bind(name, version.min(GREETER_VERSION), qh, ()));
+            }
+            "wl_seat" => {
+                registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ());
+            }
+            // Bound but not kept: `output_rank` carries the object itself,
+            // so nothing here ever has to resolve a registry name back to a
+            // proxy. A map of them only held strong references to outputs
+            // that were already gone.
+            "wl_output" => {
+                registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
+            }
             _ => {}
         }
     }
@@ -845,6 +865,11 @@ impl Dispatch<WdmGreeterV1, ()> for App {
             wdm_greeter_v1::Event::AuthOk => {
                 state.authenticating = false;
                 state.error = None;
+                // The conversation it was buffered for is over on success just
+                // as it is on failure, and `start_session` can return without
+                // launching anything ("no session to start"), leaving this
+                // process alive and holding the typed password indefinitely.
+                state.pending_answer = None;
                 state.start_session();
             }
 
@@ -1010,18 +1035,33 @@ impl Dispatch<WlBuffer, Arc<AtomicBool>> for App {
     }
 }
 
-impl Dispatch<WlOutput, u32> for App {
+impl Dispatch<WlOutput, ()> for App {
     fn event(
         _: &mut Self,
         _: &WlOutput,
         _: wayland_client::protocol::wl_output::Event,
-        _: &u32,
+        _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         // Geometry and mode are the compositor's business: the layer surface is
         // configured to the size wdm chooses.
     }
+}
+
+/// The buffered answer, if this prompt is one it may be spent on.
+///
+/// What the user typed before any conversation existed was typed into a field
+/// this greeter draws masked, so it is a password. wdm forwards
+/// `PAM_PROMPT_ECHO_ON` as [`PromptStyle::Visible`], and on any stack whose
+/// first answerable question is echo-on — pam_oath's token, a username
+/// re-prompt — spending the buffer there would answer *that* question with the
+/// password, which the stack then echoes and logs in the clear. So it is
+/// offered to a masked question only, and dropped otherwise.
+///
+/// [`PromptStyle::Visible`]: wdm_greeter_v1::PromptStyle::Visible
+fn spend_buffered(buffered: Option<String>, secret: bool) -> Option<String> {
+    buffered.filter(|_| secret)
 }
 
 fn main() -> ExitCode {
@@ -1263,6 +1303,65 @@ mod tests {
         assert!(!app.should_auto_retry());
         assert!(!app.auth_failed("Authentication failure".to_owned()));
         assert_eq!(app.error.as_deref(), Some("Permission denied"));
+    }
+
+    #[test]
+    fn a_buffered_password_is_never_spent_on_an_echoed_prompt() {
+        // The defect this guards: the password is typed into a field this
+        // greeter draws masked, before any conversation exists. wdm forwards
+        // PAM_PROMPT_ECHO_ON as `Visible`, so on a stack whose first answerable
+        // question is echo-on — pam_oath's token, a username re-prompt — an
+        // unguarded buffer answered *that* question with the password, which
+        // the stack then logs in the clear.
+        let mut app = app();
+        app.authenticating = true;
+        app.pending_answer = Some("hunter2".to_owned());
+
+        app.pam_prompt(7, "One-time code:".to_owned(), PromptStyle::Visible);
+
+        // The guard itself, where the send is observable without a compositor:
+        // an echo-on prompt gets nothing, a masked one gets the password.
+        assert_eq!(spend_buffered(Some("hunter2".to_owned()), false), None);
+        assert_eq!(
+            spend_buffered(Some("hunter2".to_owned()), true).as_deref(),
+            Some("hunter2")
+        );
+
+        let prompt = app.prompt.as_ref().expect("the prompt must be shown");
+        assert_eq!(prompt.text, "One-time code:");
+        assert!(!prompt.secret, "an echo-on prompt is not masked");
+        assert_eq!(
+            app.pending_answer, None,
+            "refused, and dropped rather than held for a later question"
+        );
+        assert!(
+            app.answer.is_empty(),
+            "the field is unmasked now, so anything typed into it masked \
+             would be on screen"
+        );
+    }
+
+    #[test]
+    fn a_masked_prompt_spends_the_buffer_and_keeps_what_was_typed_since() {
+        // The mirror of the case above, plus the create_session window: `submit`
+        // ignores Enter while an attempt is outstanding but keystrokes still
+        // land in `answer`, and wdm may hold the first prompt back for a whole
+        // rate-limit cooldown, so clearing here lost them silently.
+        let mut app = app();
+        app.authenticating = true;
+        app.pending_answer = Some("hunter2".to_owned());
+        app.answer = "typed while waiting".to_owned();
+
+        app.pam_prompt(7, "Password:".to_owned(), PromptStyle::Secret);
+
+        assert_eq!(app.pending_answer, None, "worth exactly one prompt");
+        assert_eq!(
+            app.answer, "typed while waiting",
+            "keystrokes from the create_session window must survive"
+        );
+        // With a live greeter the buffer would have been sent and `prompt`
+        // cleared; there is no compositor here, so the prompt stands.
+        assert!(app.prompt.as_ref().is_some_and(|p| p.secret));
     }
 
     #[test]
