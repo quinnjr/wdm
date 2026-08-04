@@ -687,6 +687,38 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_attempt_does_not_retry_itself() {
+        // The greeter half of the unattended-lockout loop. wdm answers a prompt
+        // that goes unanswered with an `error` prompt and then auth_failed; this
+        // asserts that pair leaves the model unwilling to start another attempt.
+        //
+        // Without the error prompt only the auth_failed arrives, which is
+        // indistinguishable from a mistyped password — so the greeter retried,
+        // wdm armed the timeout again, and the two spun. Every turn cost a
+        // pam_faillock entry, and three of those lock the account, on a machine
+        // nobody has touched.
+        let mut model = Model::default();
+
+        // Ordering is the contract, not an implementation detail: `blocked` has
+        // to be set before the conversation ends, because the retry decision is
+        // taken the moment auth_failed lands.
+        model.push_notice(
+            NoticeKind::Error,
+            "The login attempt timed out waiting for a response.".to_owned(),
+        );
+        model.authenticated = false;
+        model.conversation_over = true;
+        model.prompt = None;
+        model.error = Some("authentication failed".to_owned());
+
+        assert!(
+            !model.should_auto_retry(),
+            "a timed-out attempt must not re-arm itself; this is the lockout loop"
+        );
+        assert!(model.notice_text().unwrap().contains("timed out"));
+    }
+
+    #[test]
     fn a_lost_link_is_shown_and_ends_the_conversation() {
         // The failure a swallowed flush error used to produce: the user clicks
         // log in, the request never leaves, and the greeter shows

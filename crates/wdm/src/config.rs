@@ -317,7 +317,9 @@ impl Config {
     /// wdm would otherwise silently ignore it.
     pub fn load_or_default(path: &Path) -> Result<Self, ConfigError> {
         match Self::load(path) {
-            Err(ConfigError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(ConfigError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
                 log::info!("no config at {}, using defaults", path.display());
                 Ok(Self::default())
             }

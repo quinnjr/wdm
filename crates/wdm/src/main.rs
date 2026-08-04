@@ -12,6 +12,7 @@ mod config;
 mod errscreen;
 mod input;
 mod login;
+mod pamwire;
 mod render;
 mod session;
 mod sessions;

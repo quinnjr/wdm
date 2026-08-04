@@ -44,6 +44,23 @@ impl Canvas {
     }
 
     pub fn fill(&mut self, color: u32) {
+        // A word-at-a-time fill, because this runs once per repaint and a
+        // repaint is once per keystroke: the byte loop this replaces was 8.3
+        // million four-byte stores per keypress at 3840x2160. `slice::fill` on
+        // `u32` lowers to a memset; `chunks_exact_mut` did not.
+        //
+        // SAFETY: `align_to_mut` is only ever asked to reinterpret, and the
+        // result is used only when it produced no unaligned edges — the global
+        // allocator hands out memory aligned well past 4 bytes, so that is the
+        // real path. Anything else falls back to the byte loop, which is
+        // correct at any alignment; a partial word at either end is not a whole
+        // pixel and must not be written as one.
+        let (prefix, words, suffix) = unsafe { self.data.align_to_mut::<u32>() };
+        if prefix.is_empty() && suffix.is_empty() {
+            words.fill(color);
+            return;
+        }
+
         for pixel in self.data.chunks_exact_mut(4) {
             pixel.copy_from_slice(&color.to_ne_bytes());
         }
@@ -59,15 +76,15 @@ impl Canvas {
             return;
         }
 
-        // One slice per row rather than offset arithmetic and a bounds check
-        // per pixel; the clip above already established the range is in bounds.
+        // One memcpy per row from a row built once, rather than a four-byte
+        // store per pixel: `rect` paints the panel and the drop-down on every
+        // repaint, and a repaint is every keystroke. The clip above already
+        // established the range is in bounds.
+        let row: Vec<u8> = color.to_ne_bytes().repeat((x1 - x0) as usize);
         let stride = self.width as usize * 4;
-        for row in y0..y1 {
-            let start = row as usize * stride + x0 as usize * 4;
-            let end = row as usize * stride + x1 as usize * 4;
-            for pixel in self.data[start..end].chunks_exact_mut(4) {
-                pixel.copy_from_slice(&color.to_ne_bytes());
-            }
+        for y in y0..y1 {
+            let start = y as usize * stride + x0 as usize * 4;
+            self.data[start..start + row.len()].copy_from_slice(&row);
         }
     }
 
@@ -142,6 +159,15 @@ pub fn have_font() -> bool {
     font().is_some()
 }
 
+/// A half-open box in canvas pixels: `x0..x1`, `y0..y1`.
+#[derive(Clone, Copy)]
+pub struct Clip {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
 /// A string laid out once.
 ///
 /// Layout is the expensive half of drawing text, and several callers both
@@ -198,11 +224,35 @@ impl Shaped {
 
     /// Draw with the left edge at `x` and the top at `y`.
     pub fn draw(&self, canvas: &mut Canvas, x: f32, y: f32, color: u32) {
+        self.draw_clipped(canvas, x, y, color, None);
+    }
+
+    /// Draw, dropping any ink outside `clip`.
+    ///
+    /// The canvas is the only bound [`Self::draw`] has, which is the wrong one
+    /// for text inside a widget: an answer longer than the field drew straight
+    /// out of it and across the screen. A caller that owns a box passes it.
+    pub fn draw_clipped(
+        &self,
+        canvas: &mut Canvas,
+        x: f32,
+        y: f32,
+        color: u32,
+        clip: Option<Clip>,
+    ) {
         let (Some(font), Some(layout)) = (font(), &self.layout) else {
             return;
         };
 
-        for glyph in layout.glyphs() {
+        for glyph in layout
+            .glyphs()
+            .iter()
+            // The same filter [`Self::width`] applies, and for the same reason
+            // it must: a control character is laid out with zero metrics, so
+            // measuring it as nothing while drawing whatever the font returns
+            // for it would put ink where the caret was never told about.
+            .filter(|g| !g.char_data.is_control())
+        {
             // The Rc handle is cloned out of the cache rather than blended
             // under its borrow, because blend takes &mut Canvas and the cache
             // borrow would still be live. Cloning the handle copies nothing.
@@ -211,14 +261,30 @@ impl Shaped {
                 continue;
             }
 
+            let left = (x + glyph.x) as i32;
+            let top = (y + glyph.y) as i32;
+            // Whole glyphs that fall outside are skipped rather than blended
+            // pixel by pixel and rejected: the case this exists for is a string
+            // far longer than its box, where most glyphs are entirely out.
+            if let Some(clip) = clip
+                && (left >= clip.x1
+                    || left + metrics.width as i32 <= clip.x0
+                    || top >= clip.y1
+                    || top + metrics.height as i32 <= clip.y0)
+            {
+                continue;
+            }
+
             for row in 0..metrics.height {
                 for col in 0..metrics.width {
-                    canvas.blend(
-                        (x + glyph.x) as i32 + col as i32,
-                        (y + glyph.y) as i32 + row as i32,
-                        color,
-                        coverage[row * metrics.width + col],
-                    );
+                    let px = left + col as i32;
+                    let py = top + row as i32;
+                    if let Some(clip) = clip
+                        && (px < clip.x0 || px >= clip.x1 || py < clip.y0 || py >= clip.y1)
+                    {
+                        continue;
+                    }
+                    canvas.blend(px, py, color, coverage[row * metrics.width + col]);
                 }
             }
         }
@@ -343,6 +409,73 @@ mod tests {
         assert!(
             (one - two).abs() < 0.001,
             "each space must advance the pen equally: {one} then {two}"
+        );
+    }
+
+    #[test]
+    fn control_characters_measure_and_draw_as_nothing() {
+        if !have_font() {
+            eprintln!("skipped: no font available");
+            return;
+        }
+
+        // `width` has always skipped control characters — they are laid out
+        // with zero metrics, so counting the font's notdef box for one would
+        // put the caret past ink that is not there. `draw` did not skip them,
+        // so if the font returns a glyph for U+0009 the ink and the measurement
+        // disagree: the caret sits inside the drawn text, and centring is off
+        // by whatever was drawn. Both sides must agree, which means both must
+        // ignore it.
+        assert_eq!(width("a\tb", 20.0), width("ab", 20.0));
+
+        let render = |text: &str| {
+            let mut canvas = Canvas::new(120, 40);
+            draw(&mut canvas, 4.0, 4.0, 20.0, 0xffffffff, text);
+            canvas.data
+        };
+        assert_eq!(
+            render("a\tb"),
+            render("ab"),
+            "a control character put ink on the canvas"
+        );
+    }
+
+    #[test]
+    fn clipping_keeps_ink_inside_the_box() {
+        if !have_font() {
+            eprintln!("skipped: no font available");
+            return;
+        }
+
+        // The guard behind the answer field: a string far wider than its widget
+        // must not write outside it, whatever the canvas allows.
+        let clip = Clip {
+            x0: 10,
+            y0: 5,
+            x1: 40,
+            y1: 30,
+        };
+        let mut canvas = Canvas::new(200, 60);
+        Shaped::new(&"W".repeat(200), 20.0).draw_clipped(
+            &mut canvas,
+            4.0,
+            8.0,
+            0xffffffff,
+            Some(clip),
+        );
+
+        for y in 0..canvas.height {
+            for x in 0..canvas.width {
+                let o = ((y * canvas.width + x) * 4) as usize;
+                let inside = x >= clip.x0 && x < clip.x1 && y >= clip.y0 && y < clip.y1;
+                if !inside {
+                    assert_eq!(canvas.data[o + 3], 0, "ink escaped the clip at {x},{y}");
+                }
+            }
+        }
+        assert!(
+            canvas.data.chunks_exact(4).any(|p| p[3] == 0xff),
+            "nothing was drawn, so the clip proves nothing"
         );
     }
 

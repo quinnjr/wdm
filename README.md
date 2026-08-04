@@ -57,7 +57,10 @@ libudev, gbm, libdrm, xkbcommon and PAM; the toolkit greeters additionally need
 cargo build --release
 ```
 
-Arch packaging lives in `aur/` as a split package (`cd aur && makepkg -si`).
+Arch packaging lives in `aur/` as three AUR packages, submodules of this repo:
+`wdm` (the compositor and the toolkit-free reference greeter), `wdm-gtk-greeter`
+and `wdm-webkit-greeter`. Three rather than one split package so that building
+one greeter does not build the others — `cd aur/wdm && makepkg -si`.
 Debian and Fedora packages are built from metadata in the crate manifests, so
 neither `dpkg-buildpackage` nor `rpmbuild` is required:
 

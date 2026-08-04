@@ -27,9 +27,22 @@ wdm exposes **no `xdg_toplevel` at all**. A greeter's window must be a
 `zwlr_layer_shell_v1` surface; anything that tries to create a toplevel is
 closed immediately, and the user sees a blank screen.
 
-Anchor to all four edges and take exclusive keyboard focus. Leave the output
-unset: wdm places an output-less layer surface on the rank 0 output and moves it
-when ranks change, so choosing one by hand only reimplements that.
+Anchor to all four edges and take exclusive keyboard focus. Either way of
+choosing an output is legal — policy is the greeter's — and the two shipped
+greeters make different choices:
+
+- **Leave the output unset.** wdm places an output-less layer surface on the
+  rank 0 output and moves it when ranks change, so a greeter that has no opinion
+  gets the rank-0 policy for free and never has to see an `output_rank` event.
+- **Bind the rank 0 output explicitly**, as `wdm-greeter` does: wait for the
+  `output_rank` event naming rank 0, create the surface on that `wl_output`, and
+  rebuild it when a later event names a different one. This costs a surface
+  rebuild on hotplug, and buys a greeter whose stated policy is its own rather
+  than the compositor's — it is the same placement today, but it does not
+  silently change if the compositor's default ever does.
+
+Choose the first if "wherever wdm puts it" is what you mean; the second if the
+greeter documents where it draws and intends to keep that promise.
 
 `xdg_wm_base` *is* advertised, but only so popups have somewhere to live —
 menus and drop-downs need it for grabs.

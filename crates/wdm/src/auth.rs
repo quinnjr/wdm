@@ -4,7 +4,15 @@
 //! invoked from inside libpam. It cannot be driven from an event loop, so each
 //! authentication attempt gets a thread. The conversation forwards each question
 //! to the event loop over a [`calloop::channel`] and blocks on an [`mpsc`]
-//! receiver for the answer.
+//! receiver for the answer — with a deadline, [`RESPONSE_TIMEOUT`], so a greeter
+//! that stops answering cannot pin a thread and a PAM transaction forever.
+//!
+//! On that deadline wdm composes an `error` prompt of its own before returning
+//! `PAM_CONV_ERR`, so not every [`AuthEvent::Prompt`] originates from a PAM
+//! module. That matters to readers of the other end: `handle_auth_event` routes
+//! wdm's synthetic prompt exactly like PAM's, which is the point — it is the
+//! event that tells a greeter the failure was explained and stops it
+//! auto-retrying into an account lockout.
 //!
 //! Cancellation is expressed by dropping [`AuthHandle`]: both command senders
 //! close, the conversation's `recv` fails, it returns `PAM_CONV_ERR`, and PAM
@@ -44,7 +52,25 @@ fn next_prompt_id() -> u32 {
 /// A greeter that stops answering would otherwise pin a thread and a PAM
 /// transaction forever. Measured from when the prompt was emitted, not from the
 /// last message received, so a stream of stale responses cannot extend it.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// This is a leak guard, **not** a user-facing patience limit, and the
+/// difference is load-bearing. There is no way to end a `pam_authenticate` that
+/// is mid-conversation without failing it: whether the conversation callback
+/// returns `CONV_ERR` because it timed out or because the greeter cancelled,
+/// PAM unwinds through its failure path and `pam_faillock`'s `authfail` arm
+/// records an attempt. So every second of this timeout is a second in which a
+/// user who is merely *reading the screen* can be charged with a failed login.
+///
+/// At 60s that was reachable by a user who walked away — and, with a greeter
+/// that opens a conversation before anyone has typed, by a machine sitting
+/// untouched at its login screen. Three of those reach Arch's `deny=3` and lock
+/// the account, unattended, in about three minutes.
+///
+/// Half an hour is chosen so that only a greeter that is genuinely stuck gets
+/// here. The cost of being wrong in this direction is one pinned thread for
+/// half an hour; the cost of being wrong in the other direction is a locked-out
+/// account, so the asymmetry decides the value.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// What wdm tells pam_systemd about the seat before opening a session.
 ///
@@ -253,9 +279,11 @@ impl AuthHandle {
 
 /// The auth thread body.
 ///
-/// Runs to completion in one of four ways: authentication fails, session
-/// opening fails, the session ends normally, or the handle is dropped and every
-/// `recv` starts failing.
+/// Runs to completion in one of five ways: authentication fails, session
+/// opening fails, the session ends normally, the handle is dropped and every
+/// `recv` starts failing, or a prompt goes unanswered for [`RESPONSE_TIMEOUT`]
+/// and the conversation abandons it — which reaches the event loop as an
+/// ordinary [`AuthEvent::Failed`], preceded by the `error` prompt that says why.
 fn run(
     username: &str,
     tty: &str,
@@ -267,6 +295,7 @@ fn run(
     let conv = ChannelConversation {
         events: events.clone(),
         responses,
+        timeout: RESPONSE_TIMEOUT,
     };
 
     let mut context = match Context::new(SERVICE, Some(username), conv) {
@@ -401,11 +430,14 @@ fn run(
 /// desktop must leave `XDG_SESSION_DESKTOP` *unset*, because an empty string is
 /// a value logind will happily record and everything reading it will believe.
 fn pam_session_env(session_type: &str, desktop: &str) -> Vec<String> {
-    [("XDG_SESSION_TYPE", session_type), ("XDG_SESSION_DESKTOP", desktop)]
-        .into_iter()
-        .filter(|(_, value)| !value.is_empty())
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect()
+    [
+        ("XDG_SESSION_TYPE", session_type),
+        ("XDG_SESSION_DESKTOP", desktop),
+    ]
+    .into_iter()
+    .filter(|(_, value)| !value.is_empty())
+    .map(|(key, value)| format!("{key}={value}"))
+    .collect()
 }
 
 fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
@@ -439,6 +471,10 @@ fn os_to_string(s: &OsStr) -> Option<String> {
 struct ChannelConversation {
     events: calloop::channel::Sender<AuthEvent>,
     responses: mpsc::Receiver<PromptResponse>,
+    /// How long to wait for each response. Always [`RESPONSE_TIMEOUT`] in
+    /// production; a field so tests can reach the timeout path, which at half an
+    /// hour is otherwise unreachable in a test suite.
+    timeout: Duration,
 }
 
 impl ChannelConversation {
@@ -447,14 +483,38 @@ impl ChannelConversation {
         let id = next_prompt_id();
         self.emit(id, prompt, style)?;
 
-        let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+        let deadline = std::time::Instant::now() + self.timeout;
 
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let response = match self.responses.recv_timeout(remaining) {
                 Ok(response) => response,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    log::info!("no response to prompt {id} within {RESPONSE_TIMEOUT:?}");
+                    log::info!("no response to prompt {id} within {:?}", self.timeout);
+
+                    // Say so before failing, and say it as an `error` prompt.
+                    //
+                    // PAM logs "conversation failed" to the journal and tells
+                    // the greeter nothing, so without this the attempt ends as
+                    // an unexplained `auth_failed` — which is precisely the
+                    // shape a greeter treats as a mistyped password and retries
+                    // on its own. That retry re-arms the same timeout, and the
+                    // pair spins: one `pam_faillock` entry per timeout until the
+                    // account locks, with nobody at the keyboard.
+                    //
+                    // An `error` prompt is how a greeter learns that PAM
+                    // explained itself: it lands in `Model::push_notice`, which
+                    // sets `blocked`, which is what `Model::should_auto_retry`
+                    // consults. So this single event both tells the user why
+                    // their form reset and stops the loop, in every greeter that
+                    // shares the client — rather than in whichever ones remember
+                    // to special-case a reason string.
+                    self.emit_text(
+                        next_prompt_id(),
+                        "The login attempt timed out waiting for a response.".to_owned(),
+                        PromptStyle::Error,
+                    )?;
+
                     return Err(ErrorCode::CONV_ERR);
                 }
                 // The handle was dropped: cancelled, or the greeter died.
@@ -495,7 +555,17 @@ impl ChannelConversation {
 
     fn emit(&self, id: u32, text: &CStr, style: PromptStyle) -> Result<(), ErrorCode> {
         // PAM messages come from modules and are not guaranteed UTF-8.
-        let text = text.to_string_lossy().into_owned();
+        self.emit_text(id, text.to_string_lossy().into_owned(), style)
+    }
+
+    /// Emit text wdm composed itself, which is already UTF-8.
+    fn emit_text(&self, id: u32, text: String, style: PromptStyle) -> Result<(), ErrorCode> {
+        // The prompt text, never a response: this is what PAM asked, and the
+        // answers are the one thing in this file that must not reach a log.
+        // Without this there is no way to see what a PAM stack actually sent,
+        // which is the first question every "the greeter shows something odd"
+        // report needs answered.
+        log::debug!("prompt {id} ({style:?}): {text:?}");
         self.events
             .send(AuthEvent::Prompt { id, text, style })
             .map_err(|_| {
@@ -548,7 +618,10 @@ mod tests {
 
     #[test]
     fn pam_session_env_omits_an_empty_type() {
-        assert_eq!(pam_session_env("", "sway"), vec!["XDG_SESSION_DESKTOP=sway"]);
+        assert_eq!(
+            pam_session_env("", "sway"),
+            vec!["XDG_SESSION_DESKTOP=sway"]
+        );
         assert!(pam_session_env("", "").is_empty());
     }
 
@@ -577,11 +650,23 @@ mod tests {
         mpsc::Sender<PromptResponse>,
         calloop::channel::Channel<AuthEvent>,
     ) {
+        conversation_with_timeout(RESPONSE_TIMEOUT)
+    }
+
+    /// The same, with a timeout a test can actually reach.
+    fn conversation_with_timeout(
+        timeout: Duration,
+    ) -> (
+        ChannelConversation,
+        mpsc::Sender<PromptResponse>,
+        calloop::channel::Channel<AuthEvent>,
+    ) {
         let (events_tx, events_rx) = calloop::channel::channel();
         let (responses_tx, responses_rx) = mpsc::channel();
         let conv = ChannelConversation {
             events: events_tx,
             responses: responses_rx,
+            timeout,
         };
         (conv, responses_tx, events_rx)
     }
@@ -650,6 +735,40 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_explains_itself_before_failing() {
+        // The regression this exists for: a prompt nobody answers used to fail
+        // the attempt with nothing said to the greeter. PAM logs "conversation
+        // failed" to the journal and the greeter sees only a bare auth_failed —
+        // which is the same shape as a mistyped password, so every greeter
+        // sharing wdm-greeter-client retried on its own, re-armed the timeout,
+        // and spun. Each turn of that loop is one pam_faillock entry, so an
+        // untouched machine locked its first user out.
+        //
+        // The `error` prompt below is what breaks it: it reaches
+        // Model::push_notice, which sets `blocked`, which makes
+        // Model::should_auto_retry false. Assert the style, not just that
+        // something was said — an `info` prompt would display identically and
+        // would not stop the loop.
+        let (mut conv, _responses, events) = conversation_with_timeout(Duration::from_millis(50));
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let mut prompts = PromptStream::new(events);
+
+        let (_, text, style) = prompts.next();
+        assert_eq!(text, "Password:");
+        assert_eq!(style, PromptStyle::Secret);
+
+        let (_, text, style) = prompts.next();
+        assert_eq!(style, PromptStyle::Error);
+        assert!(
+            text.contains("timed out"),
+            "the timeout notice should say what happened, got {text:?}"
+        );
+
+        assert_eq!(worker.join().unwrap().unwrap_err(), ErrorCode::CONV_ERR);
+    }
+
+    #[test]
     fn ignores_stale_responses_and_keeps_waiting() {
         let (mut conv, responses, events) = conversation();
         let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
@@ -672,6 +791,57 @@ mod tests {
 
         let answer = worker.join().unwrap().unwrap();
         assert_eq!(answer.to_str().unwrap(), "fresh");
+    }
+
+    #[test]
+    fn stale_responses_cannot_extend_the_deadline() {
+        // RESPONSE_TIMEOUT is documented as measured from when the prompt was
+        // emitted, not from the last message received, and that is the whole
+        // leak guard: a peer that can restart the clock by sending anything can
+        // pin the thread and the PAM transaction forever. The guarantee comes
+        // from computing `deadline` once, before the loop — move it inside and
+        // both of the other timeout tests stay green, because one never
+        // approaches the deadline and the other sends nothing at all.
+        let (mut conv, responses, events) = conversation_with_timeout(Duration::from_millis(50));
+        let worker = std::thread::spawn(move || conv.prompt_echo_off(c"Password:"));
+
+        let mut prompts = PromptStream::new(events);
+        let (id, _, _) = prompts.next();
+
+        // Mismatched ids, so each one is discarded and the loop goes round
+        // again. Faster than the timeout, so a per-message deadline would never
+        // be reached and this test would hang rather than fail — which the join
+        // below turns into a visible timeout either way.
+        let chatter = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < until {
+                if responses
+                    .send(PromptResponse {
+                        id: id.wrapping_add(1000),
+                        secret: "stale".to_owned(),
+                    })
+                    .is_err()
+                {
+                    // The conversation gave up and dropped the receiver, which
+                    // is the outcome under test.
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(worker.join().unwrap().unwrap_err(), ErrorCode::CONV_ERR);
+        let waited = started.elapsed();
+        chatter.join().unwrap();
+
+        // Near the deadline, not a multiple of it. Generous upwards because a
+        // loaded CI box schedules threads late; the assertion that matters is
+        // that it did not run for the two seconds of chatter.
+        assert!(
+            waited < Duration::from_millis(1500),
+            "stale responses extended the deadline: waited {waited:?}"
+        );
     }
 
     #[test]
@@ -700,7 +870,10 @@ mod tests {
 
         let (second_id, _, style) = prompts.next();
         assert_eq!(style, PromptStyle::Secret);
-        assert_ne!(first_id, second_id, "ids must not repeat within a conversation");
+        assert_ne!(
+            first_id, second_id,
+            "ids must not repeat within a conversation"
+        );
         responses
             .send(PromptResponse {
                 id: second_id,

@@ -85,6 +85,15 @@ pub fn build(
     // with the paths the two calls above operated on.
     crate::supervise::hand_over_runtime_dir(greeter_credentials)?;
 
+    // Not fatal, unlike the runtime directory. A greeter with no cache still
+    // logs in; it just recompiles its shaders on every boot, which is the
+    // slow-blank-login-screen this exists to prevent rather than a broken one.
+    // Refusing to start over it would trade a slow login screen for no login
+    // screen at all.
+    if let Err(e) = crate::supervise::create_cache_dir(greeter_credentials) {
+        log::warn!("{e}; the greeter will start more slowly");
+    }
+
     loop_handle.insert_source(socket, move |stream, _, data| {
         if !greeter_may_connect(peer_uid(&stream), expected_uid) {
             // Dropping the stream closes it.
@@ -183,11 +192,7 @@ pub fn build(
 /// A greeter that will not start is not fatal: it goes through the same backoff
 /// and give-up policy as one that crashes, so a misconfigured `greeter.command`
 /// ends with an explanation on screen rather than wdm exiting.
-pub fn start(
-    data: &mut LoopData,
-    loop_handle: &LoopHandle<'static, LoopData>,
-    socket_name: &str,
-) {
+pub fn start(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>, socket_name: &str) {
     log::info!("greeter socket is {socket_name}");
     crate::backend::spawn_greeter(data, loop_handle);
 }
@@ -254,8 +259,6 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
 
     Ok(cred.uid)
 }
-
-
 
 /// Lock the socket to the greeter account.
 ///
@@ -338,7 +341,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-
     #[test]
     fn only_the_greeter_account_may_connect() {
         // The socket's mode and `peer_uid` are covered on their own below and
@@ -358,7 +360,10 @@ mod tests {
             "root was let in; wdm is root, so this is the connection that must not be trusted"
         );
         assert!(
-            !greeter_may_connect(Err(std::io::Error::from_raw_os_error(libc::EINVAL)), greeter),
+            !greeter_may_connect(
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                greeter
+            ),
             "a connection whose credentials could not be read was let in"
         );
     }

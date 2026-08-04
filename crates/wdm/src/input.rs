@@ -5,13 +5,12 @@
 //! intercepts is the VT switch chord.
 
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent, KeyState,
-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
+    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    TouchEvent,
 };
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
-use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent,
-};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::input::touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent};
 use smithay::utils::SERIAL_COUNTER;
 
@@ -255,7 +254,12 @@ fn vt_for(modifiers: &ModifiersState, keysym: Keysym) -> Option<i32> {
 }
 
 /// The surface pointer and touch events should go to.
-fn focus_under(state: &Wdm) -> Option<(smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+fn focus_under(
+    state: &Wdm,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
     let primary = state.outputs.first();
     state
         .layers

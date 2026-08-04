@@ -1,0 +1,53 @@
+name: rust
+
+# Runs on every push and PR to the two long-lived branches. Formatting was
+# allowed to drift for the project's whole history before this existed — 71
+# hunks across 18 files — which is what happens when the check is a thing
+# people are expected to remember rather than a thing that fails.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The greeters need the display stack's headers; wdm itself needs
+      # libinput, libseat, libudev, gbm, libdrm, xkbcommon and PAM. Kept in one
+      # step so a missing package fails here with an obvious message rather
+      # than inside a build script.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libinput-dev libseat-dev libudev-dev libgbm-dev libdrm-dev \
+            libxkbcommon-dev libpam0g-dev libwayland-dev \
+            libgtk-4-dev libgtk4-layer-shell-dev libwebkitgtk-6.0-dev
+
+      # First, and without --all-targets: formatting failures are the cheapest
+      # to produce and the most annoying to review around.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
