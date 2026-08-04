@@ -4,6 +4,13 @@ name: rust
 # allowed to drift for the project's whole history before this existed — 71
 # hunks across 18 files — which is what happens when the check is a thing
 # people are expected to remember rather than a thing that fails.
+#
+# Still called `rust` because the file name is referenced in CLAUDE.md and
+# renaming a workflow orphans its history in the Actions UI. It now also builds
+# greeters/plasma, which is C++ and CMake: that greeter generates its bindings
+# from wdm's own protocol XML, so it belongs to the same trigger as the crates
+# that generate theirs from it, not to a workflow of its own that could be
+# forgotten when the XML changes.
 on:
   push:
     branches: [main, develop]
@@ -51,3 +58,74 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # greeters/plasma is a standalone CMake project that the Rust workspace does
+  # not know about, so nothing above builds it and nothing above would notice it
+  # breaking. Its own job, in this workflow rather than a new one, because it is
+  # built from wdm's protocol XML and a change to that XML has to fail here as
+  # well as in `check`.
+  #
+  # It also makes the sanitizer claims reproducible. "ASan clean" was previously
+  # something a person had done once on their own machine, with no configuration
+  # in the tree that would let anyone else do it; the two options this
+  # configures are the whole of the answer.
+  plasma-greeter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # catch2 from apt rather than FetchContent: a configure that reaches the
+      # network cannot run in the clean chroots the distribution packages are
+      # built in, so the packages declare Catch2 as a build dependency and CI
+      # has to install it the same way they do. Ubuntu 24.04's `catch2` is
+      # version 3, which is what `find_package(Catch2 3)` wants.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config catch2 libwayland-dev
+
+      # -DWDM_PLASMA_QT=OFF, and it is not a shortcut. Nothing in the tree links
+      # Qt yet — the greeter is currently the protocol client and theme
+      # resolution — and Ubuntu 24.04 carries Qt 6.4, below the 6.5 floor this
+      # project requires for LayerShellQt::Window::get() before show(). Asking
+      # for Qt here would fail configure on a version question that has nothing
+      # to do with the code being built. When the Qt layer lands, this turns on
+      # against a runner that has 6.5.
+      - name: Configure
+        run: cmake -B build -S greeters/plasma -G Ninja -DWDM_PLASMA_QT=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      # --no-tests=error and not the default. A missing Catch2 makes the
+      # configure above skip every test target with a STATUS message, and a
+      # ctest that then finds nothing to run exits 0 — a green job that checked
+      # nothing at all, which is worse than a red one.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      # Separate build trees, because ASan and TSan interpose the same things
+      # and cannot be linked into one binary. Both are run: ASan+UBSan for the
+      # lifetimes — Link hands libwayland pointers into a std::optional the
+      # protocol decides the lifetime of — and TSan for the fake server, which
+      # is a second thread every test reads state from.
+      - name: Configure with ASan and UBSan
+        run: >
+          cmake -B build-asan -S greeters/plasma -G Ninja
+          -DWDM_PLASMA_QT=OFF -DWDM_PLASMA_SANITIZE_ADDRESS=ON
+
+      - name: Test under ASan and UBSan
+        run: |
+          cmake --build build-asan
+          ctest --test-dir build-asan --output-on-failure --no-tests=error
+
+      - name: Configure with TSan
+        run: >
+          cmake -B build-tsan -S greeters/plasma -G Ninja
+          -DWDM_PLASMA_QT=OFF -DWDM_PLASMA_SANITIZE_THREAD=ON
+
+      - name: Test under TSan
+        run: |
+          cmake --build build-tsan
+          ctest --test-dir build-tsan --output-on-failure --no-tests=error

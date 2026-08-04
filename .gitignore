@@ -1,6 +1,10 @@
 /target
 /.worktrees/
 
+# Where `cmake -B build -S greeters/plasma` puts the plasma greeter's build
+# tree, per the command in that greeter's CMakeLists.txt and in the docs.
+/build/
+
 # The design spec is local-only; the docs site alongside it is not.
 /docs/superpowers/
 

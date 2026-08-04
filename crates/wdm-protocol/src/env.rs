@@ -116,9 +116,10 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<(String, String)>, EnvError> {
 /// fails this is dropped, not an `invalid_env` error, so a greeter with no way
 /// to ask would find out by shipping. It is exactly the reimplementation this
 /// module exists to prevent, and like [`GREETER_GAVE_UP_EXIT`] it is outside
-/// both feature gates — the greeter pre-checks with it and the compositor
-/// enforces with it, so gating it on either would put the two halves of one
-/// agreement behind different switches.
+/// both feature gates — the compositor enforces with it (`Launch::build` calls
+/// exactly this, and there is no second copy in wdm to drift from it) and a
+/// greeter pre-checks with it, so gating it on either would put the two halves
+/// of one agreement behind different switches.
 ///
 /// Advisory, not authoritative: wdm applies the greeter's contribution *before*
 /// its own variables, so a key that passes here can still be overwritten by a

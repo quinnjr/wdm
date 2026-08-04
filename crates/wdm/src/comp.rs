@@ -89,7 +89,7 @@ impl ClientData for ClientState {
     }
 }
 
-/// How many layer surfaces the greeter may have mapped at once.
+/// How many layer surfaces the greeter may have at once.
 ///
 /// The greeter is untrusted, and nothing else in the protocol bounds this: each
 /// surface costs a full `render_elements_from_surface_tree` per output per
@@ -99,10 +99,32 @@ impl ClientData for ClientState {
 /// each, a login form on the primary — so the cap is generous against eight
 /// monitors and still small enough to bound the per-frame work.
 ///
-/// Counted against mapped surfaces rather than created ones on purpose: a
-/// greeter that opens and closes a surface per redraw is doing something odd but
-/// not expensive, and `layer_destroyed` gives the slot straight back.
+/// Counted against *created* surfaces, not mapped ones: smithay calls
+/// [`WlrLayerShellHandler::new_layer_surface`] from the `get_layer_surface`
+/// request, before any commit, so `layers` holds every surface the greeter has
+/// asked for whether it has ever attached a buffer or not. A greeter that
+/// creates sixteen and commits none is refused the seventeenth, which is a
+/// coarser rule than the per-frame cost alone would need — but the cost is not
+/// the only one, `configure_layers` and `send_preferred_scales` walk the list
+/// too, and the consequence of being coarse here falls entirely on the greeter,
+/// which is the untrusted party.
+///
+/// The slot comes straight back on destroy, and on disconnect: `layer_destroyed`
+/// retains, and smithay fires it from the resource's destructor, so a greeter
+/// that opens and closes a surface per redraw is doing something odd but never
+/// runs out.
 const MAX_LAYER_SURFACES: usize = 16;
+
+/// Whether a greeter already holding `held` layer surfaces may create another.
+///
+/// A free function rather than the comparison written inline, because that is
+/// the only way the boundary is reachable from a test: a [`MappedLayer`] needs a
+/// [`LayerSurface`], and smithay builds one only from a bound resource on a
+/// connected client, so nothing short of a second process on the other end of
+/// the socket can drive `new_layer_surface` far enough to hit the cap.
+const fn layer_slot_free(held: usize) -> bool {
+    held < MAX_LAYER_SURFACES
+}
 
 /// A layer surface wdm has accepted, and the output it belongs to.
 pub struct MappedLayer {
@@ -871,7 +893,7 @@ impl WlrLayerShellHandler for Wdm {
         // surface, so a greeter that is merely buggy can notice and recover,
         // while one that is not gets no more of wdm's per-frame budget either
         // way. Killing the client would restart it into the same loop.
-        if self.layers.len() >= MAX_LAYER_SURFACES {
+        if !layer_slot_free(self.layers.len()) {
             log::warn!(
                 "greeter asked for more than {MAX_LAYER_SURFACES} layer surfaces; closing {namespace:?}"
             );
@@ -1208,6 +1230,31 @@ mod tests {
             None,
             "keyboard focus survived the surface it was on"
         );
+    }
+
+    #[test]
+    fn the_seventeenth_layer_surface_is_the_one_refused() {
+        // The cap is off-by-one-shaped: `>=` against a length is the comparison
+        // people get wrong, and both directions are silent. One too strict and a
+        // legitimate greeter loses its sixteenth surface — a background on each
+        // of eight monitors plus a form is nowhere near it, but a greeter that
+        // does something more elaborate could be. One too lax and the bound is
+        // simply a different number, which nothing else in the protocol
+        // constrains.
+        //
+        // Written against `layer_slot_free` and not through
+        // `new_layer_surface`, which cannot be reached without a client: see the
+        // function's own note.
+        assert!(layer_slot_free(0), "a greeter with nothing was refused");
+        assert!(layer_slot_free(MAX_LAYER_SURFACES - 1), "the last slot");
+        assert!(
+            !layer_slot_free(MAX_LAYER_SURFACES),
+            "a seventeenth surface was allowed"
+        );
+        // And a greeter that somehow got past the cap stays refused rather than
+        // wrapping back under it.
+        assert!(!layer_slot_free(MAX_LAYER_SURFACES + 1));
+        assert!(!layer_slot_free(usize::MAX));
     }
 
     #[test]
