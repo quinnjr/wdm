@@ -26,6 +26,23 @@ pub enum SessionType {
     X11,
 }
 
+impl SessionType {
+    /// The inverse of [`Session::xdg_session_type`].
+    ///
+    /// The PAM helper reconstructs a [`Session`] from what crossed the socket,
+    /// and the socket carries the XDG spelling rather than the enum, because
+    /// that spelling is what pam_systemd is told and what the launched child
+    /// reads. Anything unrecognised is Wayland: the value comes from wdm's own
+    /// other end, so there is no third case, and defaulting to X11 would tell
+    /// logind a Wayland session is an X one on a bug that should be impossible.
+    pub fn from_xdg(value: &str) -> Self {
+        match value {
+            "x11" => Self::X11,
+            _ => Self::Wayland,
+        }
+    }
+}
+
 /// A session wdm is willing to launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -232,6 +249,34 @@ pub fn strip_field_codes(exec: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_xdg_session_type_survives_a_round_trip_through_the_wire() {
+        // The PAM helper rebuilds a Session out of what Msg::Launch carried, and
+        // the type crosses as its XDG spelling. If these two ever stop being
+        // inverses, a Wayland session is registered with logind as X11 (or the
+        // reverse) and everything keying off sd_session_get_type — screen
+        // lockers, logind's idle handling — believes it.
+        for original in [SessionType::Wayland, SessionType::X11] {
+            let session = Session {
+                id: "sway.desktop".to_owned(),
+                name: "Sway".to_owned(),
+                exec: "sway".to_owned(),
+                session_type: original,
+                path: PathBuf::new(),
+            };
+            assert_eq!(
+                SessionType::from_xdg(session.xdg_session_type()),
+                original,
+                "the wire spelling of {original:?} did not decode back to it"
+            );
+        }
+
+        // And an id that never came from wdm does not silently become an X11
+        // session, which is the one direction that misinforms logind.
+        assert_eq!(SessionType::from_xdg(""), SessionType::Wayland);
+        assert_eq!(SessionType::from_xdg("nonsense"), SessionType::Wayland);
+    }
 
     #[test]
     fn strips_field_codes() {

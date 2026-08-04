@@ -1,19 +1,34 @@
 //! Launching a user's session after a successful login.
 //!
+//! Split in two, because the two halves run in different processes:
+//!
+//! - [`Launch::validate`] runs in wdm, while the greeter is still on screen, so
+//!   that "no such user" or "that session has no command" is reported to
+//!   somebody rather than to a dark display.
+//! - [`Launch::build`] and [`Launch::spawn`] run in [`crate::pamhelper`], after
+//!   wdm has released the display. `XDG_RUNTIME_DIR` comes out of
+//!   `pam_open_session` and wdm must not invent it, and the session has to be
+//!   forked from the process that ran `open_session` or it inherits none of what
+//!   that call set up — `loginuid`, the session keyring, the mount namespace,
+//!   ambient capabilities.
+//!
 //! Everything that needs root — resolving the account, computing the
 //! supplementary group list, resolving the VT's device path — happens in the
-//! parent before the fork, so the child does only async-signal-safe work. That
-//! matters because wdm has PAM threads alive at this point, and a forked child
-//! of a multithreaded process may not allocate or take locks.
+//! parent before the fork, so the child does only async-signal-safe work. The
+//! helper is single-threaded by construction, which retires the hazard that rule
+//! was originally written for; it is kept because a `pre_exec` that assumes
+//! anything about its parent is a bug waiting for the next refactor, and because
+//! the same closure has to be correct if it is ever reached from elsewhere.
 //!
 //! The VT itself is deliberately *opened* in the child, not here: `TIOCSCTTY`
 //! only grants a controlling terminal to a session leader, and `setsid` is in
 //! the child too. What the parent prepares is the `CString` path, because
 //! building one is an allocation and the child may not make it.
 //!
-//! Releasing DRM master is *not* done here. The caller closes its libseat
-//! session before calling [`Launch::spawn`], because dropping master from the
-//! child would not release the fds the parent still holds.
+//! Releasing DRM master is *not* done here, and cannot be: by the time
+//! [`Launch::spawn`] runs, the process running it has never had it. wdm drops
+//! the DRM device, the renderer, libinput and the libseat session before it so
+//! much as tells the helper to launch.
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStringExt;
@@ -48,9 +63,10 @@ pub enum LaunchError {
 
 /// Everything needed to launch a session, resolved while still privileged.
 ///
-/// Built with [`Launch::prepare`] before the greeter is torn down, so a
-/// resolution failure is reported while there is still a greeter to report it
-/// to.
+/// Built with [`Launch::build`] in the PAM helper, after wdm has released the
+/// display. The checks that do not need `pam_env` are [`Launch::validate`]'s and
+/// run earlier, in wdm, so a resolution failure is reported while there is still
+/// a greeter to report it to.
 #[derive(Debug)]
 pub struct Launch {
     username: String,
@@ -70,23 +86,15 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Resolve an account and assemble the environment for a session.
+    /// Everything about the account and the command that can be decided without
+    /// a PAM session.
     ///
-    /// `pam_env` is the environment `pam_open_session` produced, which is where
-    /// `XDG_RUNTIME_DIR` comes from — wdm must not invent that itself, because
-    /// pam_systemd owns the directory's lifecycle.
-    ///
-    /// `extra_env` is what the greeter asked for. It is filtered through
-    /// [`greeter_may_set`] and applied *before* wdm's own session variables, so
-    /// a greeter can localise the session but can neither influence how it loads
-    /// code nor contradict a fact about the seat.
-    pub fn prepare(
-        session: &Session,
-        username: &str,
-        vt: u32,
-        pam_env: Vec<(String, String)>,
-        extra_env: Vec<(String, String)>,
-    ) -> Result<Self, LaunchError> {
+    /// Runs in wdm, before the greeter is killed, so that a resolution failure
+    /// reaches a greeter that is still on screen. It is deliberately cheap and
+    /// deliberately repeated: [`Launch::build`] calls it again in the helper,
+    /// because that is the process that actually `exec`s and a check the exec
+    /// path does not make is a check that can be routed around.
+    pub fn validate(session: &Session, username: &str) -> Result<(), LaunchError> {
         let user = uzers::get_user_by_name(username)
             .ok_or_else(|| LaunchError::NoSuchUser(username.to_owned()))?;
 
@@ -107,6 +115,35 @@ impl Launch {
         if session.exec.trim().is_empty() {
             return Err(LaunchError::EmptyCommand(session.id.clone()));
         }
+
+        Ok(())
+    }
+
+    /// Resolve an account and assemble the environment for a session.
+    ///
+    /// Runs in the PAM helper, because `pam_env` is the environment
+    /// `pam_open_session` produced — which is where `XDG_RUNTIME_DIR` comes
+    /// from, and wdm must not invent that itself, because pam_systemd owns the
+    /// directory's lifecycle.
+    ///
+    /// `extra_env` is what the greeter asked for. It is filtered through
+    /// [`greeter_may_set`] and applied *before* wdm's own session variables, so
+    /// a greeter can localise the session but can neither influence how it loads
+    /// code nor contradict a fact about the seat.
+    pub fn build(
+        session: &Session,
+        username: &str,
+        vt: u32,
+        pam_env: Vec<(String, String)>,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<Self, LaunchError> {
+        // Again, in the process that will do the exec. wdm checked this before
+        // it released the display, but wdm is not what runs setuid a moment
+        // from now.
+        Self::validate(session, username)?;
+
+        let user = uzers::get_user_by_name(username)
+            .ok_or_else(|| LaunchError::NoSuchUser(username.to_owned()))?;
 
         let uid = user.uid();
         let gid = user.primary_group_id();
@@ -137,8 +174,15 @@ impl Launch {
 
     /// Fork and exec the session.
     ///
-    /// The caller must already have released DRM master and input devices, or
-    /// the session's compositor will fail to acquire them.
+    /// Called from the PAM helper, and only from there: the child has to be a
+    /// child of the process that ran `pam_open_session`, or `loginuid`, the
+    /// session keyring, the mount namespace and ambient capabilities are set on
+    /// a process the session never descends from. The helper then `waitpid`s it
+    /// and pairs `pam_close_session` on the handle that opened it.
+    ///
+    /// wdm must already have released DRM master and input devices, which by
+    /// construction it has: it does that before it tells the helper to launch at
+    /// all.
     pub fn spawn(&self) -> Result<Child, LaunchError> {
         // Everything the child touches is built here, while allocation is still
         // legal. The pre_exec closure below only calls libc.
@@ -164,9 +208,17 @@ impl Launch {
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.home);
 
-        // SAFETY: this closure runs in the forked child of a process that has
-        // PAM threads, so it must be async-signal-safe: no allocation, no
-        // locks, only libc calls on data captured above.
+        // SAFETY: this closure runs in a forked child, so it must be
+        // async-signal-safe: no allocation, no locks, only libc calls on data
+        // captured above.
+        //
+        // The parent is now the PAM helper, which is single-threaded — it was
+        // `exec`'d for that reason — so the specific hazard this rule was
+        // written for, forking a process with live PAM threads, is retired. The
+        // rule stays: `fork` from a multithreaded process is a mistake one
+        // refactor away, and a `pre_exec` closure that is only correct under an
+        // assumption about its caller does not announce itself when that
+        // assumption stops holding.
         //
         // std applies its own uid/gid *before* pre_exec closures, which would
         // make setgroups fail, so wdm does the whole privilege drop here and
@@ -180,6 +232,14 @@ impl Launch {
                 // function: see crate::supervise::unblock_signals. A plain
                 // non-generic call allocates nothing, so the constraint this
                 // closure runs under still holds.
+                //
+                // Belt and braces now rather than load-bearing: the helper
+                // never installs a signalfd, so it has nothing blocked to
+                // inherit. Kept because a pre_exec that assumes its parent's
+                // signal mask is a bug waiting for the next refactor, and
+                // because the mask wdm itself blocks would otherwise reach the
+                // user's whole session through the helper if the helper ever
+                // gained one.
                 crate::supervise::unblock_signals()?;
 
                 // A new session and process group, so the session does not
@@ -221,11 +281,12 @@ impl Launch {
                 // set errno on every libc.
                 //
                 // from_raw_os_error rather than Error::other: the latter boxes
-                // a message, which allocates, and this closure runs in a child
-                // forked from a process with live PAM threads. If one of them
-                // held the allocator lock at fork time, allocating here would
-                // deadlock the child at exactly the moment it is trying to
-                // abort a failed privilege drop.
+                // a message, which allocates, and a forked child that allocates
+                // is a child that can deadlock on an allocator lock some other
+                // thread held at fork time — at exactly the moment it is trying
+                // to abort a failed privilege drop. The helper has no other
+                // threads today; this is what keeps that from being the only
+                // thing standing between here and a hang.
                 if libc::getuid() != uid || libc::geteuid() != uid {
                     return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                 }
@@ -627,7 +688,16 @@ mod tests {
     fn rejects_a_user_outside_the_login_range() {
         // root authenticates fine if someone knows the password; the uid range
         // is what stops it becoming a graphical root session.
-        let err = Launch::prepare(
+        let err = Launch::validate(&session(SessionType::Wayland), "root").unwrap_err();
+        assert!(
+            matches!(err, LaunchError::NotLoginable(_) | LaunchError::NoShell(_)),
+            "root was not rejected: {err:?}"
+        );
+
+        // And build refuses it too. The split put validate in wdm, one process
+        // and one socket away from the process that runs setuid; a check the
+        // exec path does not make is a check something can be routed around.
+        let err = Launch::build(
             &session(SessionType::Wayland),
             "root",
             7,
@@ -637,7 +707,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, LaunchError::NotLoginable(_) | LaunchError::NoShell(_)),
-            "root was not rejected: {err:?}"
+            "build let root through: {err:?}"
         );
     }
 
@@ -672,7 +742,14 @@ mod tests {
 
     #[test]
     fn rejects_unknown_user() {
-        let err = Launch::prepare(
+        let err = Launch::validate(
+            &session(SessionType::Wayland),
+            "definitely-not-a-user-on-this-box",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LaunchError::NoSuchUser(_)), "{err:?}");
+
+        let err = Launch::build(
             &session(SessionType::Wayland),
             "definitely-not-a-user-on-this-box",
             7,
@@ -683,22 +760,79 @@ mod tests {
         assert!(matches!(err, LaunchError::NoSuchUser(_)), "{err:?}");
     }
 
+    /// The account this test process is running as, if it is one that could
+    /// legitimately reach a launch at all.
+    ///
+    /// `None` means the suite is running as an account with no login shell —
+    /// a build container running as `nobody`, say — where the interesting
+    /// failure is unreachable and asserting anything would be asserting the
+    /// wrong thing.
+    fn current_login_user() -> Option<String> {
+        // SAFETY: getuid cannot fail and touches no memory.
+        let uid = unsafe { libc::getuid() };
+        let user = uzers::get_user_by_uid(uid)?;
+        if !crate::users::is_login_shell(user.shell()) {
+            return None;
+        }
+        if !crate::users::UidRange::from_system().contains(uid) {
+            return None;
+        }
+        Some(user.name().to_str()?.to_owned())
+    }
+
     #[test]
     fn rejects_empty_command() {
         let mut s = session(SessionType::Wayland);
         s.exec = "   ".to_owned();
 
-        let uid = unsafe { libc::getuid() };
-        let user = uzers::get_user_by_uid(uid).unwrap();
-        let name = user.name().to_str().unwrap().to_owned();
-
-        // Only reachable for a user with a login shell; skip if the test runs as
-        // an account without one rather than asserting the wrong thing.
-        if !crate::users::is_login_shell(user.shell()) {
+        let Some(name) = current_login_user() else {
             return;
-        }
+        };
 
-        let err = Launch::prepare(&s, &name, 7, Vec::new(), Vec::new()).unwrap_err();
+        let err = Launch::validate(&s, &name).unwrap_err();
         assert!(matches!(err, LaunchError::EmptyCommand(_)), "{err:?}");
+
+        let err = Launch::build(&s, &name, 7, Vec::new(), Vec::new()).unwrap_err();
+        assert!(matches!(err, LaunchError::EmptyCommand(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_valid_account_and_session_pass_validation() {
+        // The negative cases above would all still pass if validate returned
+        // an error unconditionally.
+        let Some(name) = current_login_user() else {
+            return;
+        };
+        Launch::validate(&session(SessionType::Wayland), &name)
+            .expect("the account running the tests was refused");
+    }
+
+    #[test]
+    fn build_carries_the_pam_environment_into_the_launch() {
+        // build is what the helper calls, and its whole reason for existing on
+        // that side of the socket is XDG_RUNTIME_DIR: it only exists once
+        // pam_open_session has run, and wdm must not invent it. build_env's own
+        // tests pin the assembly; this pins that `build` actually reaches it
+        // rather than dropping the argument.
+        let Some(name) = current_login_user() else {
+            return;
+        };
+
+        let launch = Launch::build(
+            &session(SessionType::Wayland),
+            &name,
+            7,
+            vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
+            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
+        )
+        .expect("a valid account and session failed to build");
+
+        assert_eq!(launch.username(), name);
+        assert_eq!(
+            env_of(&launch.env, "XDG_RUNTIME_DIR").as_deref(),
+            Some("/run/user/1000")
+        );
+        assert_eq!(env_of(&launch.env, "LANG").as_deref(), Some("de_DE.UTF-8"));
+        assert_eq!(env_of(&launch.env, "XDG_VTNR").as_deref(), Some("7"));
     }
 }

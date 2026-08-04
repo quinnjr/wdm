@@ -84,21 +84,52 @@ wdm calls `env_clear()` when spawning, so the variable cannot be inherited.
 
 ### The handoff is the whole design
 
-On `start_session`, **in the parent, before forking**: PAM opens the session,
-the account and environment are resolved while still privileged, the greeter is
-killed, and then *everything holding the display* is dropped — DRM device,
-renderer, libinput, and the libseat session. Only then does it fork, drop
-privileges in the child, and exec.
+wdm never opens a PAM session, and never forks the user's session, while it
+holds the display. The order, and every step of it is load-bearing:
 
-Steps 3–4 are deliberately not in the child: closing the seat there would not
-release the fds the parent still holds. The child does only async-signal-safe
-work, because PAM threads are alive at fork time — **do not allocate in a
-`pre_exec` closure**, use `Error::from_raw_os_error` rather than `Error::other`.
+1. The greeter sends `start_session`. wdm validates it — `Launch::validate`:
+   the account exists, its uid is in range, it has a login shell, the session
+   has a command. **Here**, because this is the last moment at which a greeter
+   is still on screen to be told.
+2. wdm kills the greeter and drops *everything holding the display* — DRM
+   device, renderer, libinput, libseat session.
+3. **Only then** `Login::launch` sends `Msg::Launch` to the PAM helper.
+4. The helper runs `pam_open_session`, assembles the environment
+   (`Launch::build` — `XDG_RUNTIME_DIR` comes from PAM and wdm must not invent
+   it), forks, drops privileges in the child, and execs.
+5. The helper `waitpid`s, reports `SessionEnded`, runs `pam_close_session` on
+   the handle that opened the session, and exits.
+6. wdm begins the next login generation.
+
+Step 2 before step 3 is the whole point. A module that forks inside
+`pam_sm_open_session` and `exit`s rather than `exec`ing — `pam_kwallet5` does,
+on its error path — used to inherit wdm's live EGL context and run the driver's
+`atexit` handlers against shared GPU state; on NVIDIA that faulted wdm's own
+channel and killed the compositor mid-login. There is now no display state
+anywhere in the process that runs PAM.
+
+Step 4's fork must be the helper's, not wdm's: `loginuid`, the session keyring,
+the mount namespace and ambient capabilities are set on the process that ran
+`open_session`, and only its children inherit them. That is also why the helper
+cannot just `exec` the session — it has to survive to pair
+`pam_close_session`.
+
+A failure after step 2 has no greeter to report to. It becomes the *next*
+greeter's `last_error`, which is the price of not opening a PAM session while
+holding the GPU.
+
+The child does only async-signal-safe work — **do not allocate in a `pre_exec`
+closure**, use `Error::from_raw_os_error` rather than `Error::other`. The
+helper is single-threaded, so the specific hazard that rule was written for is
+retired; the rule stays, because a `pre_exec` correct only under an assumption
+about its caller does not announce itself when that assumption stops holding.
 
 `backend/udev.rs`'s outer `loop` is one login generation each pass. Anything
 registered on the long-lived `LoopHandle` (timers, event sources, Wayland
 globals) must be torn down before the handoff or it fires in the *next*
-generation.
+generation. The loop does keep dispatching during the session —
+`backend::wait_for_session` — because the helper's `SessionEnded` arrives on
+the auth channel and there is no other way to hear it.
 
 ### Layer shell only
 
@@ -113,16 +144,37 @@ walking the parent's tree; it needs its own render pass and its **initial
 configure**, sent from `commit()`. Omitting that configure means every GTK
 drop-down silently does nothing.
 
-### PAM is the only threading
+### PAM is a process, not a thread
 
-`pam_authenticate` blocks and its conversation callback is a C callback, so each
-attempt gets a thread. The conversation sends prompts to the event loop over a
-`calloop::channel` and blocks on `mpsc` for the answer. Cancellation is
-expressed by *dropping* `AuthHandle`: the receivers close, `recv` fails, PAM
-unwinds by itself. There are no locks.
+PAM does not run in wdm. `wdm --pam-helper` (`pamhelper.rs`) is a freshly
+`exec`'d copy of wdm's own binary — undocumented in `wdm(1)`, reachable only
+with a `SOCK_SEQPACKET` socket on fd 3 — that runs the whole conversation, opens
+the session, forks the user's session, and closes the session. `auth.rs` is
+wdm's end: it spawns the helper, drives it, and turns what it says into
+`AuthEvent`s.
 
-The thread also owns the PAM handle for the session's lifetime, because
-`pam_open_session`/`pam_close_session` must be paired on one handle.
+`exec` and not merely `fork`, for three reasons that are all load-bearing:
+
+- **Fresh address space.** No graphics driver was ever loaded into it, so there
+  are no `atexit` handlers and no EGL state for a forking module to corrupt.
+- **Single-threaded.** `pam_loginuid` writes `/proc/self/loginuid`, which the
+  kernel refuses unless the writer is the thread-group leader. On a spawned
+  thread it could never succeed. It also means the session is forked from a
+  process with no other threads.
+- **It is the session's parent.** `pam_open_session` sets `loginuid`, the
+  session keyring, the mount namespace and ambient capabilities on the helper,
+  and `fork` copies all of them to the child. `pam_open_session` and
+  `pam_close_session` are paired on one handle, which the helper holds for the
+  session's whole lifetime — which is why it forks rather than `exec`ing.
+
+wdm still has *one* thread per attempt, in `auth.rs`: it blocks on `recv` and
+forwards to the event loop. It holds no PAM state and it is not the defect —
+removing it would mean making the socket a `calloop` source, which is a wider
+change (see the `ponytail:` at the top of `auth.rs`). There are no locks.
+
+Cancellation is expressed by *dropping* `AuthHandle`, exactly as before: wdm's
+end of the socket is shut down, the helper's next read hits EOF, its
+conversation returns `PAM_CONV_ERR`, and PAM unwinds by itself.
 
 ### Queues between layers
 
@@ -133,7 +185,10 @@ backend that owns DRM and the seat. So they queue rather than act:
   switch, session activation, device add/remove, connector rescan, vblank.
 - `Wdm::pending_actions` (`login::Action`) — launch a session, restart the
   greeter. Drained by `handle_action`, which returns `HandOff` so the backend
-  can release the display before forking.
+  can release the display before anything opens a PAM session. `HandOff`
+  carries only a username: what gets launched stays in `Login::chosen` and is
+  only reachable through `Login::launch`, so there is no second copy of it that
+  some other call site could start while the GPU is still held.
 
 ### The greeter is untrusted
 

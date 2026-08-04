@@ -76,9 +76,19 @@ pub enum Msg {
     Response { id: u32, secret: String },
     /// Open the PAM session and run the user's session.
     ///
-    /// Sent only after wdm has released the display. Everything the helper
-    /// needs to assemble the environment travels here, because the helper has
-    /// no access to wdm's configuration.
+    /// Sent only after wdm has released the display — the DRM device, the
+    /// renderer, libinput and the libseat session are all gone by the time this
+    /// crosses. That ordering is the entire point of the helper: a module that
+    /// `fork`s and `exit`s inside `pam_sm_open_session` has no live EGL context
+    /// to inherit, because there no longer is one anywhere.
+    ///
+    /// Everything the helper needs to assemble the environment travels here,
+    /// because the helper has no access to wdm's configuration. `session_type`
+    /// and `desktop` are redundant with `session_id` — they are what
+    /// `Session::xdg_session_type` and `xdg_session_desktop` derive — and are
+    /// sent anyway because they are what goes into PAM's *own* environment
+    /// before `open_session`, which is a different thing from what goes into the
+    /// child's.
     Launch {
         session_type: String,
         desktop: String,
@@ -101,22 +111,26 @@ pub enum Msg {
     Ok,
     /// The attempt failed; the helper is exiting.
     Failed(String),
-    /// `pam_open_session` succeeded, and this is the environment it produced.
+    /// The session process is running, as a child of the helper.
     ///
-    /// The environment crosses the wire because `XDG_RUNTIME_DIR` and everything
-    /// else a module exports is only known once the session is open, and the
-    /// session is opened in the helper. wdm still forks and `exec`s the user's
-    /// session itself, so it needs those variables; when that moves into the
-    /// helper this message stops carrying them anywhere and becomes purely
-    /// informational, but it does not stop being sent — it is the only signal
-    /// that `open_session` succeeded as opposed to merely having been asked for.
-    SessionOpened { env: Vec<(String, String)> },
-    /// The session process is running.
+    /// Implies `pam_open_session` succeeded: nothing is forked until it has.
+    /// The pid is the helper's child, not wdm's — wdm cannot `wait` on it, and
+    /// the message exists so a log line can name it and so a hung launch is
+    /// distinguishable from one that never started.
     SessionStarted { pid: u32 },
-    /// `pam_open_session` or the launch itself failed; the helper is exiting.
+    /// `pam_open_session`, the environment assembly or the fork failed; the
+    /// helper is exiting.
+    ///
+    /// Arrives after wdm has already released the display, so there is no
+    /// greeter left to tell directly. wdm records it as `last_error` and the
+    /// next greeter shows it, which is the price of not opening a PAM session
+    /// while holding the GPU.
     SessionFailed(String),
     /// The session process exited. `status` is the wait status as text, because
     /// what wdm does with it is put it in a log line and a `last_error`.
+    ///
+    /// Terminal: the helper sends this, then runs `pam_close_session` on the
+    /// handle that opened the session, then exits.
     SessionEnded { status: String, ran_for_ms: u64 },
 }
 
@@ -144,7 +158,6 @@ const TAG_FAILED: u8 = 5;
 const TAG_SESSION_STARTED: u8 = 6;
 const TAG_SESSION_FAILED: u8 = 7;
 const TAG_SESSION_ENDED: u8 = 8;
-const TAG_SESSION_OPENED: u8 = 9;
 
 const STYLE_SECRET: u8 = 0;
 const STYLE_VISIBLE: u8 = 1;
@@ -306,10 +319,6 @@ impl Msg {
                 out.push(TAG_FAILED);
                 put_str(&mut out, reason);
             }
-            Self::SessionOpened { env } => {
-                out.push(TAG_SESSION_OPENED);
-                put_pairs(&mut out, env);
-            }
             Self::SessionStarted { pid } => {
                 out.push(TAG_SESSION_STARTED);
                 put_u32(&mut out, *pid);
@@ -369,7 +378,6 @@ impl Msg {
             },
             TAG_OK => Self::Ok,
             TAG_FAILED => Self::Failed(r.string()?),
-            TAG_SESSION_OPENED => Self::SessionOpened { env: r.pairs()? },
             TAG_SESSION_STARTED => Self::SessionStarted { pid: r.u32()? },
             TAG_SESSION_FAILED => Self::SessionFailed(r.string()?),
             TAG_SESSION_ENDED => Self::SessionEnded {
@@ -428,24 +436,96 @@ mod tests {
         });
         round_trip(Msg::Ok);
         round_trip(Msg::Failed("Authentication failure".to_owned()));
-        round_trip(Msg::SessionOpened {
-            env: vec![
-                ("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned()),
-                ("XDG_SESSION_ID".to_owned(), "3".to_owned()),
-            ],
+        // A greeter that asked for nothing is the common case, and an empty pair
+        // list is the shape a decoder is most likely to get wrong: it is the one
+        // where "no bytes left" and "no entries" look the same.
+        round_trip(Msg::Launch {
+            session_type: "x11".to_owned(),
+            desktop: "i3".to_owned(),
+            session_id: "i3.desktop".to_owned(),
+            session_name: "i3".to_owned(),
+            session_exec: "i3".to_owned(),
+            extra_env: Vec::new(),
+            vt: 1,
         });
-        // An open session with no exported environment at all is a real
-        // outcome — a stack with no pam_systemd and no pam_env produces one —
-        // and an empty pair list is the shape a decoder is most likely to get
-        // wrong, because it is the one where "no bytes left" and "no entries"
-        // look the same.
-        round_trip(Msg::SessionOpened { env: Vec::new() });
         round_trip(Msg::SessionStarted { pid: 4321 });
+        // pid 0 is not a session wdm could ever be told about, but it is the
+        // value a decoder that read the wrong field would most plausibly
+        // produce, so the codec has to carry it faithfully rather than have the
+        // test only exercise a number that happens to be non-zero.
+        round_trip(Msg::SessionStarted { pid: 0 });
         round_trip(Msg::SessionFailed("no such session".to_owned()));
         round_trip(Msg::SessionEnded {
             status: "exit status: 0".to_owned(),
             ran_for_ms: 12_345,
         });
+        // A session that died instantly is what `last_error` exists for, and
+        // zero is where a u64 read as a u32 would still look right.
+        round_trip(Msg::SessionEnded {
+            status: "signal: 11 (SIGSEGV)".to_owned(),
+            ran_for_ms: 0,
+        });
+        round_trip(Msg::SessionEnded {
+            status: "exit status: 0".to_owned(),
+            ran_for_ms: u64::MAX,
+        });
+    }
+
+    #[test]
+    fn a_truncated_launch_is_refused() {
+        // Launch is the message the session is assembled from — the account it
+        // runs as is not here, but the command and the environment are — and it
+        // is the only one with a nested length (`extra_env`) between two
+        // variable-width fields. Every prefix must fail rather than yield a
+        // Launch with a plausible-looking Exec and a silently empty environment.
+        let full = Msg::Launch {
+            session_type: "wayland".to_owned(),
+            desktop: "sway".to_owned(),
+            session_id: "sway.desktop".to_owned(),
+            session_name: "Sway".to_owned(),
+            session_exec: "sway".to_owned(),
+            extra_env: vec![("LANG".to_owned(), "en_GB.UTF-8".to_owned())],
+            vt: 7,
+        }
+        .encode();
+
+        for cut in 1..full.len() {
+            assert!(
+                Msg::decode(&full[..cut]).is_none(),
+                "a Launch truncated to {cut} bytes decoded anyway"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_lifecycle_messages_are_distinguishable() {
+        // Three messages that all mean "the login is over" and mean opposite
+        // things to wdm: started is not terminal, ended is the ordinary exit,
+        // failed is the one that becomes a `last_error` the next greeter shows.
+        // A tag collision would make one silently decode as another, and
+        // SessionStarted and SessionEnded are adjacent in the table.
+        let tags: Vec<u8> = [
+            Msg::SessionStarted { pid: 1 },
+            Msg::SessionFailed(String::new()),
+            Msg::SessionEnded {
+                status: String::new(),
+                ran_for_ms: 0,
+            },
+            Msg::Ok,
+            Msg::Failed(String::new()),
+        ]
+        .iter()
+        .map(|m| m.encode()[0])
+        .collect();
+
+        let mut unique = tags.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            tags.len(),
+            "two messages share a tag: {tags:?}"
+        );
     }
 
     #[test]

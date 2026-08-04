@@ -14,9 +14,10 @@ use std::time::Duration;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 
+use smithay::reexports::calloop::EventLoop;
+
 use crate::comp::LoopData;
-use crate::login::{Action, LaunchRequest};
-use crate::session::Launch;
+use crate::login::{Action, SessionOutcome};
 use crate::supervise::Disposition;
 
 /// Something an event source noticed that only the backend can act on.
@@ -46,14 +47,21 @@ pub enum Request {
 pub enum Handled {
     /// Carry on running the greeter.
     Continue,
-    /// A session was prepared and the display should be handed to it.
+    /// A session was validated and the display must now be handed to it.
     ///
-    /// The backend must release DRM master and input before calling
-    /// [`Launch::spawn`], which is why this is returned rather than done here.
-    HandOff(Launch),
+    /// The backend releases DRM master, the renderer, libinput and the seat, and
+    /// **only then** calls [`crate::login::Login::launch`], which is what tells
+    /// the helper to run `pam_open_session`. Returned rather than done here
+    /// because only the backend can release any of that.
+    ///
+    /// The username is for the log line and nothing else: what gets launched is
+    /// held in the `Login` and is unreachable from here, so there is no second
+    /// copy of it that some other call site could start while the GPU is still
+    /// held.
+    HandOff { username: String },
 }
 
-/// Act on everything the greeter's requests and the PAM thread queued.
+/// Act on everything the greeter's requests and the PAM helper queued.
 ///
 /// Drains the whole queue: handling only one per pass would let a burst of
 /// requests strand an action until the next event wakes the loop.
@@ -62,25 +70,23 @@ pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
         match action {
             Action::None => {}
 
-            Action::Launch(request) => {
-                if let Some(launch) = prepare(data, request) {
-                    // Anything still queued is moot: the display is about to
-                    // change hands and the greeter is about to be killed. A
-                    // pending respawn is moot too, and would otherwise fire in
-                    // the next login generation.
-                    data.state.pending_actions.clear();
-                    // Backend requests go the same way, and for a sharper
-                    // reason: a VBlank(crtc) queued between the last
-                    // drain_requests and the handoff is acted on in the *next*
-                    // generation, against a freshly built Device where that CRTC
-                    // handle may belong to a different Head — so frame_submitted
-                    // is called for a frame nobody queued and logs an error. A
-                    // DeviceAdded or RescanConnectors left here is equally a
-                    // statement about a device that no longer exists.
-                    data.state.requests.clear();
-                    disarm_respawn(data, loop_handle);
-                    return Handled::HandOff(launch);
-                }
+            Action::Launch { username } => {
+                // Anything still queued is moot: the display is about to change
+                // hands and the greeter is about to be killed. A pending
+                // respawn is moot too, and would otherwise fire in the next
+                // login generation.
+                data.state.pending_actions.clear();
+                // Backend requests go the same way, and for a sharper reason: a
+                // VBlank(crtc) queued between the last drain_requests and the
+                // handoff is acted on in the *next* generation, against a
+                // freshly built Device where that CRTC handle may belong to a
+                // different Head — so frame_submitted is called for a frame
+                // nobody queued and logs an error. A DeviceAdded or
+                // RescanConnectors left here is equally a statement about a
+                // device that no longer exists.
+                data.state.requests.clear();
+                disarm_respawn(data, loop_handle);
+                return Handled::HandOff { username };
             }
 
             Action::RestartGreeter { error } => {
@@ -92,36 +98,41 @@ pub fn handle_action(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
     Handled::Continue
 }
 
-/// Resolve a launch request while still privileged.
+/// Block until the user's session ends, dispatching the loop while it runs.
 ///
-/// Done before the greeter is torn down so a failure can be reported to the
-/// greeter that is still on screen, rather than after the display has gone dark.
-fn prepare(data: &mut LoopData, request: LaunchRequest) -> Option<Launch> {
-    let vt = data.state.config.vt;
-    let session_id = request.session.id.clone();
-
-    match Launch::prepare(
-        &request.session,
-        &request.username,
-        vt,
-        request.pam_env,
-        request.extra_env,
-    ) {
-        Ok(launch) => {
-            // Recorded now rather than after exec: the session is what the user
-            // chose, and a compositor that crashes on startup should still be
-            // preselected so they can try it again or pick another.
-            data.state
-                .login
-                .remember_session(&request.username, &session_id);
-            Some(launch)
+/// The backend has released the display and killed the greeter, so there is
+/// nothing left to draw and nothing to serve; what the loop is still doing is
+/// carrying the helper's messages, which arrive on the auth channel, and reading
+/// the signalfd so a `systemctl stop wdm` during a session is noticed rather
+/// than left pending for hours.
+///
+/// It deliberately does **not** return early when `running` goes false. wdm
+/// exiting while the user's session still owns the display would orphan it, and
+/// the shutdown path the backend already has runs after this returns.
+pub fn wait_for_session(
+    event_loop: &mut EventLoop<'static, LoopData>,
+    data: &mut LoopData,
+) -> SessionOutcome {
+    loop {
+        if let Some(outcome) = data.state.login.take_session_outcome() {
+            // Actions queued while the display was gone belong to nothing: the
+            // greeter that could have caused them is dead, and the next login
+            // generation starts from a fresh greeter. Left here they would be
+            // drained by the next generation's first handle_action.
+            data.state.pending_actions.clear();
+            return outcome;
         }
-        Err(e) => {
-            log::error!("preparing session {session_id}: {e}");
-            data.state.queue_action(Action::RestartGreeter {
-                error: Some(e.to_string()),
-            });
-            None
+
+        // A timeout rather than a block, so a wedged auth channel cannot make
+        // this unresponsive to anything else the loop still owns.
+        if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(250)), data) {
+            // Nothing here can recover: the loop is the only way the session's
+            // end could ever be heard about, so spinning on a broken one would
+            // hang wdm for the life of the machine. Reporting it as a failed
+            // session at least gets a greeter back on screen with a reason.
+            log::error!("dispatching while the session runs: {e}");
+            data.state.pending_actions.clear();
+            return SessionOutcome::Failed(format!("wdm's event loop failed: {e}"));
         }
     }
 }

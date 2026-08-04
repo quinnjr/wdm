@@ -5,6 +5,39 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **PAM now runs in its own process, and the user's session is forked from it.**
+  0.4.0 unblocked login by removing `pam_kwallet5` from the shipped PAM stacks.
+  That treated one module; the hazard was structural, and **any** module that
+  forks and exits during `pam_open_session` reproduced it. It is now closed, and
+  `pam_kwallet5` is started again on all three distributions.
+
+  `wdm --pam-helper` is a freshly `exec`'d copy of wdm's own binary that talks to
+  wdm over a `SOCK_SEQPACKET` socket on fd 3. It has never loaded a graphics
+  driver, so there are no `atexit` handlers and no EGL state for a forking module
+  to corrupt. And wdm releases the DRM device, the renderer, libinput and the
+  libseat session **before** it tells the helper to open the session at all, so
+  there is no display state anywhere in the process that runs PAM.
+
+  Three further defects fall out of the same change, none of which was fixable by
+  configuration:
+
+  - `pam_loginuid: set_loginuid failed`. The kernel refuses the write unless the
+    writing task is the one `/proc/self` names — the thread-group leader — and
+    PAM ran on a spawned thread. The helper is single-threaded, and the session
+    it forks inherits the value.
+  - `pam_systemd: Failed to set ambient capabilities`. `prctl` is per-thread, so
+    the capabilities never reached the session even when the call succeeded.
+  - `pam_keyinit`, `pam_selinux` and `pam_namespace` never reached the session,
+    because `fork()` from `main` copies only the calling thread's state. The
+    session is now forked from the process that ran `pam_open_session`.
+
+  A session that fails to start after the display has been released can no longer
+  be reported immediately — there is no greeter on screen. It is shown by the
+  next greeter as `last_error`, which is the price of not opening a PAM session
+  while holding the GPU.
+
 ## [0.4.0] — 2026-08-04
 
 A security and conformance release. **Upgrade if you run 0.3.0**: an

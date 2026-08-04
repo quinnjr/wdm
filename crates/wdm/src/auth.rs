@@ -160,10 +160,19 @@ pub enum AuthEvent {
     Ok,
     /// The attempt failed and the thread is exiting.
     Failed(String),
-    /// The PAM session is open; these variables belong in the session's
-    /// environment.
-    SessionOpened { env: Vec<(String, String)> },
-    /// `pam_open_session` failed and the thread is exiting.
+    /// The user's session is running, as a child of the helper.
+    ///
+    /// Informational: wdm is not the session's parent and cannot `wait` on this
+    /// pid. What it is for is the log line naming the process that now owns the
+    /// display, which is the first thing anyone reads when a login goes dark.
+    SessionStarted { pid: u32 },
+    /// The user's session exited.
+    ///
+    /// `status` is the helper's rendering of the wait status, because everything
+    /// wdm does with it is put it in a log line or a `last_error`.
+    SessionEnded { status: String, ran_for: Duration },
+    /// `pam_open_session`, the environment assembly or the fork failed, and the
+    /// helper is exiting.
     SessionFailed(String),
 }
 
@@ -312,37 +321,46 @@ impl AuthHandle {
         self.wire.send(&Msg::Response { id, secret });
     }
 
-    /// Ask the helper to open the PAM session for the chosen session.
+    /// Ask the helper to open the PAM session and run the user's session.
     ///
-    /// Valid only after [`AuthEvent::Ok`]. The helper replies with
-    /// [`AuthEvent::SessionOpened`] or [`AuthEvent::SessionFailed`].
-    /// `session_type` and `desktop` are the values `crate::session::build_env`
-    /// gives the child, delivered here too because pam_systemd reads them from
-    /// the PAM environment, not from the child's.
-    pub fn start_session(&self, session_type: String, desktop: String) {
-        // ponytail: the rest of `Msg::Launch` is empty because wdm still forks
-        // and `exec`s the session itself, so the helper needs none of it. When
-        // the fork moves into the helper this method gains the session and the
-        // filtered environment as arguments and fills them in; the message is
-        // already shaped for that so the wire does not have to change twice.
+    /// Valid only after [`AuthEvent::Ok`], and — this is the part no type can
+    /// express — only once wdm has released the display. The helper replies with
+    /// [`AuthEvent::SessionStarted`] then [`AuthEvent::SessionEnded`], or with
+    /// [`AuthEvent::SessionFailed`]. Sending this while the DRM device, the
+    /// renderer or the seat are still held reintroduces the whole defect the
+    /// helper exists to fix, because `pam_open_session` runs the moment it
+    /// arrives. The ordering is enforced by the one call site,
+    /// [`crate::login::Login::launch`], and by review.
+    ///
+    /// `session_type` and `desktop` are sent as their own fields as well as
+    /// being derivable from `session`, because they go into PAM's *own*
+    /// environment before `open_session` — where pam_systemd reads them — which
+    /// is a different place from the launched child's environment.
+    pub fn start_session(
+        &self,
+        session: &crate::sessions::Session,
+        extra_env: Vec<(String, String)>,
+        vt: u32,
+    ) {
         self.wire.send(&Msg::Launch {
-            session_type,
-            desktop,
-            session_id: String::new(),
-            session_name: String::new(),
-            session_exec: String::new(),
-            extra_env: Vec::new(),
-            vt: 0,
+            session_type: session.xdg_session_type().to_owned(),
+            desktop: session.xdg_session_desktop().to_owned(),
+            session_id: session.id.clone(),
+            session_name: session.name.clone(),
+            session_exec: session.exec.clone(),
+            extra_env,
+            vt,
         });
     }
 
-    /// Tell the helper the user's session process has exited.
+    /// Dismiss the helper once the session is over.
     ///
-    /// This is what runs `pam_close_session`, so it must be sent even when the
-    /// session failed immediately, or modules like `pam_systemd` leak a logind
-    /// session. Closing the socket is the whole message: the helper is holding
-    /// the PAM session open on a blocking read, and EOF is what ends it. The
-    /// reader thread then reaps the process, so nothing is left as a zombie.
+    /// The helper pairs `pam_close_session` itself, on the handle that opened
+    /// the session, immediately after it reaps the session process — it has to,
+    /// because it is the only process holding that handle. So this is not what
+    /// runs it. What it does is release wdm's end: the reader thread's `recv`
+    /// ends, it reaps the helper, and nothing is left as a zombie or as a socket
+    /// wdm still believes in. Idempotent, and also reached through `Drop`.
     pub fn session_ended(&self) {
         self.wire.close();
     }
@@ -462,15 +480,29 @@ fn forward(wire: &Wire, events: &calloop::channel::Sender<AuthEvent>) -> Outcome
                 send(events, AuthEvent::Failed(reason.clone()));
                 return Outcome::Reported;
             }
-            Msg::SessionOpened { env } => {
-                send(events, AuthEvent::SessionOpened { env: env.clone() });
+            Msg::SessionStarted { pid } => send(events, AuthEvent::SessionStarted { pid: *pid }),
+            Msg::SessionEnded { status, ran_for_ms } => {
+                send(
+                    events,
+                    AuthEvent::SessionEnded {
+                        status: status.clone(),
+                        ran_for: Duration::from_millis(*ran_for_ms),
+                    },
+                );
+                // Terminal, and it has to be: the helper's very next acts are
+                // pam_close_session and exit, which close the socket. Without
+                // this the loop would fall out on EOF with `authenticated` set
+                // and invent a SessionFailed for a session that ended normally —
+                // which wdm would then show the next greeter as the reason the
+                // login went wrong.
+                return Outcome::Reported;
             }
             Msg::SessionFailed(reason) => {
                 send(events, AuthEvent::SessionFailed(reason.clone()));
                 return Outcome::Reported;
             }
-            // Everything else is either wdm's own direction or belongs to the
-            // layer that moves the session fork into the helper.
+            // wdm's own direction. A helper sending one of these is confused or
+            // hostile, and either way there is nothing here that acts on it.
             other => log::debug!("ignoring {} from the PAM helper", name_of(other)),
         }
     }
@@ -495,7 +527,6 @@ fn name_of(msg: &Msg) -> &'static str {
         Msg::Prompt { .. } => "prompt",
         Msg::Ok => "ok",
         Msg::Failed(_) => "failed",
-        Msg::SessionOpened { .. } => "session_opened",
         Msg::SessionStarted { .. } => "session_started",
         Msg::SessionFailed(_) => "session_failed",
         Msg::SessionEnded { .. } => "session_ended",
@@ -770,11 +801,22 @@ mod tests {
         }
     }
 
-    /// prompt -> respond -> ok -> start_session -> SessionOpened -> session_ended.
+    /// A session, as `login.rs` describes one.
+    fn a_session() -> crate::sessions::Session {
+        crate::sessions::Session {
+            id: "sway.desktop".to_owned(),
+            name: "Sway".to_owned(),
+            exec: "sway".to_owned(),
+            session_type: crate::sessions::SessionType::Wayland,
+            path: std::path::PathBuf::from("/usr/share/wayland-sessions/sway.desktop"),
+        }
+    }
+
+    /// prompt -> respond -> ok -> start_session -> started -> ended -> dismissed.
     ///
     /// The whole seam in one test, with no PAM and no process: what
     /// `AuthHandle` puts on the wire, and that what comes back reaches the event
-    /// loop as the same `AuthEvent`s `login.rs` has always consumed.
+    /// loop as the same `AuthEvent`s `login.rs` consumes.
     #[test]
     fn a_fake_helper_drives_the_conversation_end_to_end() {
         let (ours, helper) = fake_helper();
@@ -814,39 +856,64 @@ mod tests {
         helper.send(&Msg::Ok.encode()).unwrap();
         assert!(matches!(events.next("the verdict"), AuthEvent::Ok));
 
-        handle.start_session("wayland".to_owned(), "sway".to_owned());
+        handle.start_session(
+            &a_session(),
+            vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())],
+            7,
+        );
         let launch = expect(&helper, "the launch");
         let Msg::Launch {
             session_type,
             desktop,
-            ..
+            session_id,
+            session_name,
+            session_exec,
+            extra_env,
+            vt,
         } = &launch
         else {
             panic!("expected a launch, got {}", name_of(&launch));
         };
+        // Everything the helper needs to run the session, because it has no
+        // access to wdm's configuration and cannot ask for any of it later.
         assert_eq!(session_type, "wayland");
         assert_eq!(desktop, "sway");
+        assert_eq!(session_id, "sway.desktop");
+        assert_eq!(session_name, "Sway");
+        assert_eq!(session_exec, "sway");
+        assert_eq!(
+            extra_env,
+            &vec![("LANG".to_owned(), "de_DE.UTF-8".to_owned())]
+        );
+        assert_eq!(*vt, 7);
 
-        // The environment `pam_open_session` produced. wdm still forks the
-        // session itself, so this is what it launches with.
+        // The helper forks the session and says so. wdm is not its parent, so
+        // this pid is for the log line and nothing else.
+        helper
+            .send(&Msg::SessionStarted { pid: 4321 }.encode())
+            .unwrap();
+        let AuthEvent::SessionStarted { pid } = events.next("the session starting") else {
+            panic!("expected the session to start");
+        };
+        assert_eq!(pid, 4321);
+
         helper
             .send(
-                &Msg::SessionOpened {
-                    env: vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())],
+                &Msg::SessionEnded {
+                    status: "exit status: 0".to_owned(),
+                    ran_for_ms: 90_000,
                 }
                 .encode(),
             )
             .unwrap();
-        let AuthEvent::SessionOpened { env } = events.next("the session environment") else {
-            panic!("expected the session environment");
+        let AuthEvent::SessionEnded { status, ran_for } = events.next("the session ending") else {
+            panic!("expected the session to end");
         };
-        assert_eq!(
-            env,
-            vec![("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())]
-        );
+        assert_eq!(status, "exit status: 0");
+        assert_eq!(ran_for, Duration::from_secs(90));
 
-        // And the end of the session is a closed socket, which is what runs
-        // pam_close_session on the far side.
+        // And wdm dismisses the helper, which has already paired
+        // pam_close_session itself.
         handle.session_ended();
         let mut buf = [0u8; 64];
         helper
@@ -864,6 +931,46 @@ mod tests {
         assert!(
             events.is_quiet(),
             "session_ended produced an event of its own"
+        );
+    }
+
+    #[test]
+    fn a_session_that_ended_normally_is_not_also_reported_as_a_failure() {
+        // The helper's next acts after SessionEnded are pam_close_session and
+        // exit, which close the socket. The reader thread sees EOF with the
+        // attempt authenticated, and its rule for that is "the helper vanished
+        // after authenticating" — SessionFailed. Without SessionEnded being
+        // terminal, every successful login would be followed by a spurious
+        // failure, and wdm would greet the user's next login with "could not
+        // start session" as the reason their last one ended.
+        let (ours, helper) = fake_helper();
+        let (events_tx, events_rx) = calloop::channel::channel();
+        let mut events = EventStream::new(events_rx);
+
+        let _handle = AuthHandle::adopt(ours, None, "testuser", events_tx);
+        helper.send(&Msg::Ok.encode()).unwrap();
+        assert!(matches!(events.next("the verdict"), AuthEvent::Ok));
+
+        helper
+            .send(
+                &Msg::SessionEnded {
+                    status: "exit status: 0".to_owned(),
+                    ran_for_ms: 1_000,
+                }
+                .encode(),
+            )
+            .unwrap();
+        assert!(matches!(
+            events.next("the session ending"),
+            AuthEvent::SessionEnded { .. }
+        ));
+
+        // Exactly what the helper does next.
+        drop(helper);
+
+        assert!(
+            events.is_quiet(),
+            "a session that ended normally was also reported as failed"
         );
     }
 
