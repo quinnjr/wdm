@@ -644,13 +644,60 @@ fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
 
 /// PAM's own message if it gave one, otherwise the error code's description.
 ///
-/// The text reaches the greeter, so it must not leak whether an account exists:
-/// PAM already conflates "no such user" and "wrong password" into
-/// `Authentication failure`, and this preserves that.
+/// Only for failures that happen **after** a credential has been proven —
+/// account management, the expired-password change, opening the session. There
+/// the text is genuinely useful ("account expired", "password too short") and
+/// the person reading it has already demonstrated they own the account.
+///
+/// Authentication failures go through [`describe_auth`] instead, and the split
+/// is the whole point: see there.
 pub(crate) fn describe(e: &pam_client2::Error) -> String {
     e.message()
         .map(str::to_owned)
         .unwrap_or_else(|| e.to_string())
+}
+
+/// What the greeter is told when `pam_authenticate` fails: always this.
+///
+/// One constant for every cause, because the greeter is untrusted and anyone
+/// standing at the login screen can drive it. A message that distinguishes "no
+/// such user" from "wrong password" turns the login screen into an account
+/// oracle: try a name, read the answer, learn whether it exists — without a
+/// password and without ever succeeding at anything wdm would rate limit as a
+/// login.
+///
+/// This used to be [`describe`], on the stated grounds that "PAM already
+/// conflates 'no such user' and 'wrong password' into `Authentication
+/// failure`". That is not true. Measured against this repository's own
+/// `/etc/pam.d/wdm`, an account that does not exist comes back as **"User not
+/// known to the underlying authentication module"** while a wrong password
+/// comes back as "Authentication failure" — so the comment asserting the leak
+/// was closed was itself the reason nobody looked.
+///
+/// The real reason is logged at `info` on the way past, so an administrator
+/// reading the journal still learns which it was. The greeter does not.
+///
+/// ponytail: this closes the *message* channel only. A nonexistent account can
+/// still be distinguished by timing, because a stack that never reaches
+/// `pam_unix`'s hashing answers sooner. Closing that needs a constant-time
+/// floor on the whole authenticate phase — `pam_faildelay`, or a deadline wdm
+/// holds itself — which is a change to how long every failed login takes and
+/// wants measuring before it is chosen.
+pub(crate) const AUTH_FAILED: &str = "Authentication failure";
+
+/// The greeter-facing text for a failed `pam_authenticate`.
+///
+/// A function rather than using [`AUTH_FAILED`] directly, so the log line and
+/// the constant cannot drift apart at a call site that forgets one of them.
+///
+/// Takes the cause already rendered, rather than the `pam_client2::Error`,
+/// because `Error::new` is `pub(crate)` in that crate — a test cannot build one,
+/// and this is the function most worth having a test on.
+pub(crate) fn describe_auth(username: &str, cause: &str) -> String {
+    // The real cause goes to the journal only; it is deliberately not in the
+    // returned value, which is what the greeter sees.
+    log::info!("authentication failed for {username}: {cause}");
+    AUTH_FAILED.to_owned()
 }
 
 pub(crate) fn os_to_string(s: &OsStr) -> Option<String> {
@@ -669,6 +716,41 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn every_authentication_failure_reads_the_same_to_the_greeter() {
+        // The account oracle this closes. `describe` returns PAM's own words,
+        // and on this repository's own /etc/pam.d/wdm those words distinguish
+        // the two cases — measured: a nonexistent account yields "User not
+        // known to the underlying authentication module", a wrong password
+        // yields "Authentication failure". Anyone at the login screen could
+        // therefore enumerate accounts by reading the reply, with no password
+        // and nothing wdm rate limits as a login.
+        //
+        // The exact strings this host's PAM stack produced for the two cases,
+        // captured by running the real helper against the real /etc/pam.d/wdm.
+        // Both must come out the other side identical.
+        for cause in [
+            "User not known to the underlying authentication module",
+            "Authentication failure",
+            "Permission denied",
+            "Have exhausted maximum number of retries for service",
+            "Authentication service cannot retrieve authentication info",
+        ] {
+            assert_eq!(
+                describe_auth("someone", cause),
+                AUTH_FAILED,
+                "{cause:?} reached the greeter as its own text, which distinguishes \
+                 it from the others and makes the login screen an account oracle"
+            );
+        }
+
+        // The username must not leak either — it is the thing being probed.
+        assert!(
+            !describe_auth("alice", "User not known").contains("alice"),
+            "the reply named the account that was probed"
+        );
+    }
 
     #[test]
     fn pam_session_env_pairs_both_variables() {

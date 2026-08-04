@@ -68,8 +68,8 @@ use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
 use zeroize::Zeroize;
 
 use crate::auth::{
-    PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, describe, next_prompt_id,
-    os_to_string, pam_session_env,
+    PromptStyle, RESPONSE_TIMEOUT, SERVICE, SessionDescription, describe, describe_auth,
+    next_prompt_id, os_to_string, pam_session_env,
 };
 use crate::pamwire::{MAX_MESSAGE, Msg};
 use crate::session::Launch;
@@ -569,8 +569,10 @@ impl<C: ConversationHandler> Pam for LibPam<'_, C> {
         // DISALLOW_NULL_AUTHTOK: an account with an empty password must not be
         // loginable from the greeter.
         if let Err(e) = self.context.authenticate(Flag::DISALLOW_NULL_AUTHTOK) {
-            log::info!("authentication failed for {}: {e}", self.start.username);
-            return Err(describe(&e));
+            // Not `describe`: every authenticate failure looks the same to the
+            // greeter, or the login screen is an account oracle. The real cause
+            // is logged inside. See `auth::describe_auth`.
+            return Err(describe_auth(&self.start.username, &describe(&e)));
         }
 
         match self.context.acct_mgmt(Flag::DISALLOW_NULL_AUTHTOK) {
