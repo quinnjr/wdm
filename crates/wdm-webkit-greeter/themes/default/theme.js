@@ -288,6 +288,16 @@ form.addEventListener("submit", (event) => {
     el("answer").disabled = true;
     wdm.respond(el("answer").value);
   } else {
+    // Enter on an empty field is not a login attempt and must not cost one:
+    // it would run the whole PAM stack against an empty password, fail, and
+    // charge pam_faillock, so three stray presses of Enter would lock the
+    // account. Only the first prompt is guarded — once a conversation is
+    // underway an empty answer is a real choice, and is answered above.
+    if (el("answer").value === "") {
+      el("prompt").textContent = "Enter your password";
+      el("answer").focus();
+      return;
+    }
     // Keep what was typed so the prompt PAM is about to send can be answered
     // with it, rather than making the user type their password twice.
     pendingAnswer = el("answer").value;

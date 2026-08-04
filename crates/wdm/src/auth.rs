@@ -547,6 +547,12 @@ impl ChannelConversation {
 
     /// Emit text wdm composed itself, which is already UTF-8.
     fn emit_text(&self, id: u32, text: String, style: PromptStyle) -> Result<(), ErrorCode> {
+        // The prompt text, never a response: this is what PAM asked, and the
+        // answers are the one thing in this file that must not reach a log.
+        // Without this there is no way to see what a PAM stack actually sent,
+        // which is the first question every "the greeter shows something odd"
+        // report needs answered.
+        log::debug!("prompt {id} ({style:?}): {text:?}");
         self.events
             .send(AuthEvent::Prompt { id, text, style })
             .map_err(|_| {

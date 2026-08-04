@@ -7,6 +7,49 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ### Fixed
 
+- **`pam_kwallet5` crashed the compositor mid-login, on NVIDIA.** The user
+  authenticated successfully and then lost the display manager. It is no longer
+  started from the shipped PAM stacks.
+
+  `pam_kwallet5` forks inside `pam_sm_open_session` and, on its error path,
+  calls `exit()` in the child rather than exec'ing. wdm still holds DRM and a
+  live EGL context at that point — `pam_open_session` runs before the display is
+  released, deliberately — so the child ran the graphics driver's `atexit`
+  handlers against GPU state it shares with the parent. On NVIDIA that faulted
+  wdm's own channel (`NVRM: Xid 31 ... name=wdm`), after which every frame was
+  rejected with "Device is currently paused" and wdm died. `pam_gnome_keyring`
+  forks too but execs, which resets the inherited state, so it is safe and
+  stays.
+
+  Commenting the module out is a workaround, not the fix: **any** PAM module
+  that forks and exits during `pam_open_session` can do this. The fix is for wdm
+  to run the PAM session somewhere that holds no graphics state, and until that
+  lands the shipped stacks do not start one that is known to.
+
+- **An empty password cost a login attempt.** Pressing Enter on an empty field
+  ran the whole PAM stack, failed, and was recorded by `pam_faillock` — so three
+  stray presses of Enter locked the account. All three greeters now refuse to
+  open a conversation for an empty first answer and say "Enter your password"
+  instead. Only the first answer is guarded: once a conversation is underway an
+  empty answer is a real choice, and is still sent.
+
+- **The GTK greeter showed passwords in plaintext.** Its entry was masked by
+  `refresh` when a prompt arrived, and with nothing arming PAM until the user
+  submits there is no longer a prompt at startup — which is exactly the state
+  the password is typed into. The entry is now built masked and re-masked after
+  every attempt. The reference greeter (`is_none_or(|p| p.secret)`) and the
+  webkit theme (`<input type="password">`) already defaulted to masked.
+
+- **The GTK greeter showed an empty red error box.** Its error and notice labels
+  are hidden by `refresh`, which only runs when the model's revision changes —
+  so on a greeter nobody had touched it never ran, and both labels sat visible
+  and empty. Their CSS gives them a background, so this was a blank alarm under
+  the password field. Both are now built hidden.
+
+- Prompts are logged at debug level (`WDM_LOG=wdm=debug`), which is what makes
+  "the greeter is showing something odd" answerable. The prompt text only —
+  responses are the one thing in that file that must never reach a log.
+
 - **An untouched login screen locked the account out.** This is the serious one:
   it needed no interaction, no attacker, and no misconfiguration — only a
   machine left sitting at its greeter.

@@ -141,16 +141,43 @@ pub fn build(app: &Application, model: Shared, link: SharedLink) -> (Application
         users: DropDown::new(None::<StringList>, None::<gtk4::Expression>),
         sessions: DropDown::new(None::<StringList>, None::<gtk4::Expression>),
         prompt: Label::builder().halign(Align::Start).build(),
-        entry: Entry::builder().activates_default(true).build(),
+        // Masked from the very first frame. `refresh` sets this from
+        // `prompt.secret` when PAM asks, but PAM is no longer asked until the
+        // user submits — so the state the login screen sits in, and the one they
+        // type their password into, is this one. Defaulting to visible put the
+        // password on screen in plaintext.
+        //
+        // Secret is the right default rather than merely the safe one: every
+        // PAM stack that reaches a greeter opens with a password. A stack whose
+        // first question is a username or a token unmasks it on arrival, which
+        // is the direction that can be corrected on screen — the other cannot.
+        entry: Entry::builder()
+            .activates_default(true)
+            .visibility(false)
+            .input_purpose(InputPurpose::Password)
+            .build(),
+        // Both start hidden. A GTK widget is visible on construction, and these
+        // two are only ever hidden by `refresh`, which runs when the model's
+        // revision changes — so on a greeter nobody has touched it does not run
+        // at all, and the labels sat there empty. Their CSS gives them a
+        // background, so an empty `error` is a small blank red box under the
+        // entry: an alarm with nothing behind it, on a screen whose whole job is
+        // to be trustworthy.
+        //
+        // Hidden is also what `refresh` itself decides for them —
+        // `set_visible(error.is_some())` — so this is the same rule applied one
+        // frame earlier rather than a second opinion about it.
         error: Label::builder()
             .halign(Align::Start)
             .wrap(true)
+            .visible(false)
             .css_classes(["error"])
             .build(),
         notice: Label::builder()
             .halign(Align::Start)
             .wrap(true)
             .xalign(0.0)
+            .visible(false)
             .css_classes(["notice"])
             .build(),
         submit: Button::with_label("Log in"),
@@ -459,16 +486,29 @@ impl Ui {
             self.prompt.set_label("Checking…");
             self.flush();
         } else if !self.attempting.get() {
+            // Enter on an empty field is not a login attempt, and must not cost
+            // one. Opening a conversation here would run the whole PAM stack
+            // against an empty password, fail, and charge `pam_faillock` for it
+            // — so three stray presses of Enter on a login screen would lock the
+            // account. Someone brushing the keyboard is not a failed login.
+            //
+            // Refused with a sentence rather than silently: an Enter that does
+            // nothing at all reads as a wedged greeter.
+            //
+            // Only the *first* prompt is guarded this way. Once a conversation
+            // is underway an empty answer is a real choice — a stack that asks
+            // for an optional token accepts one — and it is answered above.
+            if text.is_empty() {
+                self.prompt.set_label("Enter your password");
+                self.entry.grab_focus();
+                return;
+            }
+
             // No prompt yet, because no conversation is open until right now.
             // Keep what was typed so the prompt PAM is about to send can be
             // answered with it: `begin_auth` clears the entry, and asking the
             // user to type their password a second time because the greeter
             // asked PAM a fraction of a second too late is not a login screen.
-            //
-            // Empty is still worth keeping rather than skipping: a stack whose
-            // first question is not a secret — a token, a username — is answered
-            // by whatever is in the box, and an empty answer to a password is a
-            // legitimate attempt that PAM should reject on its own terms.
             *self.pending_answer.borrow_mut() = Some(text);
             self.begin_auth();
             self.flush();
@@ -669,6 +709,11 @@ impl Ui {
         *self.pending_answer.borrow_mut() = None;
         self.prompt.set_label(wait_prompt(link_alive, attempted));
         self.entry.set_text("");
+        // Back to masked. A previous attempt may have ended on a prompt PAM said
+        // was echoable — a username, a token — and leaving the entry unmasked
+        // would put the next password on screen in plaintext.
+        self.entry.set_visibility(false);
+        self.entry.set_input_purpose(InputPurpose::Password);
         if !link_alive {
             self.entry.set_sensitive(false);
             self.submit.set_sensitive(false);

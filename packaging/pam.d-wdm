@@ -19,4 +19,16 @@ password    include     system-login
 
 session     include     system-login
 -session    optional    pam_gnome_keyring.so auto_start
--session    optional    pam_kwallet5.so auto_start
+# pam_kwallet5 is deliberately NOT started here. It forks inside
+# pam_sm_open_session and, on the error path, calls exit() in the child rather
+# than exec'ing. wdm still holds DRM and a live EGL context at that point, so
+# the child runs the graphics driver's atexit handlers against GPU state it
+# shares with the parent. On NVIDIA that faults wdm's own channel
+# (NVRM: Xid 31 ... name=wdm) and takes the compositor down mid-login: the user
+# authenticates successfully and then loses the display manager. pam_gnome_keyring
+# forks too but execs, which resets the inherited state, so it is safe and stays.
+#
+# Re-enable it only once wdm runs the PAM session somewhere that holds no
+# graphics state. Until then this line is a crash on any machine with a driver
+# whose atexit handlers touch the GPU.
+#-session    optional    pam_kwallet5.so auto_start

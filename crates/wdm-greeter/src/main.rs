@@ -408,6 +408,17 @@ impl App {
             // Keep what was typed so the prompt PAM is about to send can be
             // answered with it, rather than making the user type it twice.
             if !self.authenticating {
+                // Enter on an empty field is not a login attempt and must not
+                // cost one: it would run the PAM stack against an empty
+                // password, fail, and charge `pam_faillock`, so three stray
+                // presses of Enter would lock the account. Only the first
+                // prompt is guarded — once a conversation is underway an empty
+                // answer is a real choice, and is answered above.
+                if self.answer.is_empty() {
+                    self.error = Some("Enter your password".to_owned());
+                    self.needs_redraw = true;
+                    return;
+                }
                 self.pending_answer = Some(std::mem::take(&mut self.answer));
                 self.begin_auth();
             }
