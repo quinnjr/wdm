@@ -80,10 +80,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<(String, String)>, EnvError> {
         // A name may not contain '=' by construction of split_once, but reject
         // anything that is not a plausible shell variable name so a greeter
         // cannot smuggle oddities into the session's environment.
-        if !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
             return Err(EnvError::InvalidName);
         }
 

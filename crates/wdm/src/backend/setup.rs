@@ -192,11 +192,7 @@ pub fn build(
 /// A greeter that will not start is not fatal: it goes through the same backoff
 /// and give-up policy as one that crashes, so a misconfigured `greeter.command`
 /// ends with an explanation on screen rather than wdm exiting.
-pub fn start(
-    data: &mut LoopData,
-    loop_handle: &LoopHandle<'static, LoopData>,
-    socket_name: &str,
-) {
+pub fn start(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>, socket_name: &str) {
     log::info!("greeter socket is {socket_name}");
     crate::backend::spawn_greeter(data, loop_handle);
 }
@@ -263,8 +259,6 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
 
     Ok(cred.uid)
 }
-
-
 
 /// Lock the socket to the greeter account.
 ///
@@ -347,7 +341,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-
     #[test]
     fn only_the_greeter_account_may_connect() {
         // The socket's mode and `peer_uid` are covered on their own below and
@@ -367,7 +360,10 @@ mod tests {
             "root was let in; wdm is root, so this is the connection that must not be trusted"
         );
         assert!(
-            !greeter_may_connect(Err(std::io::Error::from_raw_os_error(libc::EINVAL)), greeter),
+            !greeter_may_connect(
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                greeter
+            ),
             "a connection whose credentials could not be read was let in"
         );
     }

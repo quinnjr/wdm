@@ -1256,8 +1256,7 @@ mod tests {
 
     impl Harness {
         fn new(users: Vec<User>, default_session: Option<&str>) -> Self {
-            let display =
-                smithay::reexports::wayland_server::Display::<Wdm>::new().unwrap();
+            let display = smithay::reexports::wayland_server::Display::<Wdm>::new().unwrap();
             let handle = display.handle();
 
             let (events, auth_rx) = smithay::reexports::calloop::channel::channel();
@@ -1411,10 +1410,7 @@ mod tests {
             .position(|m| m.opcode == wire::DONE)
             .expect("no done event");
         assert!(default < done, "default_session arrived after done");
-        assert_eq!(
-            events[default].args().string(),
-            "river.desktop"
-        );
+        assert_eq!(events[default].args().string(), "river.desktop");
     }
 
     #[test]
@@ -1459,9 +1455,9 @@ mod tests {
         // What Wdm::cancel does, and what a greeter reaches by destroying its
         // object or by dying and being respawned.
         h.state.login.reset();
-        h.state.login.handle_auth_event(AuthEvent::Failed(
-            "Authentication failure".to_owned(),
-        ));
+        h.state
+            .login
+            .handle_auth_event(AuthEvent::Failed("Authentication failure".to_owned()));
 
         // The accounting half. Switching user in a greeter cancels, so charging
         // a cancellation accrues rate-limit penalties for logins nobody

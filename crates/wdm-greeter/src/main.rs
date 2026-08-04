@@ -83,12 +83,7 @@ struct Slot {
 }
 
 impl Buffers {
-    fn new(
-        shm: &WlShm,
-        qh: &QueueHandle<App>,
-        width: i32,
-        height: i32,
-    ) -> Option<Self> {
+    fn new(shm: &WlShm, qh: &QueueHandle<App>, width: i32, height: i32) -> Option<Self> {
         use rustix::fs::{MemfdFlags, memfd_create};
 
         let slot_len = (width as usize) * (height as usize) * 4;
@@ -140,9 +135,7 @@ impl Buffers {
 
     /// A slot the compositor is not currently reading from.
     fn free_slot(&self) -> Option<&Slot> {
-        self.slots
-            .iter()
-            .find(|s| !s.busy.load(Ordering::Relaxed))
+        self.slots.iter().find(|s| !s.busy.load(Ordering::Relaxed))
     }
 }
 
@@ -375,10 +368,7 @@ impl App {
                 self.session_index = self.sessions.len().saturating_sub(1);
                 self.needs_redraw = true;
             }
-            keysyms::KEY_Return
-            | keysyms::KEY_KP_Enter
-            | keysyms::KEY_Escape
-            | keysyms::KEY_F2 => {
+            keysyms::KEY_Return | keysyms::KEY_KP_Enter | keysyms::KEY_Escape | keysyms::KEY_F2 => {
                 // Escape and Enter both close on the highlighted row: moving the
                 // highlight *is* the selection, so there is nothing to revert.
                 self.menu_open = false;
@@ -945,10 +935,7 @@ impl Dispatch<WlKeyboard, ()> for App {
 
         match event {
             wl_keyboard::Event::Keymap { format, fd, size } => {
-                if !matches!(
-                    format.into_result(),
-                    Ok(wl_keyboard::KeymapFormat::XkbV1)
-                ) {
+                if !matches!(format.into_result(), Ok(wl_keyboard::KeymapFormat::XkbV1)) {
                     log::error!("the compositor sent an unsupported keymap format");
                     return;
                 }

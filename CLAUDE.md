@@ -19,7 +19,10 @@ cargo build                       # whole workspace
 cargo test --workspace            # all in-file #[cfg(test)] modules
 cargo test -p wdm login::         # one module
 cargo test -p wdm the_test_name   # one test
-cargo clippy --workspace --all-targets   # must be clean; CI does not exist yet
+cargo fmt --all --check                  # must be clean
+cargo clippy --workspace --all-targets    # must be clean
+
+# All three run in CI (.github/workflows/rust.yml) on main and develop.
 
 cargo deb -p wdm --no-build              # target/debian/*.deb
 cargo generate-rpm -p crates/wdm         # target/generate-rpm/*.rpm

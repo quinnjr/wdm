@@ -346,7 +346,10 @@ fn build_env(
     set("XDG_SESSION_CLASS", "user".to_owned());
     set("XDG_SESSION_TYPE", session.xdg_session_type().to_owned());
     // Desktops key their own configuration off this.
-    set("XDG_SESSION_DESKTOP", session.xdg_session_desktop().to_owned());
+    set(
+        "XDG_SESSION_DESKTOP",
+        session.xdg_session_desktop().to_owned(),
+    );
 
     env
 }

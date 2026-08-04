@@ -8,7 +8,7 @@ use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, DropDown, Entry,
     InputPurpose, Label, Orientation, StringList,
 };
-use gtk4_layer_shell::{Edge, Layer, LayerShell, KeyboardMode};
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use wdm_greeter_client::{Model, Shared, SharedLink};
 
@@ -932,7 +932,10 @@ mod tests {
         let snapshot = model.error.clone();
         // What begin_auth does on the way to the first conversation.
         model.begin_attempt();
-        assert!(model.error.is_none(), "begin_attempt no longer clears error");
+        assert!(
+            model.error.is_none(),
+            "begin_attempt no longer clears error"
+        );
 
         restore_enumerate_error(&mut model, snapshot);
 
@@ -1013,7 +1016,10 @@ mod tests {
         let mut model = Model::default();
         model.error = Some(unusable_reason(true, true).unwrap().to_owned());
         model.begin_attempt();
-        assert!(model.error.is_none(), "an attempt clears `error` as it must");
+        assert!(
+            model.error.is_none(),
+            "an attempt clears `error` as it must"
+        );
 
         let unusable = unusable_reason(model.users.is_empty(), model.sessions.is_empty());
         assert_eq!(
@@ -1143,7 +1149,8 @@ mod tests {
         // and that arm is what the login screen sits in for as long as nobody
         // touches the machine — the most-seen string in the whole greeter, and
         // the one that was unchecked.
-        for (link_alive, attempted) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (link_alive, attempted) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             let line = wait_prompt(link_alive, attempted);
             assert!(
                 theme.contains(line),

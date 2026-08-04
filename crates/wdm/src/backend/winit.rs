@@ -202,8 +202,11 @@ fn render(
                 .as_ref()
                 .is_none_or(|(cached, cached_size, _)| cached != reason || *cached_size != size)
             {
-                *error_screen =
-                    Some((reason.clone(), size, crate::render::error_buffer(reason, size)));
+                *error_screen = Some((
+                    reason.clone(),
+                    size,
+                    crate::render::error_buffer(reason, size),
+                ));
                 // A new message or size is a new buffer, so a failure to import
                 // it is news again.
                 *error_screen_logged = false;
@@ -214,10 +217,8 @@ fn render(
             // smithay read the buffer's physical size as logical and scale it up
             // again. This backend hardcodes scale 1 so the two agree here — which
             // is precisely why the DRM backend's version of this went unnoticed.
-            let logical = crate::render::error_element_size(
-                size,
-                output.current_scale().fractional_scale(),
-            );
+            let logical =
+                crate::render::error_element_size(size, output.current_scale().fractional_scale());
             match MemoryRenderBufferRenderElement::from_buffer(
                 backend.renderer(),
                 (0.0, 0.0),
@@ -266,7 +267,9 @@ fn render(
         // Flipped180 because winit's framebuffer origin is the opposite of ours.
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.05, 0.05, 0.07, 1.0), &damage)?;
-        smithay::backend::renderer::utils::draw_render_elements(&mut frame, 1.0, &elements, &damage)?;
+        smithay::backend::renderer::utils::draw_render_elements(
+            &mut frame, 1.0, &elements, &damage,
+        )?;
 
         // The nested compositor synchronises for us, so the fence needs no wait.
         let _sync = frame.finish()?;

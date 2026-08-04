@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::keyboard::{KeyboardHandle, XkbConfig};
@@ -28,13 +28,13 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
     with_surface_tree_downward,
 };
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
 use smithay::wayland::input_method::{
     InputMethodHandler, InputMethodManagerState, PopupSurface as ImePopupSurface,
@@ -57,10 +57,10 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_fractional_scale,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
     delegate_input_method_manager, delegate_layer_shell, delegate_output, delegate_presentation,
-    delegate_dmabuf, delegate_seat, delegate_shm, delegate_text_input_manager,
-    delegate_viewporter, delegate_xdg_shell,
+    delegate_seat, delegate_shm, delegate_text_input_manager, delegate_viewporter,
+    delegate_xdg_shell,
 };
 
 use smithay::desktop::{
@@ -816,7 +816,10 @@ impl WlrLayerShellHandler for Wdm {
             .filter(|o| self.outputs.contains(o))
             .or_else(|| self.primary_output().cloned());
 
-        log::debug!("new layer surface {namespace:?} on {:?}", output.as_ref().map(Output::name));
+        log::debug!(
+            "new layer surface {namespace:?} on {:?}",
+            output.as_ref().map(Output::name)
+        );
 
         self.layers.push(MappedLayer { surface, output });
         self.configure_layers();
@@ -961,7 +964,12 @@ impl DmabufHandler for Wdm {
         self.dmabuf_state.get_or_insert_with(DmabufState::new)
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, _dmabuf: Dmabuf, notifier: ImportNotifier) {
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
         // ponytail: accepted without a trial import, because the renderer lives
         // in the backend and is not reachable from here. The advertised formats
         // come from that same renderer, so a client using one of them will

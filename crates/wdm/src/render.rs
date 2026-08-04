@@ -1,9 +1,9 @@
 //! Render elements and texture helpers shared by the backends.
 
-use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::{ImportAll, ImportMem};
 use smithay::utils::{Logical, Physical, Size, Transform};
 

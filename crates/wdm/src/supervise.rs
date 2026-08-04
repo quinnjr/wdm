@@ -170,9 +170,7 @@ fn create_runtime_dir_at(dir: &Path) -> std::io::Result<()> {
 /// See [`CACHE_DIR`] for why it exists at all. Unlike the runtime directory it
 /// is created and handed over in one step, because nothing is ever placed
 /// inside it by root — there is no window to keep the greeter out of.
-pub fn create_cache_dir(
-    owner: Option<(libc::uid_t, libc::gid_t)>,
-) -> Result<(), GreeterError> {
+pub fn create_cache_dir(owner: Option<(libc::uid_t, libc::gid_t)>) -> Result<(), GreeterError> {
     // Unprivileged: the greeter runs as the developer, whose own XDG_CACHE_HOME
     // is already writable, and /var/cache is not.
     let Some((uid, gid)) = owner else {
@@ -568,7 +566,10 @@ impl Greeter {
             self.rapid_failures = 1;
         }
 
-        log::warn!("greeter failure {}/{MAX_RAPID_FAILURES}", self.rapid_failures);
+        log::warn!(
+            "greeter failure {}/{MAX_RAPID_FAILURES}",
+            self.rapid_failures
+        );
 
         if self.rapid_failures >= MAX_RAPID_FAILURES {
             self.gave_up = true;
@@ -587,7 +588,10 @@ impl Greeter {
     /// The delays this policy can actually produce, longest first.
     #[cfg(test)]
     fn possible_delays() -> Vec<Duration> {
-        BACKOFF_SECS.iter().map(|s| Duration::from_secs(*s)).collect()
+        BACKOFF_SECS
+            .iter()
+            .map(|s| Duration::from_secs(*s))
+            .collect()
     }
 
     /// Stop the greeter, used before handing the display to a session.
@@ -923,9 +927,14 @@ mod tests {
         // discarded, not trusted, because an unwaitable handle says nothing
         // about how long the process lived.
         g.started = Some(Instant::now() - RAPID_FAILURE - Duration::from_secs(1));
-        let first = g.dispose(unwaitable()).expect("an error is not still running");
+        let first = g
+            .dispose(unwaitable())
+            .expect("an error is not still running");
         assert_eq!(restart_delay(&first), Some(Duration::from_secs(1)));
-        assert!(reason_of(&first).contains("could not be waited for"), "{first:?}");
+        assert!(
+            reason_of(&first).contains("could not be waited for"),
+            "{first:?}"
+        );
         assert!(!reason_of(&first).contains("exited cleanly"), "{first:?}");
         assert!(g.started.is_none(), "started must be cleared");
         assert_eq!(g.rapid_failures, 1, "must count as a rapid failure");
@@ -1038,10 +1047,7 @@ mod tests {
             describe_exit(ExitStatus::from_raw(0x100)),
             "exited with status 1"
         );
-        assert_eq!(
-            describe_exit(ExitStatus::from_raw(9)),
-            "killed by signal 9"
-        );
+        assert_eq!(describe_exit(ExitStatus::from_raw(9)), "killed by signal 9");
         // The give-up status is a sentence, not a number: it is the one that
         // most often ends up on the give-up screen.
         assert_eq!(
@@ -1084,7 +1090,10 @@ mod tests {
         for _ in 0..MAX_RAPID_FAILURES * 2 {
             g.started = Some(Instant::now() - (RAPID_FAILURE * 3));
             assert!(
-                !matches!(g.note_exit(ExitStatus::from_raw(0x100)), Disposition::GaveUp { .. }),
+                !matches!(
+                    g.note_exit(ExitStatus::from_raw(0x100)),
+                    Disposition::GaveUp { .. }
+                ),
                 "an occasional crash was treated as a failure to start"
             );
         }
@@ -1133,7 +1142,11 @@ mod tests {
         };
         entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+            })
             .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
             .filter(|stat| {
                 // The comm field is parenthesised and can itself contain both
@@ -1229,20 +1242,16 @@ mod tests {
         // A pre-existing directory with loose permissions — a leftover from a
         // previous run, possibly still owned by the greeter — is tightened and
         // taken back, not accepted as-is.
-        std::fs::set_permissions(
-            &dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         create_runtime_dir_at(&dir).unwrap();
         let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(std::os::unix::fs::MetadataExt::mode(&meta) & 0o777, 0o700);
         // Ownership is reasserted to the effective uid, which is root in
         // production and the test user here.
-        assert_eq!(
-            std::os::unix::fs::MetadataExt::uid(&meta),
-            unsafe { libc::geteuid() }
-        );
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), unsafe {
+            libc::geteuid()
+        });
     }
 
     #[test]
@@ -1283,8 +1292,14 @@ mod tests {
 
         let parent_mode =
             std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&parent).unwrap()) & 0o777;
-        assert_ne!(parent_mode, 0o700, "the parent must not inherit the leaf's mode");
-        assert!(parent_mode & 0o055 != 0, "the parent stays traversable: {parent_mode:o}");
+        assert_ne!(
+            parent_mode, 0o700,
+            "the parent must not inherit the leaf's mode"
+        );
+        assert!(
+            parent_mode & 0o055 != 0,
+            "the parent stays traversable: {parent_mode:o}"
+        );
 
         let leaf = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&dir).unwrap()) & 0o777;
         assert_eq!(leaf, 0o700);

@@ -276,7 +276,11 @@ fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>) 
             canvas.rect(x + 2, row_y, width - 4, MENU_ROW_HEIGHT, SELECTED);
         }
 
-        let color = if index == view.session_index { TEXT } else { DIM };
+        let color = if index == view.session_index {
+            TEXT
+        } else {
+            DIM
+        };
         let baseline = row_y as f32 + (MENU_ROW_HEIGHT as f32 - BODY_SIZE) / 2.0 - 2.0;
         text::draw(
             canvas,
@@ -318,7 +322,6 @@ pub fn paint_message(canvas: &mut Canvas, message: &str, is_error: bool) {
 mod tests {
     use super::*;
 
-
     const SESSIONS: &[&str] = &[
         "Sway", "GNOME", "Plasma", "Hyprland", "River", "Weston", "Cage", "Niri",
     ];
@@ -328,10 +331,7 @@ mod tests {
     }
 
     fn view_with<'a>(sessions: &'a [String]) -> View<'a> {
-        View {
-            sessions,
-            ..view()
-        }
+        View { sessions, ..view() }
     }
 
     fn view() -> View<'static> {
@@ -364,7 +364,12 @@ mod tests {
     #[test]
     fn paints_without_panicking_at_any_size() {
         // Smaller than the panel, exactly the panel, and much larger.
-        for (w, h) in [(1, 1), (320, 200), (PANEL_WIDTH, PANEL_HEIGHT), (3840, 2160)] {
+        for (w, h) in [
+            (1, 1),
+            (320, 200),
+            (PANEL_WIDTH, PANEL_HEIGHT),
+            (3840, 2160),
+        ] {
             let mut canvas = Canvas::new(w, h);
             paint(&mut canvas, &view());
             assert_opaque(&canvas);
@@ -664,4 +669,3 @@ mod tests {
         assert_opaque(&canvas);
     }
 }
-

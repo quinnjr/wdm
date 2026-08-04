@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::compositor::FrameFlags;
+use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
@@ -33,17 +33,15 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
-use smithay::reexports::drm::control::{
-    Device as ControlDevice, ResourceHandles, connector, crtc,
-};
+use smithay::reexports::drm::control::{Device as ControlDevice, ResourceHandles, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, backend::GlobalId};
 use smithay::utils::{DeviceFd, Physical, Size};
 
 use crate::comp::{LoopData, Wdm};
-use crate::render::WdmElement;
 use crate::config::{self, Config};
+use crate::render::WdmElement;
 
 use super::{Handled, Request, handle_action, poll_greeter};
 
@@ -302,10 +300,7 @@ fn activate_vt(vt: u32, wait: bool) {
     // function owns, and neither reads or writes user memory.
     unsafe {
         if libc::ioctl(fd, VT_ACTIVATE, vt as libc::c_int) < 0 {
-            log::warn!(
-                "switching to vt {vt}: {}",
-                std::io::Error::last_os_error()
-            );
+            log::warn!("switching to vt {vt}: {}", std::io::Error::last_os_error());
             return;
         }
 
@@ -313,10 +308,7 @@ fn activate_vt(vt: u32, wait: bool) {
         // seat before it completes would register the session against the VT
         // being left rather than the one being entered.
         if wait && libc::ioctl(fd, VT_WAITACTIVE, vt as libc::c_int) < 0 {
-            log::warn!(
-                "waiting for vt {vt}: {}",
-                std::io::Error::last_os_error()
-            );
+            log::warn!("waiting for vt {vt}: {}", std::io::Error::last_os_error());
             return;
         }
     }
@@ -490,13 +482,14 @@ impl Udev {
             render_formats,
         );
 
-        let drm_token = loop_handle.insert_source(drm_notifier, |event, meta, data| match event {
-            DrmEvent::VBlank(crtc) => {
-                let _ = meta;
-                data.state.request(Request::VBlank(crtc));
-            }
-            DrmEvent::Error(e) => log::error!("drm: {e}"),
-        })?;
+        let drm_token =
+            loop_handle.insert_source(drm_notifier, |event, meta, data| match event {
+                DrmEvent::VBlank(crtc) => {
+                    let _ = meta;
+                    data.state.request(Request::VBlank(crtc));
+                }
+                DrmEvent::Error(e) => log::error!("drm: {e}"),
+            })?;
 
         self.device = Some(Device {
             output_manager,
@@ -696,7 +689,9 @@ impl Udev {
                         // VT_ACTIVATE goes through the same handshake libseat
                         // would have driven, so the seat still learns it is
                         // being switched away from.
-                        log::error!("switching to vt {vt} through the seat: {e}; trying the console directly");
+                        log::error!(
+                            "switching to vt {vt} through the seat: {e}; trying the console directly"
+                        );
                         activate_vt(vt as u32, false);
                     }
                 }
@@ -840,8 +835,10 @@ impl Udev {
                     // buffer scale of 1, so leaving this None makes smithay read
                     // the mode size as logical and then multiply it by the
                     // output scale. See render::error_element_size.
-                    let logical =
-                        crate::render::error_element_size(size, output.current_scale().fractional_scale());
+                    let logical = crate::render::error_element_size(
+                        size,
+                        output.current_scale().fractional_scale(),
+                    );
                     match MemoryRenderBufferRenderElement::from_buffer(
                         &mut device.renderer,
                         (0.0, 0.0),
@@ -861,10 +858,12 @@ impl Udev {
                 None => data.state.elements(&mut device.renderer, &output),
             };
 
-            match head
-                .compositor
-                .render_frame(&mut device.renderer, &elements, CLEAR, FrameFlags::DEFAULT)
-            {
+            match head.compositor.render_frame(
+                &mut device.renderer,
+                &elements,
+                CLEAR,
+                FrameFlags::DEFAULT,
+            ) {
                 Ok(frame) => {
                     if frame.is_empty {
                         continue;
@@ -887,7 +886,6 @@ impl Udev {
                 .send_frames(data.state.uptime().as_millis() as u32);
         }
     }
-
 
     /// Give up the display so a session's compositor can take it.
     ///
@@ -951,7 +949,9 @@ fn pick_mode(
 
     let choice = select_mode(&candidates, wanted)?;
 
-    if choice.fell_back && let Some(wanted) = wanted {
+    if choice.fell_back
+        && let Some(wanted) = wanted
+    {
         log::warn!(
             "{}-{} does not support mode {wanted}, using its preferred mode",
             info.interface().as_str(),

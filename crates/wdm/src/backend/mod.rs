@@ -11,8 +11,8 @@ pub mod winit;
 
 use std::time::Duration;
 
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 
 use crate::comp::LoopData;
 use crate::login::{Action, LaunchRequest};
@@ -192,8 +192,10 @@ pub fn spawn_greeter(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loop
         // Not failures of this attempt: the policy has already spoken, or a
         // greeter is already up. Re-running the failure accounting would count
         // a success against the budget.
-        Err(e @ (crate::supervise::GreeterError::GaveUp
-            | crate::supervise::GreeterError::AlreadyRunning)) => {
+        Err(
+            e @ (crate::supervise::GreeterError::GaveUp
+            | crate::supervise::GreeterError::AlreadyRunning),
+        ) => {
             log::debug!("not starting a greeter: {e}");
         }
 
@@ -219,11 +221,7 @@ pub fn disarm_respawn(data: &mut LoopData, loop_handle: &LoopHandle<'static, Loo
 }
 
 /// Schedule another attempt at starting the greeter.
-fn arm_respawn(
-    data: &mut LoopData,
-    loop_handle: &LoopHandle<'static, LoopData>,
-    delay: Duration,
-) {
+fn arm_respawn(data: &mut LoopData, loop_handle: &LoopHandle<'static, LoopData>, delay: Duration) {
     disarm_respawn(data, loop_handle);
 
     let handle = loop_handle.clone();

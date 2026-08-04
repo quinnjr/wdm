@@ -430,11 +430,14 @@ fn run(
 /// desktop must leave `XDG_SESSION_DESKTOP` *unset*, because an empty string is
 /// a value logind will happily record and everything reading it will believe.
 fn pam_session_env(session_type: &str, desktop: &str) -> Vec<String> {
-    [("XDG_SESSION_TYPE", session_type), ("XDG_SESSION_DESKTOP", desktop)]
-        .into_iter()
-        .filter(|(_, value)| !value.is_empty())
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect()
+    [
+        ("XDG_SESSION_TYPE", session_type),
+        ("XDG_SESSION_DESKTOP", desktop),
+    ]
+    .into_iter()
+    .filter(|(_, value)| !value.is_empty())
+    .map(|(key, value)| format!("{key}={value}"))
+    .collect()
 }
 
 fn send(events: &calloop::channel::Sender<AuthEvent>, event: AuthEvent) {
@@ -615,7 +618,10 @@ mod tests {
 
     #[test]
     fn pam_session_env_omits_an_empty_type() {
-        assert_eq!(pam_session_env("", "sway"), vec!["XDG_SESSION_DESKTOP=sway"]);
+        assert_eq!(
+            pam_session_env("", "sway"),
+            vec!["XDG_SESSION_DESKTOP=sway"]
+        );
         assert!(pam_session_env("", "").is_empty());
     }
 
@@ -864,7 +870,10 @@ mod tests {
 
         let (second_id, _, style) = prompts.next();
         assert_eq!(style, PromptStyle::Secret);
-        assert_ne!(first_id, second_id, "ids must not repeat within a conversation");
+        assert_ne!(
+            first_id, second_id,
+            "ids must not repeat within a conversation"
+        );
         responses
             .send(PromptResponse {
                 id: second_id,
