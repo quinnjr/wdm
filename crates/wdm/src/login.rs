@@ -100,6 +100,30 @@ const BACKOFF_SECS: &[u64] = &[0, 1, 2, 4, 8, 10];
 /// enough that a user who mistyped does not think the machine has hung.
 const FAILURE_FLOOR: Duration = Duration::from_secs(2);
 
+/// The least time between two accepted `create_session` calls.
+///
+/// The backoff and the cooldown are both charged from `AuthEvent::Failed`, and a
+/// **cancel** is deliberately charged nothing: switching account in a greeter
+/// cancels, and a user picking a different name has not attempted a login. That
+/// left `create_session → respond → cancel → repeat` costing nothing at all —
+/// and each turn of it forks and `exec`s `/proc/self/exe --pam-helper` as root
+/// *and* unwinds PAM through `CONV_ERR`, which `pam_faillock`'s `authfail` arm
+/// records. A greeter that is compromised, or merely buggy, could walk any named
+/// account into a lockout at wire speed.
+///
+/// So there are two gates, and they charge different things. `cooldown_until` is
+/// the rate limit proper: it is armed only by a real failure, it grows, and it
+/// survives reset. This is the cheap one that *every* accepted attempt pays,
+/// cancelled or not — no failure counter, no growth, just a floor under how
+/// often the helper can be started.
+///
+/// One second, because it has to be invisible to the thing it must not punish: a
+/// user choosing an account from a list. It bounds the loop rather than closing
+/// it — a determined greeter can still reach `deny=3` in a few seconds — and
+/// closing it is `pam_faillock`'s business, not wdm's, because wdm cannot tell a
+/// cancelled attempt from a refused one without asking PAM.
+const MIN_ATTEMPT_INTERVAL: Duration = Duration::from_secs(1);
+
 /// When a failure must be reported so the attempt costs a constant time.
 ///
 /// `anchor` is the moment wdm last handed PAM something to work on, so
@@ -111,6 +135,17 @@ const FAILURE_FLOOR: Duration = Duration::from_secs(2);
 /// Saturates to zero rather than going negative: an answer that arrived after
 /// the deadline has already paid the floor, and delaying it further would make
 /// a *slow* PAM cost more than a fast one, which is the same leak upside down.
+///
+/// That saturation is also the ceiling on what the floor buys, and the word for
+/// it is "usually", not "never". Everything PAM does under [`FAILURE_FLOOR`] is
+/// hidden; everything over it is not. A local `pam_unix` refusal is tens to
+/// hundreds of milliseconds and disappears. A network stack — `pam_sss` against
+/// a directory, Kerberos against a KDC — routinely takes longer than two
+/// seconds, and there the observed time is exactly PAM's own, so a name the
+/// directory does not know can still be told from one it does. Raising the floor
+/// past the slowest plausible network round trip is not a fix: it is a
+/// multi-second delay charged to every user who mistypes, which is the trade the
+/// two-second value already decided.
 ///
 /// Free-standing so the arithmetic can be tested without a PAM conversation to
 /// drive it; [`AuthHandle`] cannot be built in a test.
@@ -218,6 +253,12 @@ pub struct Login {
     /// followed by a rebind resets the phase, and a greeter that kills itself
     /// gets a brand new object either way. Survives reset for the same reason.
     cooldown_until: Option<Instant>,
+    /// When an attempt was last accepted, for [`MIN_ATTEMPT_INTERVAL`].
+    ///
+    /// Survives [`Login::reset`] for the same reason `cooldown_until` does, and
+    /// more sharply: the loop this gates *is* a reset loop, so a field it
+    /// cleared would gate nothing at all.
+    last_attempt: Option<Instant>,
     /// When PAM was last given something to work on, for [`failure_delay`].
     ///
     /// Set by [`Login::begin_attempt`] and re-anchored by every `respond`,
@@ -276,6 +317,7 @@ impl Login {
             pending_prompt: None,
             failures: 0,
             cooldown_until: None,
+            last_attempt: None,
             attempt_started: None,
             generation: 0,
             failure_timer: None,
@@ -570,14 +612,30 @@ impl Login {
             .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
+    /// How long until another attempt may be accepted, if the last was too
+    /// recent.
+    ///
+    /// The gate a *cancel* pays. [`Self::rate_limited`] is charged only by a
+    /// failure and is escaped entirely by cancelling; this is charged by every
+    /// accepted attempt and is escaped by nothing but waiting. See
+    /// [`MIN_ATTEMPT_INTERVAL`].
+    fn too_soon(&self) -> Option<Duration> {
+        (self.last_attempt? + MIN_ATTEMPT_INTERVAL).checked_duration_since(Instant::now())
+    }
+
     /// Note that a new attempt is starting.
     ///
     /// Bumps the generation so anything armed for the previous attempt becomes a
-    /// no-op, clears the stale launch error the user has moved on from, and
-    /// starts the clock a failure will be reported against.
+    /// no-op, clears the stale launch error the user has moved on from, charges
+    /// the minimum interval, and starts the clock a failure will be reported
+    /// against.
     pub fn begin_attempt(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.last_error = None;
+        // Every accepted attempt, whatever becomes of it. An attempt that is
+        // cancelled a moment from now is charged nothing else — no failure, no
+        // cooldown — and this is the only thing it does pay.
+        self.last_attempt = Some(Instant::now());
         // An attempt that fails before it ever prompts — the stack refuses on
         // `pam_start`, or a module ahead of `pam_unix` says no with nothing to
         // ask — still has to cost the floor, so the anchor exists from here.
@@ -819,25 +877,12 @@ impl Wdm {
     }
 
     fn create_session(&mut self, resource: &WdmGreeterV1, username: String) -> Action {
-        // Checked before the phase, because the phase is the part a greeter can
-        // reset at will and this is the part it cannot.
-        if let Some(remaining) = self.login.rate_limited() {
-            // Not a protocol error: the greeter may try again, just not yet. The
-            // refusal is delayed until the limit expires rather than sent now,
-            // because a greeter that retries on failure would otherwise spin for
-            // the whole cooldown. Answering late makes its retry land exactly
-            // when it is allowed to.
-            log::debug!("deferring create_session for {remaining:?}");
-            // Armed unconditionally, and disarming any existing timer first, so
-            // every accepted create_session gets exactly one terminal event. The
-            // previous guard skipped arming while already in Cooldown, which
-            // silently dropped the request and hung a greeter that waits for a
-            // reply per request.
-            self.login
-                .report_failure_after("too many attempts".to_owned(), remaining);
-            return Action::None;
-        }
-
+        // The phase first, because two of its arms are protocol errors the XML
+        // mandates and a deferred `auth_failed` is not a substitute for either.
+        // The limits below can only be reached from a phase that accepts a new
+        // conversation at all — today a live cooldown during `Authenticating` is
+        // unreachable, since a failure clears the handle, but the ordering must
+        // not depend on that staying true.
         match self.login.phase {
             Phase::Idle | Phase::Cooldown => {}
 
@@ -859,20 +904,67 @@ impl Wdm {
             }
         }
 
+        // Both limits, and neither is the phase: the phase is what a greeter can
+        // reset at will — by destroying its object, or by dying and being
+        // respawned — and these are what it cannot. `rate_limited` is charged by
+        // failures; `too_soon` is charged by every accepted attempt, including
+        // the ones that are cancelled a moment later and so charged nothing
+        // else. See MIN_ATTEMPT_INTERVAL.
+        if let Some(remaining) = self
+            .login
+            .rate_limited()
+            .into_iter()
+            .chain(self.login.too_soon())
+            .max()
+        {
+            // Not a protocol error: the greeter may try again, just not yet. The
+            // refusal is delayed until the limit expires rather than sent now,
+            // because a greeter that retries on failure would otherwise spin for
+            // the whole cooldown. Answering late makes its retry land exactly
+            // when it is allowed to.
+            log::debug!("deferring create_session for {remaining:?}");
+            // Armed unconditionally, and disarming any existing timer first, so
+            // there is at most one pending report at a time — a second deferred
+            // call replaces the first's timer rather than stacking onto it, so
+            // the two produce one `auth_failed` between them. The previous guard
+            // skipped arming while already in Cooldown, which silently dropped
+            // the request and hung a greeter that waits for a reply per request.
+            self.login
+                .report_failure_after("too many attempts".to_owned(), remaining);
+            return Action::None;
+        }
+
         if !self.login.users.iter().any(|u| u.name == username) {
             // Not rejected outright, and the reason is no longer PAM's. PAM does
             // *not* conflate "no such user" with "wrong password" — under this
             // repository's own /etc/pam.d/wdm the first comes back as "User not
             // known to the underlying authentication module" and the second as
-            // "Authentication failure". The two are indistinguishable to a
-            // greeter because wdm makes them so: auth::AUTH_FAILED flattens
-            // every authenticate failure to one string, and failure_delay
-            // reports it on a deadline so the clock says nothing either.
+            // "Authentication failure". The two are indistinguishable in the one
+            // place wdm has made them so: the *verdict*. auth::AUTH_FAILED
+            // flattens its text, and failure_delay reports it on a deadline so
+            // its timing says nothing either.
             //
             // Short-circuiting here would reintroduce the difference on this
             // side of PAM — an unadvertised name would fail by a path with its
             // own timing and its own phase transitions, and the enumeration
             // oracle would be back without either of those defences noticing.
+            //
+            // ponytail: the verdict is not the whole conversation, and the rest
+            // of it is not flattened. `handle_auth_event`'s Prompt arm forwards
+            // every prompt immediately and unconditionally, and `pam_sss` and
+            // `pam_ldap` skip the password prompt entirely for a name they do
+            // not know (see auth::notice_to_greeter) — so counting prompts still
+            // answers "does this account exist", with no password offered and no
+            // clock consulted. The upgrade path is to give every attempt the same
+            // visible shape: when the stack asks nothing before refusing, wdm
+            // emits a synthetic `Secret` prompt of its own and discards the
+            // answer. It is not done here because it is a change to the meaning
+            // of the protocol rather than to a string — the greeter would be
+            // collecting a password that nothing verifies, the id would have to
+            // come from the helper's reserved block without the helper knowing,
+            // and it equalises only the zero-prompt case, not two stacks that
+            // ask different numbers of real questions. That wants deciding as a
+            // protocol change, with the greeters in the room.
             log::debug!("create_session for unadvertised user {username:?}");
         }
 
@@ -897,8 +989,21 @@ impl Wdm {
                 self.login.phase = Phase::Authenticating;
             }
             Err(e) => {
-                log::error!("spawning auth thread for {username}: {e}");
-                resource.auth_failed("could not start authentication".to_owned());
+                log::error!("spawning the PAM helper for {username:?}: {e}");
+                // Through report_failure_after like every other failure, rather
+                // than answering this one resource inline. Nothing here depends
+                // on the username, so there was no oracle to close — but this
+                // was one of only two exits that skipped the function where
+                // every stated invariant lives: the floor, the single pending
+                // report, and the broadcast to *every* bound object rather than
+                // to whichever one happened to send the request.
+                let delay = failure_delay(
+                    self.login.attempt_started,
+                    self.login.next_backoff(),
+                    Instant::now(),
+                );
+                self.login
+                    .report_failure_after("could not start authentication".to_owned(), delay);
             }
         }
 
@@ -936,10 +1041,19 @@ impl Wdm {
         let Some(auth) = &self.login.auth else {
             // Phase said Authenticating but the handle is gone. Swallowing the
             // answer would leave the greeter waiting for a reply that can never
-            // come, so the attempt is failed explicitly.
+            // come, so the attempt is failed explicitly — and through
+            // report_failure_after, for the reason create_session's spawn
+            // failure goes through it: it is where the floor, the one-pending-
+            // report rule and the broadcast to every bound object live, and an
+            // exit that replies to one resource inline has none of them.
             log::error!("respond with no auth handle; failing the attempt");
-            self.login.phase = Phase::Idle;
-            resource.auth_failed("the login attempt was interrupted".to_owned());
+            let delay = failure_delay(
+                self.login.attempt_started,
+                self.login.next_backoff(),
+                Instant::now(),
+            );
+            self.login
+                .report_failure_after("the login attempt was interrupted".to_owned(), delay);
             return Action::None;
         };
 
@@ -1185,16 +1299,132 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_is_capped() {
-        // A user who mistyped must not be locked out for minutes, and a brute
-        // force attempt must not be allowed to retry at full speed.
-        assert_eq!(BACKOFF_SECS[0], 0, "the first attempt must not be delayed");
-        for pair in BACKOFF_SECS.windows(2) {
-            assert!(
-                pair[1] >= pair[0],
-                "backoff must not shrink: {BACKOFF_SECS:?}"
-            );
+        // Driven through `next_backoff` and `failure_delay`, not read off
+        // `BACKOFF_SECS`. Every assertion here used to name the table and
+        // nothing else, so it could not fail for anything the table is *used*
+        // for — and nothing pinned that `next_backoff` indexes with the
+        // pre-increment count, so the sequence a greeter actually experiences is
+        // not the table as written.
+        let mut login = login();
+        let anchor = Instant::now();
+
+        let delivered: Vec<u64> = (0..BACKOFF_SECS.len())
+            .map(|_| {
+                // The order handle_auth_event uses: the delay is computed from
+                // the count *before* this failure is charged.
+                let delay = failure_delay(Some(anchor), login.next_backoff(), anchor);
+                login.failures += 1;
+                delay.as_secs()
+            })
+            .collect();
+
+        // Not [0, 1, 2, 4, 8, 10]: the first three are swallowed by
+        // FAILURE_FLOOR, which is the floor doing its job rather than the
+        // backoff failing at it.
+        assert_eq!(
+            delivered,
+            vec![2, 2, 2, 4, 8, 10],
+            "the delay a greeter waits is not what the table plus the floor say"
+        );
+
+        // Capped: further failures do not keep growing, so a user who mistyped
+        // is not locked out of their own machine for minutes.
+        login.failures += 20;
+        assert_eq!(
+            failure_delay(Some(anchor), login.next_backoff(), anchor).as_secs(),
+            *delivered.last().unwrap(),
+            "the backoff ran off the end of the table"
+        );
+
+        // And it never shrinks, which is what makes it a backoff at all.
+        for pair in delivered.windows(2) {
+            assert!(pair[1] >= pair[0], "backoff shrank: {delivered:?}");
         }
-        assert!(*BACKOFF_SECS.last().unwrap() <= 30);
+    }
+
+    #[test]
+    fn a_cancelled_attempt_is_free_of_cooldown_but_not_free() {
+        // `create_session → respond → cancel → repeat` was charged nothing at
+        // all: the failure counter and `cooldown_until` are armed only from the
+        // Failed arm, and a cancel deliberately reaches neither. Each turn of
+        // that loop forks and execs a root helper and unwinds PAM through
+        // CONV_ERR, which pam_faillock records as an authfail — so a compromised
+        // greeter could walk any named account into a lockout at wire speed.
+        let mut login = login();
+
+        // What an accepted create_session does, and all a cancelled attempt
+        // ever does.
+        login.begin_attempt();
+        login.reset();
+
+        // The gate that must not have been charged: switching account in a
+        // greeter cancels, and a user picking a different name has not failed a
+        // login.
+        assert_eq!(login.failures, 0, "a cancellation was charged as a failure");
+        assert!(
+            login.rate_limited().is_none(),
+            "a cancellation armed the failure cooldown"
+        );
+
+        // And the gate that must have been.
+        let remaining = login
+            .too_soon()
+            .expect("a cancel-and-retry loop costs nothing");
+        assert!(remaining <= MIN_ATTEMPT_INTERVAL);
+
+        // Reset is how the loop goes round, so a gate reset could clear would
+        // gate nothing.
+        login.reset();
+        assert!(
+            login.too_soon().is_some(),
+            "destroying the greeter object escaped the minimum interval"
+        );
+
+        // It is a floor, not a lockout: it lapses on its own.
+        login.last_attempt = Some(Instant::now() - MIN_ATTEMPT_INTERVAL * 2);
+        assert!(login.too_soon().is_none());
+    }
+
+    #[test]
+    fn an_interrupted_respond_is_reported_like_every_other_failure() {
+        // `respond` with the phase saying Authenticating and the handle gone
+        // used to reply `auth_failed` inline to the one resource that asked:
+        // no FAILURE_FLOOR, and no broadcast, so a second bound object would
+        // never hear that the attempt was over. Neither depends on the
+        // username, so there was no oracle — but they were the only exits that
+        // skipped the function every stated invariant lives in.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.begin_attempt();
+        h.state.login.phase = Phase::Authenticating;
+        h.state.login.pending_prompt = Some(7);
+        // There is no AuthHandle to build in a test, so this is the interrupted
+        // path by construction.
+        h.state.respond(&resource, 7, "hunter2".to_owned());
+
+        assert_eq!(
+            h.state.login.phase,
+            Phase::Cooldown,
+            "the failure was reported without entering the deferred path"
+        );
+        assert!(
+            h.state.login.failure_timer.is_some(),
+            "nothing was armed to tell the greeter the attempt ended"
+        );
+
+        // Deferred, not immediate: the harness never dispatches its event loop,
+        // so an inline reply is the only thing that could reach the wire.
+        h.dispatch();
+        client.pump();
+        assert!(
+            !client
+                .greeter_events()
+                .iter()
+                .any(|m| m.opcode == wire::AUTH_FAILED),
+            "auth_failed was answered inline, skipping the failure floor"
+        );
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             // nested backend never held one. The greeter still goes first, so
             // the sequence a reader sees here is the sequence that matters.
             data.state.greeter.kill();
-            data.state.layers.clear();
+            data.state.forget_greeter();
 
             // The session is still launched, so the environment, the privilege
             // drop and the helper's own handling can be inspected — but it will

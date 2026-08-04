@@ -47,8 +47,15 @@ pub fn error_buffer(reason: &str, size: Size<i32, Physical>) -> MemoryRenderBuff
 /// is off it. The nested backend hardcodes scale 1, where the two agree, so this
 /// is invisible in development. It is also the one path where nothing else can
 /// help the user, hence a size computed here and passed explicitly.
+///
+/// Rounded **up**, not to nearest. A mode that does not divide by the scale has
+/// no logical size that maps back to it exactly — 1001 at scale 2.5 rounds to
+/// 400 logical, which smithay then draws as 1000 physical, leaving a one-pixel
+/// strip of whatever was in the framebuffer down the edge of the one screen
+/// whose entire job is to be readable. Ceiling overdraws by less than a pixel of
+/// scale instead, and overdraw is clipped to the output.
 pub fn error_element_size(mode: Size<i32, Physical>, scale: f64) -> Size<i32, Logical> {
-    mode.to_f64().to_logical(scale).to_i32_round()
+    mode.to_f64().to_logical(scale).to_i32_ceil()
 }
 
 /// A small white arrow with a dark outline, for when no client has set a cursor.
@@ -56,6 +63,15 @@ pub fn error_element_size(mode: Size<i32, Physical>, scale: f64) -> Size<i32, Lo
 /// Drawn in code rather than loaded from an xcursor theme: wdm runs before any
 /// user session, so it cannot rely on a theme being installed or on the
 /// per-user setting that selects one. Built once and reused.
+///
+/// ponytail: the ceiling is a fixed 12x19 one-bit raster — no theme, no shape
+/// beyond the arrow, no animation, and blurry on anything above scale 1, since
+/// it is uploaded at buffer scale 1 and the compositor scales it up. It is only
+/// ever seen when the greeter has not set a cursor of its own, which every
+/// toolkit greeter does. The upgrade path is `xcursor`, loading a theme named in
+/// `[greeter]` config with this as the fallback when none resolves, rasterised
+/// per output scale — worth it when a greeter wants a resize or text cursor,
+/// which needs named shapes rather than one bitmap.
 pub fn pointer_buffer() -> &'static MemoryRenderBuffer {
     static POINTER: std::sync::OnceLock<MemoryRenderBuffer> = std::sync::OnceLock::new();
 
@@ -100,13 +116,43 @@ mod tests {
         // read the physical mode size as logical and draw it scale times too
         // big. At scale 2 the user sees the top-left quarter of an error message
         // and no way to act on it.
-        let mode = Size::<i32, Physical>::from((3840, 2160));
+        //
+        // The modes are deliberately not all round. 3840x2160 divides exactly by
+        // every scale below, so a round trip through it is the identity whatever
+        // the rounding — which is what made this test weaker than its name.
+        // 1366x768, 1001x1001 and 2560x1080 do not, and at 1.25/1.5/2.5 neither
+        // does the arithmetic.
+        //
+        // `>=`, not `==`: no logical size maps back exactly to an indivisible
+        // mode, and the two errors are not equivalent. Overdraw is clipped to the
+        // output; a shortfall is a strip of stale framebuffer down the edge of
+        // the screen whose only job is to be read.
+        let modes = [(3840, 2160), (1366, 768), (1001, 1001), (2560, 1080)];
 
-        for scale in [1.0, 1.5, 2.0] {
-            assert_eq!(
-                geometry(error_element_size(mode, scale), scale),
-                mode,
-                "at scale {scale}"
+        for (w, h) in modes {
+            let mode = Size::<i32, Physical>::from((w, h));
+            for scale in [1.0, 1.25, 1.5, 2.0, 2.5] {
+                let drawn = geometry(error_element_size(mode, scale), scale);
+                assert!(
+                    drawn.w >= mode.w && drawn.h >= mode.h,
+                    "{mode:?} at scale {scale} is drawn as {drawn:?}, leaving a gap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_give_up_screen_does_not_overdraw_by_more_than_a_pixel_of_scale() {
+        // The other half of the bound: ceiling is chosen because overdraw is
+        // clipped, but it must still be *one* pixel of overdraw and not a whole
+        // second screen — which is what the None-size defect produced.
+        let mode = Size::<i32, Physical>::from((1001, 1001));
+
+        for scale in [1.25, 1.5, 2.5] {
+            let drawn = geometry(error_element_size(mode, scale), scale);
+            assert!(
+                f64::from(drawn.w - mode.w) <= scale.ceil(),
+                "{mode:?} at scale {scale} is drawn as {drawn:?}"
             );
         }
     }

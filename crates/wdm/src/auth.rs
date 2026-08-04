@@ -41,7 +41,7 @@
 //! which is the whole of the fix. See [`to_greeter`], where it matters most.
 //!
 //! Several pieces here are `pub(crate)` rather than private — the prompt-id
-//! counter, [`RESPONSE_TIMEOUT`], [`to_greeter`], [`pam_session_env`] and
+//! reservation, [`RESPONSE_TIMEOUT`], [`to_greeter`], [`pam_session_env`] and
 //! [`SessionDescription::pam_items`] — because [`crate::pamhelper`] is where they
 //! are used. They live here rather than there so that the two ends of the socket
 //! cannot disagree about an id counter, a timeout, or an error string that must
@@ -66,14 +66,46 @@ pub const SERVICE: &str = "wdm";
 
 /// Source of prompt ids, shared by every attempt in the process.
 ///
-/// Per-attempt counters would restart at 0, so a late `respond` carrying id 0
-/// from a cancelled conversation would match the first prompt of the *next*
-/// one — feeding one user's secret to another user's PAM stack. An id must
-/// identify the question it was issued for, which means it may never be reused.
+/// An id must identify the question it was issued for, which means it may never
+/// be reused: a late `respond` carrying id 0 from a cancelled conversation must
+/// not match the first prompt of the *next* one, or one user's secret is fed to
+/// another user's PAM stack. `Login::reset()` clears `pending_prompt`, so the
+/// next attempt is free to register the same id — nothing downstream notices the
+/// collision.
+///
+/// The ids are minted in the helper, which is a fresh `exec` per attempt and so
+/// cannot hold a counter that survives one. The counter therefore lives here, in
+/// wdm, which does: [`reserve_prompt_ids`] hands each attempt a block, the block
+/// travels on [`Msg::Start`], and the helper counts up from it. That is the
+/// whole of the mechanism, and it stopped being true for a while when PAM moved
+/// out of process — the doc claiming a shared counter outlived the counter.
 static NEXT_PROMPT_ID: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) fn next_prompt_id() -> u32 {
-    NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed)
+/// How many ids one attempt is given.
+///
+/// A block rather than one id at a time, because the ids are allocated in a
+/// process that cannot reach this counter. A PAM conversation asks a handful of
+/// questions — a username, a password, sometimes a token, sometimes an expired
+/// password's three — so four thousand is not a limit anything real approaches.
+///
+/// A helper that spilled past its block would land in the next attempt's, which
+/// is the defect this exists to prevent, so it is not left to the size alone:
+/// [`observe_prompt_id`] raises the counter past every id wdm actually sees, so
+/// the block after a spill is still clear of it.
+const PROMPT_ID_BLOCK: u32 = 4096;
+
+/// Reserve one attempt's block of prompt ids, returning its first id.
+pub(crate) fn reserve_prompt_ids() -> u32 {
+    NEXT_PROMPT_ID.fetch_add(PROMPT_ID_BLOCK, Ordering::Relaxed)
+}
+
+/// Note that `id` has been issued, so no future block can contain it.
+///
+/// Belt to [`PROMPT_ID_BLOCK`]'s braces, and cheap: a helper that asked more
+/// questions than its block holds would otherwise reuse ids the next attempt is
+/// about to be given.
+fn observe_prompt_id(id: u32) {
+    NEXT_PROMPT_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
 }
 
 /// How long a prompt may go unanswered before the attempt is abandoned.
@@ -218,10 +250,14 @@ impl Wire {
     fn send(&self, msg: &Msg) {
         let mut bytes = msg.encode();
         if let Err(e) = self.sock.send(&bytes) {
-            // Nothing can be done here. If the helper has gone, the reader
-            // thread's EOF is what reports it, through the one path that also
-            // knows whether wdm asked for it.
-            log::debug!("sending to the PAM helper: {e}");
+            // `error`, not `debug`: nothing can be *done* here — if the helper
+            // has gone, the reader thread's EOF is what reports it, through the
+            // one path that also knows whether wdm asked for it — but nothing
+            // recovers either. A message that did not go is a message the peer
+            // is still waiting for, and the two failures that are not a dead
+            // helper (EMSGSIZE on an oversized `Launch`, ENOBUFS) leave both
+            // ends alive and stuck.
+            log::error!("sending {} to the PAM helper: {e}", name_of(msg));
         }
         bytes.zeroize();
     }
@@ -278,6 +314,10 @@ impl AuthHandle {
             vtnr: session.vtnr,
             session_type: session.session_type,
             desktop: session.desktop,
+            // The helper mints the ids and cannot survive to remember which it
+            // used, so the block is reserved here, where the counter outlives
+            // every attempt. See NEXT_PROMPT_ID.
+            id_base: reserve_prompt_ids(),
         });
 
         Ok(handle)
@@ -300,17 +340,27 @@ impl AuthHandle {
 
         let reader = Arc::clone(&wire);
         let name = username.to_owned();
+        // Read out before the `Child` is moved into the closure, which is also
+        // where it goes when the spawn *fails*: `Builder::spawn` drops the
+        // closure it could not run, and `Child`'s own `Drop` does not reap.
+        let pid = child.as_ref().map(Child::id);
+        // The reporting half of the same failure, because the closure owns the
+        // sender too.
+        let reporter = events.clone();
+
         // Detached: it ends when the socket does, which is either when the
-        // helper exits or when this handle is dropped. A failure to spawn it is
-        // not fatal — the helper is already running and cancellation still works
-        // — but nothing would ever be heard from it, so it is reported and the
-        // attempt is failed rather than left silent.
+        // helper exits or when this handle is dropped. A failure to spawn it
+        // leaves the helper running and cancellation working, and nothing else:
+        // `pump` is the only producer of `AuthEvent::Failed`, and `pump` is the
+        // thread that did not start, so without the three lines below the
+        // greeter waits for ever on a prompt while a root helper sits
+        // unreaped.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pam-reader-{username}"))
             .spawn(move || pump(&reader, child, &events, &name))
         {
             log::error!("spawning the PAM reader thread for {username:?}: {e}");
-            wire.close();
+            report_unstartable_helper(&wire, pid, &reporter);
         }
 
         Self {
@@ -379,6 +429,45 @@ impl Drop for AuthHandle {
         // handle dropped after `session_ended` is not a special case.
         self.wire.close();
     }
+}
+
+/// Wind up an attempt whose reader thread never started.
+///
+/// Everything [`pump`] would have done on the way out, done here instead
+/// because it is not running: shut the socket so the helper's `recv` hits EOF
+/// and PAM unwinds, reap the process that is now exiting, and tell the greeter
+/// the attempt is over. Skipping any of the three leaves a distinct wreck — a
+/// helper holding a PAM transaction, a root zombie per attempt, and a login
+/// screen that accepts nothing but `cancel`.
+///
+/// The `waitpid` blocks, on the event loop thread. It is bounded by the EOF
+/// delivered a line above, and this path is reached only when the process
+/// cannot create a thread at all, which is not a state worth optimising for.
+fn report_unstartable_helper(
+    wire: &Wire,
+    pid: Option<u32>,
+    events: &calloop::channel::Sender<AuthEvent>,
+) {
+    wire.close();
+
+    if let Some(pid) = pid {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `pid` is this process's child — it was spawned a moment ago
+        // and nothing has waited for it, so the number cannot have been
+        // recycled — and `status` is a live local.
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        if waited < 0 {
+            log::error!(
+                "reaping the PAM helper {pid}: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    send(
+        events,
+        AuthEvent::Failed("the authentication helper could not be started".to_owned()),
+    );
 }
 
 /// The reader thread: forward what the helper says, then reap it.
@@ -471,14 +560,19 @@ fn forward(wire: &Wire, events: &calloop::channel::Sender<AuthEvent>) -> Outcome
 
         // Borrowed, not destructured: `Msg` has a `Drop`.
         match &msg {
-            Msg::Prompt { id, text, style } => send(
-                events,
-                AuthEvent::Prompt {
-                    id: *id,
-                    text: text.clone(),
-                    style: *style,
-                },
-            ),
+            Msg::Prompt { id, text, style } => {
+                // Before it is forwarded: from here on a `respond` can carry
+                // this id, so no later attempt may be handed it.
+                observe_prompt_id(*id);
+                send(
+                    events,
+                    AuthEvent::Prompt {
+                        id: *id,
+                        text: text.clone(),
+                        style: *style,
+                    },
+                );
+            }
             Msg::Ok => {
                 authenticated = true;
                 send(events, AuthEvent::Ok);
@@ -744,12 +838,28 @@ impl Cause for str {
 /// supplementary groups and so is in neither `systemd-journal` nor `adm`; a
 /// deployment that puts the greeter account in either has reopened the channel.
 ///
-/// ponytail: this closes the *message* channel only. A nonexistent account can
-/// still be distinguished by timing, because a stack that never reaches
-/// `pam_unix`'s hashing answers sooner. Closing that needs a constant-time
-/// floor on the whole authenticate phase — `pam_faildelay`, or a deadline wdm
-/// holds itself — which is a change to how long every failed login takes and
-/// wants measuring before it is chosen.
+/// This closes the *message* channel. The clock is closed separately and
+/// already: `login::FAILURE_FLOOR` reports every failed authenticate on a
+/// deadline measured from wdm's own side of the conversation, so a stack that
+/// gives up before `pam_unix` hashes and one that does not are answered at the
+/// same instant. That shipped in v0.6.0; this comment used to say the timing
+/// channel "wants measuring before it is chosen", and a comment asserting a leak
+/// is still open is the reason nobody checks whether it is.
+///
+/// ponytail: two residual channels, neither of which is the verdict.
+///
+/// - The *shape* of the conversation. `AUTH_FAILED` and `FAILURE_FLOOR` both act
+///   on the verdict, and neither touches what happened before it:
+///   [`notice_to_greeter`] records that `pam_sss` and `pam_ldap` skip the
+///   password prompt entirely for a name they do not know, and prompts are
+///   forwarded immediately and unconditionally, so counting them still answers
+///   "does this account exist" with no password and no clock. Closing it means
+///   giving every attempt the same visible shape — a synthetic `Secret` prompt
+///   when the stack asks none — which is a change to what a greeter is answering
+///   and is described where it would be made, in `login::create_session`.
+/// - The floor is a floor. A network stack — `pam_sss` against a directory,
+///   Kerberos against a KDC — is routinely slower than two seconds, and there
+///   the observed time is PAM's own; see `login::failure_delay`.
 const AUTH_FAILED: &str = "Authentication failure";
 
 /// The greeter-facing text for a PAM failure in `phase`.
@@ -789,9 +899,10 @@ pub(crate) fn to_greeter(phase: Phase, username: &str, cause: &(impl Cause + ?Si
 ///
 /// A fixed string rather than nothing at all, because the message is also what
 /// stops a greeter retrying: an `Error` prompt lands in `Model::push_notice`,
-/// which sets `blocked`, which `Model::should_auto_retry` consults. Dropping
-/// these would restore the retry spin the response-timeout notice exists to
-/// prevent.
+/// which sets `blocked` — the flag that marks a failure PAM *explained*, and so
+/// one a greeter shows rather than replaces with a fresh prompt. Dropping these
+/// would leave the failure unexplained, which is the shape a greeter used to
+/// retry on.
 ///
 /// This is only for text emitted *before* `pam_authenticate` returns success.
 /// The expired-password change runs after it and keeps its own words, which is
@@ -948,12 +1059,123 @@ mod tests {
 
     #[test]
     fn prompt_ids_are_never_reused() {
-        // The whole point of the global counter: a late response from a
-        // cancelled conversation must not match a prompt in the next one.
-        let a = next_prompt_id();
-        let b = next_prompt_id();
+        // The whole point of the counter: a late response from a cancelled
+        // conversation must not match a prompt in the next one. Blocks, not
+        // single ids, because the ids themselves are minted in the helper.
+        let a = reserve_prompt_ids();
+        let b = reserve_prompt_ids();
         assert_ne!(a, b);
-        assert!(b > a);
+        assert!(
+            b >= a + PROMPT_ID_BLOCK,
+            "two attempts were handed overlapping id blocks: {a} then {b}"
+        );
+
+        // And a helper that used more ids than its block holds does not push the
+        // next attempt onto one of them.
+        let spilled = b + PROMPT_ID_BLOCK + 7;
+        observe_prompt_id(spilled);
+        assert!(
+            reserve_prompt_ids() > spilled,
+            "a block was reissued over ids that had already been sent"
+        );
+    }
+
+    #[test]
+    fn a_second_helper_cannot_be_handed_the_first_helpers_prompt_ids() {
+        // The regression the doc used to describe and the code no longer had.
+        // Ids are minted in the helper, and the helper is a fresh `exec` per
+        // attempt — so a counter it owned would restart at 0 every login, and
+        // `Login::reset` clears `pending_prompt`, so the next attempt would
+        // re-register id 0 and a late `respond(0, …)` from the cancelled
+        // conversation would answer it. Two generations, driven end to end.
+        let first = {
+            let (ours, helper) = fake_helper();
+            let (events_tx, events_rx) = calloop::channel::channel();
+            let mut events = EventStream::new(events_rx);
+            let base = reserve_prompt_ids();
+
+            let _handle = AuthHandle::adopt(ours, None, "testuser", events_tx);
+            // What a helper seeded from that base emits for its first question.
+            helper
+                .send(
+                    &Msg::Prompt {
+                        id: base,
+                        text: "Password: ".to_owned(),
+                        style: PromptStyle::Secret,
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            let AuthEvent::Prompt { id, .. } = events.next("a prompt") else {
+                panic!("expected a prompt");
+            };
+            assert_eq!(id, base, "the helper's id did not survive the forward");
+            id
+        };
+
+        // The attempt is cancelled and the next one starts. Its block must not
+        // contain the id the greeter may still be about to answer.
+        let second = reserve_prompt_ids();
+        assert!(
+            second > first,
+            "the next attempt was handed id {second}, which the previous \
+             conversation had already issued as {first}; a late respond would \
+             answer the wrong question"
+        );
+    }
+
+    #[test]
+    fn a_helper_whose_reader_cannot_start_is_reported_and_reaped() {
+        // `adopt` used to log, close the wire and return Ok. But `pump` is the
+        // only producer of AuthEvent::Failed and `pump` is the thread that did
+        // not start, so the greeter sat on its prompt for ever and the root
+        // helper stayed unreaped. The thread spawn cannot be made to fail on
+        // demand, so what is driven here is the recovery itself.
+        let (ours, helper) = fake_helper();
+        let (events_tx, events_rx) = calloop::channel::channel();
+        let mut events = EventStream::new(events_rx);
+
+        // A stand-in for the helper: a real child of this process that exits on
+        // its own, so the reap has something to reap.
+        let child = Command::new("/bin/true").spawn().expect("spawning a child");
+        let pid = child.id();
+        // Not `wait`ed and not dropped-into-a-wait: `Child`'s Drop does not
+        // reap, which is exactly the leak this path has to clean up after.
+        std::mem::forget(child);
+
+        let wire = Wire {
+            sock: ours,
+            closing: AtomicBool::new(false),
+        };
+        report_unstartable_helper(&wire, Some(pid), &events_tx);
+
+        let AuthEvent::Failed(reason) = events.next("a failure") else {
+            panic!("an attempt whose reader never started must be failed");
+        };
+        assert!(reason.contains("helper"), "{reason}");
+
+        // The helper is told to stop, the same way cancellation tells it.
+        helper
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            helper.recv(&mut buf).unwrap(),
+            0,
+            "the helper was left holding a live PAM transaction"
+        );
+
+        // And it was reaped: a second wait for the same child finds nothing.
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a live local; a pid that is no longer our child
+        // simply yields ECHILD, which is the assertion.
+        let again = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert!(again < 0, "the helper was left as a zombie");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "waiting for the already-reaped helper failed for another reason"
+        );
     }
 
     #[test]
