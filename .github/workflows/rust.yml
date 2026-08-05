@@ -239,12 +239,20 @@ jobs:
       # qmllint; without it the CMake finds no Qt6::qmllint, skips the default
       # theme's lint with a STATUS message, and the typo class that ships as a
       # blank login screen goes unchecked.
+      #
+      # build-essential is here for the same reason git is: this job runs in a
+      # container rather than on the runner image, and `debian:trixie` ships no
+      # compiler. The `plasma-greeter` job above needs no equivalent because it
+      # runs on ubuntu-latest directly, where gcc is preinstalled — which is
+      # exactly why this was invisible until the job first ran, and why
+      # `project(... LANGUAGES C CXX)` failed at configure with
+      # "No CMAKE_C_COMPILER could be found" rather than anything about Qt.
       - name: Install build dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates cmake ninja-build pkg-config catch2 \
-            libwayland-dev qt6-base-dev qt6-declarative-dev \
+            build-essential git ca-certificates cmake ninja-build pkg-config \
+            catch2 libwayland-dev qt6-base-dev qt6-declarative-dev \
             qt6-declarative-dev-tools liblayershellqtinterface-dev
 
       - uses: actions/checkout@v4
