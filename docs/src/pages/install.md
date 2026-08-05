@@ -24,7 +24,7 @@ as it is created.
 
 ### Arch
 
-There are three AUR packages, one per build-dependency set. `wdm` depends on the
+There are four AUR packages, one per build-dependency set. `wdm` depends on the
 virtual `wdm-greeter-implementation`, which every greeter provides, so pacman
 asks which one to install.
 
@@ -33,22 +33,33 @@ asks which one to install.
 | `wdm` | `wdm`, `wdm-greeter` | the display stack only |
 | `wdm-gtk-greeter` | `wdm-gtk-greeter` | GTK4, gtk4-layer-shell |
 | `wdm-webkit-greeter` | `wdm-webkit-greeter` | the above plus WebKitGTK |
+| `wdm-plasma-greeter` | `wdm-plasma-greeter` | Qt 6, layer-shell-qt, CMake |
 
-Three rather than one split package because a split package has a single
+Four rather than one split package because a split package has a single
 `build()`, so every greeter was compiled whatever you asked for — installing the
 GTK greeter meant having WebKitGTK in the chroot, and installing `wdm` alone
-meant both toolkits. Each package now builds only its own crates.
+meant every toolkit. Each package now builds only its own greeter.
 
 `wdm` ships the reference greeter alongside the compositor because it is the one
 with no toolkit dependency: `wdm` on its own is installable, and satisfiable,
 with nothing but the display stack.
 
-In this repository the three are git submodules of `aur/`, each tracking its own
+`wdm-plasma-greeter` is the only one of the four that is not built with cargo.
+`greeters/plasma` is a standalone CMake project the Rust workspace deliberately
+does not know about, so that package build-depends on `cmake`, `ninja` and
+`catch2` and not on `rust` at all.
+
+All four are at `0.8.0`, which is one release ahead of the last tag: no
+published tarball contains `greeters/plasma` yet, so they name the first release
+that will, and share a placeholder checksum until it is tagged.
+
+In this repository the four are git submodules of `aur/`, each tracking its own
 AUR repository, so they are developed here and pushed there:
 
 ```bash
 git submodule update --init
-cd aur/wdm && makepkg -si            # or aur/wdm-gtk-greeter, aur/wdm-webkit-greeter
+cd aur/wdm && makepkg -si            # or aur/wdm-gtk-greeter, aur/wdm-webkit-greeter,
+                                     # aur/wdm-plasma-greeter
 ```
 
 ### Debian and Fedora

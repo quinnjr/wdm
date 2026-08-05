@@ -7,3 +7,6 @@
 [submodule "aur/wdm-webkit-greeter"]
 	path = aur/wdm-webkit-greeter
 	url = ssh://aur@aur.archlinux.org/wdm-webkit-greeter.git
+[submodule "aur/wdm-plasma-greeter"]
+	path = aur/wdm-plasma-greeter
+	url = ssh://aur@aur.archlinux.org/wdm-plasma-greeter.git

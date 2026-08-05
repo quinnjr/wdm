@@ -132,13 +132,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build pkg-config catch2 libwayland-dev
 
-      # -DWDM_PLASMA_QT=OFF, and it is not a shortcut. Nothing in the tree links
-      # Qt yet — the greeter is currently the protocol client and theme
-      # resolution — and Ubuntu 24.04 carries Qt 6.4, below the 6.5 floor this
-      # project requires for LayerShellQt::Window::get() before show(). Asking
-      # for Qt here would fail configure on a version question that has nothing
-      # to do with the code being built. When the Qt layer lands, this turns on
-      # against a runner that has 6.5.
+      # -DWDM_PLASMA_QT=OFF here, and it is no longer "the Qt half is untested":
+      # the plasma-greeter-qt job below builds and tests it on Debian trixie.
+      # What this job is for is the property the layering exists for — that the
+      # protocol client and theme resolution build and pass on a machine that
+      # has never had Qt installed — and the ASan tree, which is kept Qt-free
+      # deliberately, because ASan is what brings LeakSanitizer and LSan against
+      # a distribution Qt reports Qt's own static initialisation. TSan runs
+      # here *and* on the Qt half, in the job below: it has no leak checker, so
+      # that objection does not apply to it, and the threads it was configured
+      # for are in both halves. See the comment on that job.
       - name: Configure
         run: cmake -B build -S greeters/plasma -G Ninja -DWDM_PLASMA_QT=OFF
 
@@ -176,3 +179,167 @@ jobs:
         run: |
           cmake --build build-tsan
           ctest --test-dir build-tsan --output-on-failure --no-tests=error
+
+  # The Qt half: the QObject a theme binds against, the executable, the default
+  # theme and qmllint over it.
+  #
+  # A container and not ubuntu-latest, because ubuntu-latest is still 24.04 and
+  # 24.04 carries Qt 6.4 — below the 6.5 floor that makes
+  # `LayerShellQt::Window::get()` before `show()` the whole of the layer-shell
+  # setup — and has no Qt 6 LayerShellQt at all, because it ships Plasma 5.
+  # The alternatives, and why this one:
+  #
+  #   - Leaving -DWDM_PLASMA_QT=OFF everywhere. Rejected: that is half the
+  #     greeter — every property, the whole state machine, the buffered-answer
+  #     rule that a real account was locked out for — compiled by nobody on
+  #     every push. The `--no-tests=error` comment above already says what a
+  #     green job that checks nothing is worth.
+  #   - jurplel/install-qt-action plus LayerShellQt from source. Rejected: a
+  #     third-party action downloading a Qt from qt.io, and then a KDE library
+  #     built against it needing extra-cmake-modules and QtWaylandClient's
+  #     private headers. Four moving parts to get one `find_package` to
+  #     succeed, and every one of them can go red without a commit.
+  #   - runs-on: ubuntu-26.04, which does have Qt 6.8. Still marked preview in
+  #     actions/runner-images, and the same objection as the gtk4-layer-shell
+  #     step above: a preview image changes under you.
+  #   - This. Debian trixie is Debian stable, carries Qt 6.8.2 and
+  #     liblayershellqtinterface-dev, and is pinned by a name that does not
+  #     move until Debian releases again. When ubuntu-latest catches up this
+  #     job becomes a `runs-on:` line and the container goes away.
+  #
+  # ASan stays in the job above with Qt off, and that is deliberate rather than
+  # an omission: it is AddressSanitizer that brings LeakSanitizer, and pointing
+  # LSan at a distribution Qt reports Qt's own static initialisation, which no
+  # change in this repository can fix. A job that goes red for reasons nobody
+  # can act on is a job people learn to ignore. What ASan was configured for —
+  # Link handing libwayland raw pointers into a std::optional whose lifetime
+  # the protocol decides — lives in the Qt-free half and is fully exercised
+  # there.
+  #
+  # TSan does not inherit that argument, and used to be excluded by it anyway.
+  # It has no leak checker, so the LSan objection simply does not apply; and
+  # the thing it was configured for is the fake server being a second thread
+  # the tests read state from, which is precisely what tst_wdm does. Excluding
+  # it here left the concurrent code that best matches TSan's stated purpose as
+  # the only code TSan never saw, with "it passes on a developer machine"
+  # standing in for a check — which is unverifiable by anyone else and rots
+  # silently. So it is run here, on the tree that has the threads.
+  #
+  # Its own build tree, because ASan and TSan interpose the same things and
+  # cannot be linked into one binary, and `-L qt` because the Qt-labelled
+  # subset is the part this tree exists to instrument; the Qt-free suites are
+  # already run under TSan in the job above. `--no-tests=error` for the usual
+  # reason: an empty subset must be a failure, not a pass.
+  plasma-greeter-qt:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      # Before checkout, because actions/checkout needs git and the container
+      # is a base image with none. qt6-declarative-dev-tools is what carries
+      # qmllint; without it the CMake finds no Qt6::qmllint, skips the default
+      # theme's lint with a STATUS message, and the typo class that ships as a
+      # blank login screen goes unchecked.
+      #
+      # build-essential is here for the same reason git is: this job runs in a
+      # container rather than on the runner image, and `debian:trixie` ships no
+      # compiler. The `plasma-greeter` job above needs no equivalent because it
+      # runs on ubuntu-latest directly, where gcc is preinstalled — which is
+      # exactly why this was invisible until the job first ran, and why
+      # `project(... LANGUAGES C CXX)` failed at configure with
+      # "No CMAKE_C_COMPILER could be found" rather than anything about Qt.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates cmake ninja-build pkg-config \
+            catch2 libwayland-dev qt6-base-dev qt6-declarative-dev \
+            qt6-declarative-dev-tools liblayershellqtinterface-dev
+
+      - uses: actions/checkout@v4
+
+      # No -DWDM_PLASMA_QT: the default is ON, so a bare configure is the full
+      # build. The step after the build is what makes that a thing this job can
+      # fail on rather than a thing this comment asserts.
+      - name: Configure
+        run: cmake -B build -S greeters/plasma -G Ninja
+
+      - name: Build
+        run: cmake --build build
+
+      # The assertion that this job is testing the Qt half at all.
+      #
+      # Without it the job is green-and-empty in two different ways, and neither
+      # one is visible in its output:
+      #
+      #   - If the WDM_PLASMA_QT default ever flips to OFF, a bare configure
+      #     stops building the executable, the QObject and tst_wdm. tst_link,
+      #     tst_theme and tst_exitcode are registered outside that `if`, so
+      #     ctest still finds three suites and passes — and `--no-tests=error`
+      #     never fires, because it fires only on *zero*. The job would go green
+      #     having compiled none of the half it exists for.
+      #   - If this container ever stops carrying qt6-declarative-dev-tools, the
+      #     CMake finds no Qt6::qmllint, skips the default theme's lint with a
+      #     STATUS message nobody reads, and four other suites keep the run
+      #     non-empty. The typo class that ships as a blank login screen would
+      #     go unchecked.
+      #
+      # So: the executable must exist, the lint entry must be registered by
+      # name, and the Qt-labelled tests must be a non-empty set. The label is
+      # attached in greeters/plasma/CMakeLists.txt inside the same
+      # `if(WDM_PLASMA_QT)` that builds them, which is what makes its absence
+      # mean the Qt half is absent rather than merely renamed.
+      - name: Assert the Qt half was built
+        run: |
+          test -x build/wdm-plasma-greeter
+          ctest --test-dir build -N -L qt | grep -q qmllint-default-theme
+
+      # Nothing here opens a display: tst_wdm drives the whole state machine
+      # under a QCoreApplication against a socketpair, and qmllint is a static
+      # analyser. There is deliberately no xvfb and no offscreen platform — if
+      # one of these ever needs a QPA plugin, that is a fact about the test
+      # worth failing over rather than papering over.
+      #
+      # Two invocations rather than one. The first runs everything; the second
+      # runs only the Qt-labelled subset, so that an empty subset is a
+      # missing-test error rather than a run that quietly consisted of the
+      # Qt-free suites. The step above already catches that, and this catches it
+      # again from the other side — the check is free and the failure it is for
+      # is silent.
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure --no-tests=error
+          ctest --test-dir build --output-on-failure --no-tests=error -L qt
+
+      - name: Configure with TSan
+        run: >
+          cmake -B build-tsan -S greeters/plasma -G Ninja
+          -DWDM_PLASMA_SANITIZE_THREAD=ON
+
+      # TSAN_OPTIONS, and the suppressions file is not a way of making a red job
+      # green. Qt on Linux dispatches through glib, and a distribution Qt is
+      # built without instrumentation, so TSan reports its event dispatcher's
+      # internal synchronisation as unannotated races — stacks that bottom out
+      # in libglib-2.0 and libQt6Core with no frame of ours above them. Every
+      # assertion in those runs passed; it was the third-party reports that
+      # failed the step.
+      #
+      # This is the same objection that keeps the ASan tree Qt-free, arriving by
+      # a different route: LeakSanitizer against that Qt reports its static
+      # initialisation, ThreadSanitizer reports its event loop. The file
+      # suppresses libraries and nothing of ours, and says so at the top; the
+      # no-Qt TSan tree in the job above still covers Link and the fake server
+      # with no suppressions at all.
+      #
+      # The path is computed with $(pwd) inside the step rather than from
+      # ${{ github.workspace }}: this job runs in a container, where that
+      # expression expands to the *host* path (/home/runner/work/...) while the
+      # checkout is mounted at /__w/.... TSan then cannot read the file and
+      # aborts every binary at startup, including the ones Catch2 runs during
+      # test discovery — which is how it failed, and it failed loudly rather
+      # than proceeding with no suppressions, which is the behaviour worth
+      # having.
+      - name: Test under TSan
+        run: |
+          cmake --build build-tsan
+          TSAN_OPTIONS="suppressions=$(pwd)/greeters/plasma/tests/tsan-suppressions.txt" \
+            ctest --test-dir build-tsan --output-on-failure --no-tests=error -L qt

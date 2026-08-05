@@ -1,6 +1,7 @@
 #include "link.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -117,14 +118,43 @@ struct Link::Callbacks {
 
     static void authOk(void *data, wdm_greeter_v1 *) {
         auto *self = static_cast<Link *>(data);
+        if (self->discardConversationEvent("auth_ok")) {
+            return;
+        }
         self->pending_.reset();
         self->observer_->onAuthOk();
     }
 
     static void authFailed(void *data, wdm_greeter_v1 *, const char *reason) {
         auto *self = static_cast<Link *>(data);
+        if (self->discardConversationEvent("auth_failed")) {
+            return;
+        }
         self->pending_.reset();
         self->observer_->onAuthFailed(reason);
+    }
+
+    /// A bounded roundtrip's sync coming back. `data` is the caller's flag on
+    /// its own stack — the callback is destroyed before that stack unwinds on
+    /// every path out of roundtrip(), including the deadline one.
+    static void roundtripDone(void *data, wl_callback *, std::uint32_t) {
+        *static_cast<bool *>(data) = true;
+    }
+
+    /// The cancel barrier coming down. See Link::cancel().
+    static void barrierDone(void *data, wl_callback *callback, std::uint32_t) {
+        auto *self = static_cast<Link *>(data);
+        // Identity checked rather than assumed: cancel() destroys the previous
+        // barrier when it installs a new one, so this should always be the
+        // current one — and if it ever is not, clearing the flag for a barrier
+        // that has been superseded would reopen the window the newer one is
+        // holding shut.
+        if (self->barrier_ != callback) {
+            wl_callback_destroy(callback);
+            return;
+        }
+        self->dropBarrier();
+        self->discarding_ = false;
     }
 
     static void defaultSession(void *data, wdm_greeter_v1 *, const char *id) {
@@ -133,6 +163,16 @@ struct Link::Callbacks {
 
     static const wl_registry_listener kRegistry;
     static const wdm_greeter_v1_listener kGreeter;
+    static const wl_callback_listener kBarrier;
+    static const wl_callback_listener kRoundtrip;
+};
+
+const wl_callback_listener Link::Callbacks::kBarrier = {
+    .done = &Link::Callbacks::barrierDone,
+};
+
+const wl_callback_listener Link::Callbacks::kRoundtrip = {
+    .done = &Link::Callbacks::roundtripDone,
 };
 
 const wl_registry_listener Link::Callbacks::kRegistry = {
@@ -159,6 +199,8 @@ Link::~Link() {
     // Destroying the greeter object cancels any conversation in progress, which
     // is the whole of the cleanup wdm needs from us. The display is Qt's and is
     // deliberately left alone.
+    // Before the queue below, which it lives in.
+    dropBarrier();
     if (greeter_ != nullptr) {
         wdm_greeter_v1_destroy(greeter_);
     }
@@ -186,12 +228,47 @@ void Link::handleGlobal(wl_registry *registry, std::uint32_t name, const char *i
     wdm_greeter_v1_add_listener(greeter_, &Callbacks::kGreeter, this);
 }
 
+bool Link::discardConversationEvent(const char *what) {
+    if (!discarding_) {
+        return false;
+    }
+    // Said out loud, because this is where an event wdm really sent stops
+    // without the layer above ever hearing of it: a login attempt that ends
+    // with the screen simply going quiet has to leave a line behind saying
+    // which event was dropped and why.
+    //
+    // stderr and not a logging framework, and unconditional rather than
+    // thresholded — the same arrangement styleFromProtocol's default arm above
+    // is under, and for the same reason. This half links no Qt, so
+    // logging.h's handler and WDM_GREETER_LOG are not reachable from here, and
+    // wdm's greeters are journald children whose stderr is already where their
+    // diagnostics go.
+    std::fprintf(stderr, "wdm-plasma-greeter: %s for a cancelled conversation; discarded\n", what);
+    return true;
+}
+
 void Link::handlePrompt(std::uint32_t id, const char *text, std::uint32_t style) {
+    // Before the Prompt is built, and in particular before `pending_` could be
+    // written: re-arming pending_ for a conversation wdm has been told to
+    // abandon is the whole of the defect cancel()'s barrier exists for. The
+    // layer above drops the event too, but it cannot undo this — by the time
+    // its guard runs, Link is already holding an id it will accept a respond
+    // for.
+    if (discardConversationEvent("prompt")) {
+        return;
+    }
     Prompt prompt{id, text, styleFromProtocol(style)};
     if (prompt.expectsAnswer()) {
         pending_ = prompt;
     }
     observer_->onPrompt(prompt);
+}
+
+void Link::dropBarrier() {
+    if (barrier_ != nullptr) {
+        wl_callback_destroy(barrier_);
+        barrier_ = nullptr;
+    }
 }
 
 void Link::die(const std::string &why) {
@@ -200,7 +277,56 @@ void Link::die(const std::string &why) {
     }
     dead_ = true;
     pending_.reset();
+    // The barrier is destroyed but the flag is left standing. Nothing will ever
+    // dispatch again, so the flag has no further effect; destroying the proxy
+    // is what matters, because the queue it lives in is destroyed with this
+    // object and a listener left pointing into it is a use-after-free waiting
+    // for a dispatch that a reconnect would provide.
+    dropBarrier();
     observer_->onLinkDead(why);
+}
+
+bool Link::roundtrip(int timeoutMs, std::string *error) {
+    auto *wrapper = static_cast<wl_display *>(wl_proxy_create_wrapper(display_));
+    if (wrapper == nullptr) {
+        *error = "could not wrap the Wayland display";
+        return false;
+    }
+    wl_proxy_set_queue(reinterpret_cast<wl_proxy *>(wrapper), queue_);
+    wl_callback *callback = wl_display_sync(wrapper);
+    wl_proxy_wrapper_destroy(wrapper);
+    if (callback == nullptr) {
+        *error = "could not ask the compositor for a roundtrip";
+        return false;
+    }
+
+    bool done = false;
+    wl_callback_add_listener(callback, &Callbacks::kRoundtrip, &done);
+
+    // A clock and not a countdown of poll() timeouts: poll returns early on any
+    // readable byte, including one belonging to another queue entirely, so a
+    // loop that passed the full timeout each pass would have no deadline at
+    // all on a busy connection.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!done) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            wl_callback_destroy(callback);
+            *error = "wdm accepted the connection but never finished enumerating";
+            return false;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (!readAndDispatch(static_cast<int>(remaining))) {
+            // Only a dead link gets here; readAndDispatch has already reported
+            // it through onLinkDead, and this is the sentence the caller shows.
+            wl_callback_destroy(callback);
+            *error = "lost the connection to the compositor: " + reasonFromErrno();
+            return false;
+        }
+    }
+    wl_callback_destroy(callback);
+    return true;
 }
 
 bool Link::connect(std::string *error) {
@@ -243,18 +369,29 @@ bool Link::connect(std::string *error) {
     // collects the globals and binds; the second collects everything that
     // arrives as a result of binding, which is the entire enumerate phase up to
     // and including `done`.
-    if (wl_display_roundtrip_queue(display_, queue_) < 0) {
-        *error = "lost the connection to the compositor: " + reasonFromErrno();
-        die(*error);
+    //
+    // Both are deadlined, and both halves need it for different reasons: a
+    // compositor that accepts a connection and never answers the registry is
+    // as silent as one that binds and never sends `done`, and the deadline is
+    // shared between them because what the user is waiting for is one thing —
+    // a login screen — rather than two protocol phases.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kEnumerateTimeoutMs);
+    const auto remaining = [&deadline] {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        return left > 0 ? static_cast<int>(left) : 0;
+    };
+
+    if (!roundtrip(remaining(), error)) {
         return false;
     }
     if (greeter_ == nullptr) {
         *error = "the compositor does not offer wdm_greeter_v1; this greeter only runs under wdm";
         return false;
     }
-    if (wl_display_roundtrip_queue(display_, queue_) < 0) {
-        *error = "lost the connection to the compositor: " + reasonFromErrno();
-        die(*error);
+    if (!roundtrip(remaining(), error)) {
         return false;
     }
     return true;
@@ -295,6 +432,35 @@ void Link::cancel() {
     // prompt that is never going to be answerable again.
     pending_.reset();
     wdm_greeter_v1_cancel(greeter_);
+
+    // The barrier, and it is sent *after* the cancel because that ordering is
+    // the entire guarantee: its `done` cannot arrive until wdm has processed
+    // the cancel, so nothing before it belongs to a conversation that still
+    // exists. See the header.
+    //
+    // A wrapper for the same reason connect() uses one — the sync's callback
+    // must be created on our queue and not on Qt's, or the `done` is dispatched
+    // where nothing understands it and the barrier never comes down.
+    dropBarrier();
+    auto *wrapper = static_cast<wl_display *>(wl_proxy_create_wrapper(display_));
+    if (wrapper != nullptr) {
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy *>(wrapper), queue_);
+        barrier_ = wl_display_sync(wrapper);
+        wl_proxy_wrapper_destroy(wrapper);
+    }
+    if (barrier_ != nullptr) {
+        wl_callback_add_listener(barrier_, &Callbacks::kBarrier, this);
+        discarding_ = true;
+    } else {
+        // Only reachable on an allocation failure, which libwayland does not
+        // otherwise survive. Named rather than ignored, because without the
+        // barrier a prompt crossing this cancel is delivered again and the
+        // failure it causes — a respond under a dead conversation's id — shows
+        // up as wdm killing the greeter with no local explanation at all.
+        std::fprintf(stderr,
+                     "wdm-plasma-greeter: could not create the cancel barrier; a prompt already "
+                     "in flight may still be delivered\n");
+    }
     dispatch();
 }
 
