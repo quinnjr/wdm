@@ -315,7 +315,23 @@ jobs:
           cmake -B build-tsan -S greeters/plasma -G Ninja
           -DWDM_PLASMA_SANITIZE_THREAD=ON
 
+      # TSAN_OPTIONS, and the suppressions file is not a way of making a red job
+      # green. Qt on Linux dispatches through glib, and a distribution Qt is
+      # built without instrumentation, so TSan reports its event dispatcher's
+      # internal synchronisation as unannotated races — stacks that bottom out
+      # in libglib-2.0 and libQt6Core with no frame of ours above them. Every
+      # assertion in those runs passed; it was the third-party reports that
+      # failed the step.
+      #
+      # This is the same objection that keeps the ASan tree Qt-free, arriving by
+      # a different route: LeakSanitizer against that Qt reports its static
+      # initialisation, ThreadSanitizer reports its event loop. The file
+      # suppresses libraries and nothing of ours, and says so at the top; the
+      # no-Qt TSan tree in the job above still covers Link and the fake server
+      # with no suppressions at all.
       - name: Test under TSan
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/greeters/plasma/tests/tsan-suppressions.txt
         run: |
           cmake --build build-tsan
           ctest --test-dir build-tsan --output-on-failure --no-tests=error -L qt

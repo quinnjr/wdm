@@ -1,0 +1,43 @@
+# ThreadSanitizer suppressions for the Qt-enabled test run.
+#
+# Only third-party frames belong here. Nothing in greeters/plasma is
+# suppressed, and nothing should ever be added that is: the reason TSan runs at
+# all is the fake compositor, which is a second thread every test in tst_link
+# and tst_wdm reads state from, and a suppression covering our own code would
+# retire exactly the check this file exists to keep alive.
+#
+# Qt on Linux dispatches events through glib by default, and a distribution Qt
+# is built without instrumentation — so TSan sees glib's and QtCore's internal
+# synchronisation as unannotated and reports it. The reports are real races as
+# far as TSan can tell and entirely outside this repository: the stacks bottom
+# out in libglib-2.0 and libQt6Core with no frame of ours above them.
+#
+# This is the same objection that keeps the ASan tree Qt-free, arriving by a
+# different route. LeakSanitizer against a distribution Qt reports Qt's static
+# initialisation; ThreadSanitizer against the same Qt reports its event
+# dispatcher. Both are noise nobody can act on, and a job that goes red for
+# reasons nobody can act on is a job people learn to ignore.
+#
+# ponytail: this suppresses by library, not by specific race, so a genuine race
+# introduced in a Qt frame *called from our code* would be hidden with them.
+# The ceiling is that TSan's coverage of this greeter stops at the Qt boundary.
+# The upgrade path is a Qt built with -fsanitize=thread — which means building
+# Qt from source in CI, several hours per run, for a class of bug this project
+# has never had. The no-Qt TSan tree in the plasma-greeter job still covers
+# Link and the fake server with no suppressions at all, and that is where the
+# threading this project actually wrote lives.
+
+# Qt's own internals: object trees, the event dispatcher, QMetaObject.
+race:libQt6Core.so
+race:libQt6Gui.so
+race:libQt6Qml.so
+race:libQt6Quick.so
+
+# Qt's glib event-loop integration, and glib itself.
+race:libglib-2.0.so
+race:libgobject-2.0.so
+
+# Thread leaks are Qt's to answer for too: QQmlEngine and the QPA plugins
+# start threads they do not join before exit.
+thread:libQt6Core.so
+thread:libQt6Qml.so
