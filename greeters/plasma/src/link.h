@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 
+struct wl_callback;
 struct wl_display;
 struct wl_event_queue;
 struct wl_registry;
@@ -155,13 +156,38 @@ public:
     Link(const Link &) = delete;
     Link &operator=(const Link &) = delete;
 
+    /// How long the enumerate phase is given before it is called a failure.
+    ///
+    /// Bounded because the unbounded version had exactly one failure mode and
+    /// it was the worst one available: a wdm that accepts the connection and
+    /// then stops answering — wedged rather than crashed, so no EOF and no
+    /// error — leaves the greeter blocked inside connect() forever, with no
+    /// window, nothing on stderr, and nothing for wdm's give-up screen to say.
+    /// That is the blank login screen the top of main.cpp says this greeter
+    /// exists to prevent, reached through the one path that had no deadline on
+    /// it.
+    ///
+    /// Ten seconds, and the number is chosen from what is on the other side:
+    /// wdm's enumerate phase is a scan of /etc/passwd and the session
+    /// directories, work measured in milliseconds even on a machine that is
+    /// swapping. Anything an order of magnitude past that is not slow, it is
+    /// stopped. Long enough that no real machine trips it, short enough that
+    /// the user gets a sentence instead of a black screen.
+    static constexpr int kEnumerateTimeoutMs = 10000;
+
     /// Bind the global and receive the enumerate phase.
     ///
     /// Returns once `done` has arrived, so the QML engine loads against a
     /// populated model rather than flickering into one. False with `error` set
     /// when wdm_greeter_v1 is not advertised — the ordinary result of running
     /// the binary from a terminal, which deserves a sentence rather than a
-    /// crash — or when the connection failed outright.
+    /// crash — when the connection failed outright, or when wdm accepted the
+    /// connection and then stopped answering; see kEnumerateTimeoutMs.
+    ///
+    /// This is the one method that reads the connection's fd itself. It is
+    /// called before QGuiApplication's event loop is running, so there is no
+    /// second reader to race — which is why the two roundtrips it replaced were
+    /// correct here and would not have been anywhere else.
     ///
     /// Callable once. A second call would overwrite the queue and the registry,
     /// leaking both and leaving the old registry listening into a destroyed
@@ -191,6 +217,14 @@ public:
     /// of the conversation, and link death.
     const std::optional<Prompt> &pendingPrompt() const { return pending_; }
 
+    /// Whether a cancel's barrier is still outstanding — see cancel().
+    ///
+    /// For the tests, which have to be able to say "the barrier was up and then
+    /// it came down" rather than infer it from what did not happen. The greeter
+    /// never reads it: everything it changes has already been decided by the
+    /// time an observer callback runs.
+    bool discardingUntilBarrier() const { return discarding_; }
+
     /// Begin a PAM conversation. Only ever from a deliberate user action — a
     /// conversation is a login attempt as far as pam_faillock is concerned for
     /// its whole duration, including the part where it is waiting for an answer
@@ -213,6 +247,36 @@ public:
     /// was marshalled afterwards, and the freed bytes being marshalled are a
     /// password.
     bool respond(std::uint32_t id, std::string response);
+
+    /// Abandon the conversation, and refuse everything wdm sent before it heard
+    /// so.
+    ///
+    /// The second half is the load-bearing one, and it is why this is a barrier
+    /// rather than a flag on the layer above. Dropping `pending_` here is not
+    /// enough: a prompt already on the wire is dispatched *after* the cancel is
+    /// sent, `handlePrompt` puts it back into `pending_`, and Link will then
+    /// accept a `respond` quoting its id. If the theme has meanwhile started a
+    /// second conversation — one 16 ms pump tick is all it takes: the user
+    /// picks another account and presses Enter — the answer buffered for the
+    /// *second* conversation is sent under the *first* conversation's prompt
+    /// id. wdm meets that with stale_prompt, which kills the greeter, and the
+    /// request that killed it carried one user's password under another user's
+    /// conversation.
+    ///
+    /// So the cancel is followed by a `wl_display_sync` on our own queue, and
+    /// every prompt and verdict arriving before its `done` is dropped without
+    /// touching `pending_`. Wayland orders a client's requests and a
+    /// compositor's events on one connection, so everything wdm emitted before
+    /// it processed the cancel precedes that `done` and everything belonging to
+    /// the next conversation follows it. The discard is therefore by
+    /// construction rather than by timing — which is the difference between
+    /// this and a guard that happens to win the race on the machines it was
+    /// tried on.
+    ///
+    /// Not a `wl_display_roundtrip_queue`, which would have been three lines
+    /// instead of thirty: it blocks the thread that draws the login screen on a
+    /// compositor that may be wedged rather than gone, and a greeter frozen
+    /// mid-cancel is the blank screen this greeter is built to avoid.
     void cancel();
     /// Launch a session. Sends no environment: locale and keyboard come from
     /// wdm's own configuration, and the env argument exists for greeters that
@@ -257,13 +321,29 @@ private:
     /// actually takes.
     ///
     /// `timeoutMs` bounds the wait for the socket to become readable.
+    ///
+    /// connect() is the one caller inside the greeter, and it is a caller for
+    /// the same reason the tests are: at that point Qt's event loop has not
+    /// started, so nothing else is reading the fd.
     bool readAndDispatch(int timeoutMs);
+
+    /// wl_display_roundtrip_queue with a deadline.
+    ///
+    /// libwayland's own roundtrip has none, and a compositor that answers
+    /// nothing is not distinguishable from one that is about to. Returns false
+    /// with `error` set on the deadline and on the connection failing.
+    bool roundtrip(int timeoutMs, std::string *error);
 
     void handleGlobal(wl_registry *registry, std::uint32_t name, const char *interface,
                       std::uint32_t version);
     void handlePrompt(std::uint32_t id, const char *text, std::uint32_t style);
+    /// Whether this conversation event belongs to a conversation wdm has
+    /// already been told to abandon. See cancel().
+    bool discardConversationEvent(const char *what);
     /// Latch the failure and report it once.
     void die(const std::string &why);
+    /// Destroy the outstanding cancel barrier, if there is one.
+    void dropBarrier();
 
     wl_display *display_ = nullptr;
     LinkObserver *observer_ = nullptr;
@@ -273,6 +353,14 @@ private:
     std::uint32_t version_ = 0;
     bool dead_ = false;
     std::optional<Prompt> pending_;
+
+    /// The outstanding cancel barrier, and whether it is still up. See
+    /// cancel(). Two members rather than one because the callback has to be
+    /// destroyed on the paths that never dispatch it — link death and this
+    /// object's own destruction — and a null proxy is not the same fact as a
+    /// barrier that has come down.
+    wl_callback *barrier_ = nullptr;
+    bool discarding_ = false;
 };
 
 } // namespace wdm

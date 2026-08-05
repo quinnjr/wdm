@@ -181,3 +181,64 @@ TEST_CASE("a main qml that cannot be read is not a theme", "[theme]") {
     CAPTURE(result.error);
     CHECK(result.error.find("cannot read") != std::string::npos);
 }
+
+// --------------------------------------------------------------------------
+// The argument list
+// --------------------------------------------------------------------------
+//
+// Parsed rather than scanned, and every malformed form is an error rather than
+// a default, for the same reason a missing theme is: this greeter is launched
+// from a `greeter.command` line in wdm's configuration file, and an argument
+// that is quietly ignored there is a setting an administrator believes is in
+// effect. The webkit greeter's `theme_argument` applies exactly these rules;
+// an administrator should not have to remember which greeter is stricter.
+
+TEST_CASE("a theme name is taken in either spelling", "[theme][args]") {
+    CHECK(wdm::parseThemeArgument({"--theme", "breeze"}).name == "breeze");
+    CHECK(wdm::parseThemeArgument({"--theme=breeze"}).name == "breeze");
+    // A path, which resolveTheme distinguishes by the separator rather than by
+    // asking the filesystem.
+    CHECK(wdm::parseThemeArgument({"--theme=/srv/themes/mine"}).name == "/srv/themes/mine");
+}
+
+TEST_CASE("no argument at all means the default theme", "[theme][args]") {
+    const wdm::ThemeArgument parsed = wdm::parseThemeArgument({});
+    REQUIRE(parsed.ok());
+    // Empty, and resolveTheme reads empty as kDefaultThemeName — so the two
+    // agree about what "not given" means without either of them naming the
+    // default twice.
+    CHECK(parsed.name.empty());
+    CHECK(resolveTheme(parsed.name, fs::path("/nonexistent")).error.find("'default'")
+          != std::string::npos);
+}
+
+TEST_CASE("a malformed argument list is refused rather than defaulted", "[theme][args]") {
+    SECTION("a trailing --theme with no value") {
+        const wdm::ThemeArgument parsed = wdm::parseThemeArgument({"--theme"});
+        CHECK(!parsed.ok());
+        CHECK(parsed.name.empty());
+    }
+
+    SECTION("--theme= with nothing after it") {
+        // Not the same as asking for the default: an empty name in a
+        // configuration file is a mistake, and resolving it to `default` would
+        // hide it behind a login screen that looks fine.
+        CHECK(!wdm::parseThemeArgument({"--theme="}).ok());
+    }
+
+    SECTION("--theme given twice") {
+        // Quietly taking the later value shows a login screen other than the
+        // one that was asked for, and the one that was asked for is right there
+        // in the same command line.
+        CHECK(!wdm::parseThemeArgument({"--theme", "a", "--theme", "b"}).ok());
+        CHECK(!wdm::parseThemeArgument({"--theme=a", "--theme=b"}).ok());
+    }
+
+    SECTION("anything else") {
+        const wdm::ThemeArgument parsed = wdm::parseThemeArgument({"--verbose"});
+        CHECK(!parsed.ok());
+        // Named, because the person reading this is looking at a login screen
+        // that did not appear and needs to know which word was the problem.
+        CHECK(parsed.error.find("--verbose") != std::string::npos);
+    }
+}

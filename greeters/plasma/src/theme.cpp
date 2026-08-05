@@ -57,4 +57,44 @@ ThemeResult resolveTheme(std::string_view requested, const std::filesystem::path
     return ThemeResult{Theme{directory, mainQml}, std::string()};
 }
 
+ThemeArgument parseThemeArgument(const std::vector<std::string> &args) {
+    constexpr std::string_view kFlag = "--theme";
+    constexpr std::string_view kFlagEquals = "--theme=";
+
+    ThemeArgument result;
+    bool seen = false;
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string &arg = args[i];
+        std::string value;
+
+        if (arg == kFlag) {
+            if (i + 1 >= args.size()) {
+                return ThemeArgument{std::string(), "--theme needs a value"};
+            }
+            value = args[++i];
+        } else if (arg.rfind(kFlagEquals, 0) == 0) {
+            value = arg.substr(kFlagEquals.size());
+        } else {
+            return ThemeArgument{std::string(), "unrecognised argument: " + arg};
+        }
+
+        if (value.empty()) {
+            // `--theme=` with nothing after it. Distinct from `--theme` not
+            // being given at all, and not the same as asking for the default:
+            // an empty name in a greeter.command line is a configuration
+            // mistake, and resolving it to `default` would hide it behind a
+            // login screen that looks fine.
+            return ThemeArgument{std::string(), "--theme needs a value"};
+        }
+        if (seen) {
+            return ThemeArgument{std::string(), "--theme given more than once"};
+        }
+        seen = true;
+        result.name = std::move(value);
+    }
+
+    return result;
+}
+
 } // namespace wdm
