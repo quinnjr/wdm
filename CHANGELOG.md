@@ -5,6 +5,40 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-05
+
+A fourth greeter, `wdm-plasma-greeter`, written in C++ against Qt 6 and QML for
+Plasma desktops. It is the first part of this project not built with cargo:
+`greeters/plasma` is a standalone CMake project the Rust workspace deliberately
+does not know about, because a `build.rs` shelling out to cmake would make
+`cargo test --workspace` fail on every machine without Qt.
+
+Its themes are QML, and the theme contract is public rather than a demo — a
+theme sees a `wdm` object with properties, models and signals, and holds the
+policy that wdm does not: what a failure looks like, whether to preselect a
+session, when to retry. `docs/src/pages/plasma-themes.md` is the contract.
+
+The greeter is split so that nearly all of it is testable without a display.
+`Link` owns the `wdm_greeter_v1` connection on its own `wl_event_queue` and
+speaks libwayland directly; `Wdm` is the QML-facing object above it. The suite
+runs the whole state machine against a fake compositor under a
+`QCoreApplication` with no QPA platform plugin and no window, which is what
+lets it run in a build chroot.
+
+**CI now covers the C++ as well as the Rust**, in three jobs: the Rust checks,
+a no-Qt tree built under ASan/UBSan and ThreadSanitizer, and a Qt tree on
+`debian:trixie`. TSan against a distribution Qt reports Qt's own event
+dispatcher and glib's internals, so those are suppressed by library, with the
+ceiling named in `greeters/plasma/tests/tsan-suppressions.txt`: TSan's coverage
+of this greeter stops at the Qt boundary. The no-Qt tree, which is where the
+threading this project actually wrote lives, runs with no suppressions at all.
+
+Arch packaging is now four AUR packages. `wdm-plasma-greeter` build-depends on
+`cmake`, `ninja` and `catch2` and on rust not at all; `catch2` is a hard
+makedepend and `check()` passes `--no-tests=error`, because a missing Catch2
+skips every test target with a STATUS message and leaves a `ctest` that finds
+nothing and exits 0.
+
 ## [0.7.0] — 2026-08-04
 
 The second project audit, reconciled — 44 findings across 212 units. Three
@@ -581,7 +615,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/quinnjr/wdm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/quinnjr/wdm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/quinnjr/wdm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/quinnjr/wdm/releases/tag/v0.5.0

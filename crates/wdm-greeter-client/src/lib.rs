@@ -364,9 +364,9 @@ impl Model {
     /// Record that the connection to wdm is gone.
     ///
     /// Reported through the model because the UIs already draw everything from
-    /// it: the failure lands as a sticky notice (so it is shown, not scrolled
-    /// away by a retry — `blocked` suppresses auto-retry, which would only spin
-    /// against a dead socket) and ends whatever the conversation was doing. The
+    /// it: the failure lands as a sticky notice (so it is shown, not replaced by
+    /// a fresh prompt — `blocked` marks a failure that was explained, which a UI
+    /// leaves on screen) and ends whatever the conversation was doing. The
     /// alternative was a log line nobody at a login screen can read, under a
     /// greeter stuck on "Starting session…" forever.
     pub fn link_lost(&mut self, why: &str) {
@@ -536,24 +536,37 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        state.apply(event);
+    }
+}
+
+impl Model {
+    /// Fold one `wdm_greeter_v1` event into the model.
+    ///
+    /// The whole of the [`Dispatch`] impl above, which does nothing else. It
+    /// lives here because `Dispatch::event` needs a bound `WdmGreeterV1` and a
+    /// live `Connection` to call, and neither exists without a compositor on
+    /// the other end — so a test that wants to know what an event does to the
+    /// model could only restate the arm rather than run it.
+    pub(crate) fn apply(&mut self, event: wdm_greeter_v1::Event) {
         match event {
             wdm_greeter_v1::Event::User {
                 name,
                 display_name,
                 last_session,
                 ..
-            } => state.users.push(User {
+            } => self.users.push(User {
                 name,
                 display_name,
                 last_session,
             }),
 
             wdm_greeter_v1::Event::Session { id, name, .. } => {
-                state.sessions.push(Session { id, name });
+                self.sessions.push(Session { id, name });
             }
 
             wdm_greeter_v1::Event::DefaultSession { id } => {
-                state.default_session = id;
+                self.default_session = id;
             }
 
             // Placement is left to the compositor. wdm puts a layer surface with
@@ -564,13 +577,13 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
             wdm_greeter_v1::Event::OutputRank { .. } => {}
 
             wdm_greeter_v1::Event::LastError { text } => {
-                state.error = Some(text);
-                state.touch();
+                self.error = Some(text);
+                self.touch();
             }
 
             // Link::connect roundtrips until this arrives, so there is nothing
             // to record — the UI is only built once the lists are populated.
-            wdm_greeter_v1::Event::Done => state.touch(),
+            wdm_greeter_v1::Event::Done => self.touch(),
 
             wdm_greeter_v1::Event::Prompt { id, text, style } => {
                 match style.into_result() {
@@ -581,25 +594,27 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
                     // XML does not define — and there is nothing to show.
                     Ok(style) => match Routed::from(style) {
                         // Expects no answer. PAM explaining itself, so it
-                        // sticks and it stops the auto-retry.
-                        Routed::Notice(kind) => state.push_notice(kind, text),
+                        // sticks: it sets `blocked`, which marks a failure a UI
+                        // leaves on screen rather than replacing with a fresh
+                        // prompt.
+                        Routed::Notice(kind) => self.push_notice(kind, text),
                         Routed::Prompt { secret } => {
-                            state.prompt = Some(Prompt { id, text, secret });
+                            self.prompt = Some(Prompt { id, text, secret });
                         }
                     },
                     Err(e) => log::warn!("unknown prompt style: {e}"),
                 }
-                state.touch();
+                self.touch();
             }
 
-            wdm_greeter_v1::Event::AuthOk => state.auth_ok(),
+            wdm_greeter_v1::Event::AuthOk => self.auth_ok(),
 
             wdm_greeter_v1::Event::AuthFailed { reason } => {
-                state.authenticated = false;
-                state.conversation_over = true;
-                state.prompt = None;
-                state.error = Some(reason);
-                state.touch();
+                self.authenticated = false;
+                self.conversation_over = true;
+                self.prompt = None;
+                self.error = Some(reason);
+                self.touch();
             }
 
             _ => {}
@@ -611,11 +626,18 @@ impl Dispatch<WdmGreeterV1, ()> for Model {
 mod tests {
     use super::*;
 
+    /// A model that has just been failed by wdm, through the event that fails
+    /// it.
+    ///
+    /// Built by `apply` rather than by a struct literal: a literal would assert
+    /// its own initialiser back to itself, and no edit to the `AuthFailed` arm
+    /// could make a test written that way fail.
     fn failed() -> Model {
-        Model {
-            conversation_over: true,
-            ..Model::default()
-        }
+        let mut model = Model::default();
+        model.apply(wdm_greeter_v1::Event::AuthFailed {
+            reason: "Authentication failure".to_owned(),
+        });
+        model
     }
 
     #[test]
@@ -626,11 +648,34 @@ mod tests {
         // armed a conversation nobody was present for. The state is still worth
         // pinning; what a greeter does with it is now the greeter's, and every
         // greeter in this repository waits for a keypress.
-        let model = failed();
-        assert!(model.conversation_over);
+        //
+        // The transition is what is pinned, not the end state: the model starts
+        // mid-conversation, holding a question and believing it authenticated,
+        // and `AuthFailed` is what has to undo all three.
+        let mut model = Model::default();
+        model.apply(wdm_greeter_v1::Event::Prompt {
+            id: 1,
+            text: "Password: ".to_owned(),
+            style: wayland_client::WEnum::Value(wdm_greeter_v1::PromptStyle::Secret),
+        });
+        model.authenticated = true;
+        let before = model.revision;
+        assert!(model.prompt.is_some(), "the setup did not arm a prompt");
+
+        model.apply(wdm_greeter_v1::Event::AuthFailed {
+            reason: "Authentication failure".to_owned(),
+        });
+
+        assert!(model.conversation_over, "the attempt must be over");
+        assert!(!model.authenticated, "a failure must revoke authentication");
+        assert!(
+            model.prompt.is_none(),
+            "a question nobody will read the answer to must not stay on screen"
+        );
+        assert_eq!(model.error.as_deref(), Some("Authentication failure"));
         assert!(!model.blocked, "a bare failure carries no explanation");
-        assert!(model.prompt.is_none());
         assert!(model.notice_text().is_none());
+        assert_ne!(model.revision, before, "the UI was never told to redraw");
     }
 
     #[test]
@@ -811,9 +856,8 @@ mod tests {
         // halves are one sentence and must read as one.
         let notice = model.notice_text().unwrap();
         assert_eq!(notice, "The account is locked. (10 minutes left to unlock)");
-        // And a notice marks the conversation explained, so a UI leaves it up
-        // rather than replacing it with a fresh prompt.
-        model.conversation_over = true;
+        // And either half is enough to mark the failure explained, so a UI
+        // leaves it up rather than replacing it with a fresh prompt.
         assert!(model.blocked);
     }
 

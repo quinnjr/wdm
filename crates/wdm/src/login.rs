@@ -646,9 +646,17 @@ impl Login {
     ///
     /// Reporting late *is* the rate limit: a greeter cannot start another
     /// attempt until it hears how the last one went, so the delay is what slows
-    /// a brute force down. Answering immediately would leave a greeter that
-    /// retries on failure — which is the natural thing to write — spinning at
-    /// full speed for the whole cooldown.
+    /// a brute force down. The greeter is untrusted, and a cooldown it can
+    /// discover the length of by being told "no" is a cooldown it can sit out at
+    /// full speed; withholding the verdict is what bounds its request rate to
+    /// one attempt per delay, whatever it is written to do on failure. No
+    /// greeter in this repository retries by itself — since v0.7.0 a retry is a
+    /// keypress — so this is not politeness towards a client, it is the limit.
+    ///
+    /// The cost is borne by the user, not by the attacker: up to
+    /// `BACKOFF_SECS.last()` seconds — ten — of a greeter sitting on "Waiting…"
+    /// after a mistyped password, with nothing to say why, because saying why is
+    /// the thing being withheld.
     ///
     /// It is also what makes a failed authenticate constant-time, and that cost
     /// nothing to add: this was already a deadline mechanism, so hiding PAM's
@@ -919,9 +927,12 @@ impl Wdm {
         {
             // Not a protocol error: the greeter may try again, just not yet. The
             // refusal is delayed until the limit expires rather than sent now,
-            // because a greeter that retries on failure would otherwise spin for
-            // the whole cooldown. Answering late makes its retry land exactly
-            // when it is allowed to.
+            // because the greeter is untrusted and an immediate "no" tells it
+            // the cooldown is running while costing it nothing — it can ask
+            // again at once, for the whole cooldown. Withholding the answer is
+            // what caps its rate at one request per limit. Nothing in this
+            // repository retries by itself; the bound is on what an adversary
+            // can do, not on what a conforming greeter does.
             log::debug!("deferring create_session for {remaining:?}");
             // Armed unconditionally, and disarming any existing timer first, so
             // there is at most one pending report at a time — a second deferred

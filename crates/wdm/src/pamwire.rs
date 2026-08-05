@@ -588,9 +588,11 @@ mod tests {
     #[test]
     fn every_prompt_style_survives_the_wire() {
         // The styles are the one field with a lossy representation — a u8 that
-        // could silently land on the wrong variant. Info and Error are what
-        // stop a greeter auto-retrying into an account lockout, so a style that
-        // decoded as Secret would be a functional bug, not a cosmetic one.
+        // could silently land on the wrong variant. Info and Error are what mark
+        // a failure PAM explained — "the account is locked" — which a UI leaves
+        // on screen instead of replacing with a fresh prompt, so a style that
+        // decoded as Secret would be a functional bug, not a cosmetic one: it
+        // would put the explanation behind a password box.
         for style in [
             PromptStyle::Secret,
             PromptStyle::Visible,
