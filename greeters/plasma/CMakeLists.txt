@@ -35,7 +35,7 @@ cmake_minimum_required(VERSION 3.22)
 # linkage in C, and every one of the marshalling tables is a namespace-scope
 # const. Compiling them as C++ would hide wdm_greeter_v1_interface from the
 # linker.
-project(wdm-plasma-greeter VERSION 0.7.0 LANGUAGES C CXX)
+project(wdm-plasma-greeter VERSION 0.8.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
