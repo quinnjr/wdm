@@ -1,0 +1,69 @@
+/*
+ * Tailwind build input. Not what the page loads — ./build.sh compiles this to
+ * vendor/tailwind.css, and that is what index.html links.
+ *
+ * @source is explicit rather than left to Tailwind's automatic detection. The
+ * generated stylesheet contains only the utilities it can prove are used, and
+ * theme.js adds classes at runtime that appear in no HTML file; without both
+ * files named here, the states this theme spends most of its time in — an
+ * error on screen, the form disabled after the link dies — would come out
+ * unstyled, and only on a machine where those states were reached.
+ */
+@import "tailwindcss";
+
+@source "../index.html";
+@source "../theme.js";
+
+/*
+ * #1793d1 is Arch's own blue, from the logo. The darker `night` is not from
+ * the palette — it is picked to sit under the compositor's background
+ * (0.07, 0.07, 0.10, set in wdm-webkit-greeter's main.rs) so that the moment
+ * before the page paints does not flash a different colour than the moment
+ * after.
+ */
+@theme {
+  --color-arch-blue: #1793d1;
+  --color-arch-blue-bright: #3bb3ea;
+  --color-arch-night: #12121a;
+}
+
+@layer components {
+  /*
+   * One class for every input and select on the form, so the password field
+   * and the two dropdowns cannot drift apart. `appearance-none` on a <select>
+   * removes the arrow, which style.css draws back as a background image —
+   * a data: URI, because the content policy allows data: and this saves an
+   * install rule for a file worth 200 bytes.
+   */
+  .wdm-field {
+    @apply w-full appearance-none rounded-xl border border-white/10 bg-slate-950/60
+           px-4 py-3 text-slate-100 transition
+           placeholder:text-slate-500
+           focus:border-arch-blue focus:outline-none focus:ring-2 focus:ring-arch-blue/40
+           disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  /*
+   * The message elements. Both are `hidden` until there is something to say —
+   * the attribute, not a class, because theme.js toggles `node.hidden` and a
+   * theme that styled these with `display: flex` would override the attribute
+   * and leave an empty coloured box on screen. That is a real regression this
+   * project has shipped before, in the GTK greeter, where labels are visible
+   * by construction. `[hidden]:hidden` below is what makes the attribute win.
+   */
+  .wdm-notice {
+    @apply rounded-xl border px-4 py-3 text-sm leading-relaxed;
+  }
+
+  .wdm-notice[hidden] {
+    @apply hidden;
+  }
+
+  .wdm-notice-error {
+    @apply border-red-500/30 bg-red-500/10 text-red-200;
+  }
+
+  .wdm-notice-info {
+    @apply border-sky-500/30 bg-sky-500/10 text-sky-200;
+  }
+}

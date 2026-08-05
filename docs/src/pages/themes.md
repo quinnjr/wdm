@@ -27,6 +27,84 @@ The default theme is installed at
 `/usr/share/wdm/webkit-greeter/themes/default` and is the worked example of
 everything below. Copy it and start editing.
 
+## The shipped themes
+
+| Theme | |
+|---|---|
+| `default` | Hand-written HTML and CSS, no dependencies. The reference for the API. |
+| `arch` | Arch-flavoured, built with Tailwind and Font Awesome, with a clock. |
+| `react` | React 19 and Font Awesome, built with Vite and tested with Vitest. |
+
+`arch` is the worked example of a theme that **brings its own toolkit**. Its
+Tailwind build, its Font Awesome subset and the Arch logo are vendored into
+`vendor/` inside the theme, and `build.sh` regenerates them.
+
+They are vendored rather than linked because the greeter's content policy is
+`default-src file: data:` and the login screen is up before any network exists.
+A `<link>` to a CDN does not degrade to something plainer — it renders the login
+screen unstyled, with every icon a missing-glyph box, on the one screen whose
+failures nobody can read a log from. The same reasoning applies to a theme of
+your own: everything it loads must be a file beside it.
+
+The logo is the distribution's own `archlinux-logo.svg`, taken from the
+`filesystem` package and checked against a pinned sha256 by `build.sh`, with
+Arch's trademark notice shipped beside it. It is not read from
+`/usr/share/pixmaps` at runtime, because a theme is self-contained and this one
+installs on Debian and Fedora too, where that path holds nothing.
+
+The clock switches between 12- and 24-hour time when clicked. It writes the
+choice to `localStorage`, which the greeter builds on an ephemeral session — so
+the preference lasts as long as the page does and resets when the greeter is
+respawned. A theme that needs a preference to survive that has nowhere to put
+it today.
+
+### The React theme
+
+`react` is a full front-end project — Vite, JSX, components, Vitest — and the
+demonstration that being one costs none of the rules above. Its sources are in
+`src/`; `./build.sh` produces the two files it ships.
+
+Three things about React and this API are worth copying:
+
+- **The greeter's callbacks are globals, assigned outside React.** They are
+  installed in a **layout** effect, not `useEffect`: wdm can call them as soon
+  as the page's scripts have run, and a callback landing while React is still
+  mounting throws inside the web view, which the greeter counts as a failed
+  evaluation and retransmits.
+- **The state a callback decides from must be current, not captured.** `useWdm`
+  keeps the authoritative state in a ref and reads it when wdm calls, because a
+  handler closed over a render-old state would read a buffered password that
+  had already been spent. wdm also sends several statements in one evaluation —
+  a run of `show_message` and then `authentication_complete` — which execute
+  back to back before React re-renders once, so anything deriving the next
+  state from the rendered value would see the same stale state for all of them.
+- **The decisions are a pure reducer**, `src/machine.js`, which returns effects
+  rather than calling `wdm.respond` itself. That is what lets `src/machine.test.js`
+  execute every rule on this page with no compositor on the other end. It is
+  the only theme whose rules are run rather than read, and if you are writing a
+  theme with a build step it is the part worth stealing.
+
+Font Awesome is here too, and in a different form from `arch`: the SVG
+component packages rather than the webfont. Each icon is imported by name and
+rendered as inline `<svg>`, so the bundle carries only the icons used and the
+theme installs **no font file at all** — where `arch` must ship a 119 kB woff2,
+because a stylesheet can only name a glyph and a missing webfont renders every
+icon as a tofu box. Import icons by name, never by string (`icon="user"`):
+the string form needs a global library registered at startup, which defeats
+tree-shaking and fails at runtime rather than at build time. The cost is
+`fontawesome-svg-core`, about 97 kB in the bundle.
+
+`src/bundle.test.js` mounts the **built** bundle in a DOM and asserts it
+renders. That is not belt and braces: both bugs found while writing this theme
+were in the build rather than the logic — Vite's library mode leaves
+`process.env.NODE_ENV` for the consumer to define, and `@vitejs/plugin-react`
+chooses its JSX transform from that same variable rather than from Vite's
+`--mode`. Each produced a bundle that built cleanly and rendered a blank white
+login screen. Neither is visible to a unit test or to `vite build`.
+
+The bundle is committed, so packaging needs no npm and no network. CI rebuilds
+it and fails if it differs from what is committed.
+
 ## The API
 
 `window.wdm` exists before your own scripts run, already populated — it is

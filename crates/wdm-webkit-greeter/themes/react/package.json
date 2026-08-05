@@ -1,0 +1,27 @@
+{
+  "name": "wdm-webkit-theme-react",
+  "private": true,
+  "version": "0.8.0",
+  "type": "module",
+  "description": "A React theme for wdm-webkit-greeter. Built with Vite, tested with Vitest.",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-svg-core": "^7.3.1",
+    "@fortawesome/free-solid-svg-icons": "^7.3.1",
+    "@fortawesome/react-fontawesome": "^3.1.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@vitejs/plugin-react": "5.1.0",
+    "jsdom": "^27.4.0",
+    "tailwindcss": "4.3.3",
+    "vite": "7.2.2",
+    "vitest": "3.2.4"
+  }
+}
