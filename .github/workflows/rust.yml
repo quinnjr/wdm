@@ -329,9 +329,17 @@ jobs:
       # suppresses libraries and nothing of ours, and says so at the top; the
       # no-Qt TSan tree in the job above still covers Link and the fake server
       # with no suppressions at all.
+      #
+      # The path is computed with $(pwd) inside the step rather than from
+      # ${{ github.workspace }}: this job runs in a container, where that
+      # expression expands to the *host* path (/home/runner/work/...) while the
+      # checkout is mounted at /__w/.... TSan then cannot read the file and
+      # aborts every binary at startup, including the ones Catch2 runs during
+      # test discovery — which is how it failed, and it failed loudly rather
+      # than proceeding with no suppressions, which is the behaviour worth
+      # having.
       - name: Test under TSan
-        env:
-          TSAN_OPTIONS: suppressions=${{ github.workspace }}/greeters/plasma/tests/tsan-suppressions.txt
         run: |
           cmake --build build-tsan
-          ctest --test-dir build-tsan --output-on-failure --no-tests=error -L qt
+          TSAN_OPTIONS="suppressions=$(pwd)/greeters/plasma/tests/tsan-suppressions.txt" \
+            ctest --test-dir build-tsan --output-on-failure --no-tests=error -L qt
