@@ -15,6 +15,12 @@ const licences = () => ({
     for (const [from, to] of [
       ["node_modules/react/LICENSE", "LICENSE-react.txt"],
       ["node_modules/tailwindcss/LICENSE", "LICENSE-tailwind.txt"],
+      // Font Awesome's icons are CC BY 4.0 and its code MIT; the icons are
+      // bundled into app.js as path data, so the licence travels with them.
+      [
+        "node_modules/@fortawesome/free-solid-svg-icons/LICENSE.txt",
+        "LICENSE-fontawesome.txt",
+      ],
     ]) {
       this.emitFile({
         type: "asset",

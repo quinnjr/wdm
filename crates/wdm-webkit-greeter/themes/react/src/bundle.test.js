@@ -136,6 +136,36 @@ describe("the built bundle", () => {
     expect(mounted.doc.querySelector("input").type).toBe("password");
   });
 
+  it("renders the Font Awesome icons inline", () => {
+    // Icons are SVG components, so they are in the DOM rather than in a font
+    // file — which is the reason this theme installs no webfont. A tree-shake
+    // that dropped them, or an icon imported by string name against a library
+    // that was never registered, both render nothing and throw nothing.
+    const icons = mounted.doc.querySelectorAll("svg[data-icon]");
+    expect(icons.length).toBeGreaterThanOrEqual(4);
+    const names = [...icons].map((svg) => svg.getAttribute("data-icon"));
+    expect(names).toContain("user");
+    expect(names).toContain("display");
+    expect(names).toContain("right-to-bracket");
+    // The prompt icon tracks whether the answer is masked; at rest it is.
+    expect(names).toContain("lock");
+    // Every path must have actual geometry — an icon whose data failed to
+    // bundle still renders an <svg> element, just an empty one.
+    for (const path of mounted.doc.querySelectorAll("svg[data-icon] path")) {
+      expect(path.getAttribute("d")?.length ?? 0).toBeGreaterThan(10);
+    }
+  });
+
+  it("does not inject Font Awesome's CSS at runtime", () => {
+    // autoAddCss is disabled and the stylesheet imported into the bundle
+    // instead, so the rules are in force before the first paint. If that
+    // regressed, the icons would each be full-page-width for a frame.
+    const injected = [...mounted.doc.querySelectorAll("style")].some((s) =>
+      (s.textContent || "").includes("svg-inline--fa"),
+    );
+    expect(injected).toBe(false);
+  });
+
   it("installs the three callbacks the greeter calls by name", () => {
     // These are globals wdm evaluates by hand. If the layout effect that
     // assigns them ever moves to a plain effect, or the component fails to
@@ -179,5 +209,12 @@ describe("the built stylesheet", () => {
 
   it("contains utilities used only inside the React tree", () => {
     expect(css()).toContain("rounded-3xl");
+  });
+
+  it("contains Font Awesome's own rules", () => {
+    // Imported rather than injected at runtime. Without them every icon is
+    // sized by the raw SVG's intrinsic dimensions — which is the width of the
+    // card.
+    expect(css()).toContain("svg-inline--fa");
   });
 });

@@ -33,7 +33,7 @@ everything below. Copy it and start editing.
 |---|---|
 | `default` | Hand-written HTML and CSS, no dependencies. The reference for the API. |
 | `arch` | Arch-flavoured, built with Tailwind and Font Awesome, with a clock. |
-| `react` | React 19, built with Vite and tested with Vitest. |
+| `react` | React 19 and Font Awesome, built with Vite and tested with Vitest. |
 
 `arch` is the worked example of a theme that **brings its own toolkit**. Its
 Tailwind build, its Font Awesome subset and the Arch logo are vendored into
@@ -83,6 +83,16 @@ Three things about React and this API are worth copying:
   execute every rule on this page with no compositor on the other end. It is
   the only theme whose rules are run rather than read, and if you are writing a
   theme with a build step it is the part worth stealing.
+
+Font Awesome is here too, and in a different form from `arch`: the SVG
+component packages rather than the webfont. Each icon is imported by name and
+rendered as inline `<svg>`, so the bundle carries only the icons used and the
+theme installs **no font file at all** — where `arch` must ship a 119 kB woff2,
+because a stylesheet can only name a glyph and a missing webfont renders every
+icon as a tofu box. Import icons by name, never by string (`icon="user"`):
+the string form needs a global library registered at startup, which defeats
+tree-shaking and fails at runtime rather than at build time. The cost is
+`fontawesome-svg-core`, about 97 kB in the bundle.
 
 `src/bundle.test.js` mounts the **built** bundle in a DOM and asserts it
 renders. That is not belt and braces: both bugs found while writing this theme

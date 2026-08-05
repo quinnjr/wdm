@@ -1,33 +1,71 @@
 import { useEffect, useRef, useState } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import {
+  faCircleInfo,
+  faDisplay,
+  faLock,
+  faRightToBracket,
+  faTriangleExclamation,
+  faUser,
+} from "@fortawesome/free-solid-svg-icons";
 import { useWdm } from "./useWdm.js";
+
+// Font Awesome as SVG components rather than the webfont themes/arch uses.
+//
+// The React packages are the right shape here for a reason that is specific to
+// this greeter, not just idiom: each icon is imported by name and rendered as
+// inline <svg>, so the bundle carries the six paths below and nothing else,
+// and the theme installs no font file at all. themes/arch has to ship a
+// 119 kB woff2 because a stylesheet can only name a glyph, and a webfont whose
+// file is missing renders every icon as a tofu box on a screen with no console.
+// There is no such file to lose here.
+//
+// Explicit named imports, never the string form (`icon="user"`): that requires
+// a global icon library registered at startup, which defeats tree-shaking and
+// fails at runtime — a blank space where the icon goes — rather than at build
+// time if a name is wrong.
 
 const Notice = ({ kind, messages }) =>
   messages.length === 0 ? null : (
     <p
       className={
         kind === "error"
-          ? "rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm leading-relaxed text-red-200"
-          : "rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm leading-relaxed text-sky-200"
+          ? "flex gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm leading-relaxed text-red-200"
+          : "flex gap-3 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm leading-relaxed text-sky-200"
       }
     >
       {/*
-        One <span> per message, not one joined string. PAM sends them one at a
-        time and routinely splits an explanation in two — "the account is
-        locked" and "10 minutes left to unlock" — and each keeps its own
-        identity so a stylesheet can tell them apart. Keyed by index because
-        the list is append-only and two messages can legitimately be identical.
+        Decorative: the severity is already carried by the message text and by
+        the colour, and a screen reader announcing "warning" before PAM's own
+        wording would be reading the theme's opinion rather than the stack's.
       */}
-      {messages.map((text, i) => (
-        <span key={i}>
-          {i > 0 ? " " : ""}
-          {text}
-        </span>
-      ))}
+      <FontAwesomeIcon
+        icon={kind === "error" ? faTriangleExclamation : faCircleInfo}
+        className="mt-1 shrink-0"
+        aria-hidden="true"
+      />
+      <span>
+        {/*
+          One <span> per message, not one joined string. PAM sends them one at
+          a time and routinely splits an explanation in two — "the account is
+          locked" and "10 minutes left to unlock" — and each keeps its own
+          identity so a stylesheet can tell them apart. Keyed by index because
+          the list is append-only and two messages can legitimately be
+          identical.
+        */}
+        {messages.map((text, i) => (
+          <span key={i}>
+            {i > 0 ? " " : ""}
+            {text}
+          </span>
+        ))}
+      </span>
     </p>
   );
 
-const Field = ({ children }) => (
-  <label className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-slate-400">
+const Field = ({ icon, children }) => (
+  <label className="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-slate-400">
+    {icon ? <FontAwesomeIcon icon={icon} className="text-[11px]" aria-hidden="true" /> : null}
     {children}
   </label>
 );
@@ -82,7 +120,7 @@ export const App = ({ api }) => {
 
         <form onSubmit={submit} autoComplete="off" className="space-y-5">
           <div>
-            <Field>User</Field>
+            <Field icon={faUser}>User</Field>
             <select
               className={select}
               value={state.username}
@@ -100,7 +138,16 @@ export const App = ({ api }) => {
           </div>
 
           <div>
-            <Field>{state.promptText}</Field>
+            {/*
+              The label is PAM's own words, so the icon is the only fixed part
+              of it — and it tracks whether the answer is masked rather than
+              always saying "lock". An echo-on question (pam_oath's token, a
+              username re-prompt) is not a password prompt and must not be
+              dressed as one.
+            */}
+            <Field icon={state.promptSecret ? faLock : faCircleInfo}>
+              {state.promptText}
+            </Field>
             <input
               ref={input}
               className={select}
@@ -120,7 +167,7 @@ export const App = ({ api }) => {
           <Notice kind="info" messages={state.infos} />
 
           <div>
-            <Field>Session</Field>
+            <Field icon={faDisplay}>Session</Field>
             <select
               className={select}
               value={state.sessionId}
@@ -140,8 +187,9 @@ export const App = ({ api }) => {
           <button
             type="submit"
             disabled={busy || inert}
-            className="w-full rounded-xl bg-sky-500 px-4 py-3 font-medium text-slate-950 transition hover:bg-sky-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 px-4 py-3 font-medium text-slate-950 transition hover:bg-sky-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
           >
+            <FontAwesomeIcon icon={faRightToBracket} aria-hidden="true" />
             {state.phase === "starting" ? "Starting session…" : "Log in"}
           </button>
         </form>
