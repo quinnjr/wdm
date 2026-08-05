@@ -37,6 +37,16 @@ provides = "wdm-greeter-implementation"
 assets = [
     ["../../target/release/wdm-webkit-greeter", "usr/lib/wdm/wdm-webkit-greeter", "755"],
     ["themes/default/*", "usr/share/wdm/webkit-greeter/themes/default/", "644"],
+    # Three entries for the arch theme, not one glob: `themes/arch/*` does not
+    # descend, so vendor/ would be dropped and the theme would install as an
+    # unstyled page with every icon a missing-glyph box. src/ and build.sh are
+    # deliberately absent — they regenerate vendor/ and are not read at runtime.
+    ["themes/arch/index.html", "usr/share/wdm/webkit-greeter/themes/arch/", "644"],
+    ["themes/arch/style.css", "usr/share/wdm/webkit-greeter/themes/arch/", "644"],
+    ["themes/arch/theme.js", "usr/share/wdm/webkit-greeter/themes/arch/", "644"],
+    # Carries the Font Awesome and Tailwind licences as well as the assets;
+    # CC BY 4.0 and the OFL both require them to travel with the files.
+    ["themes/arch/vendor/*", "usr/share/wdm/webkit-greeter/themes/arch/vendor/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -47,6 +57,12 @@ provides = { wdm-greeter-implementation = "*" }
 assets = [
     { source = "target/release/wdm-webkit-greeter", dest = "/usr/lib/wdm/wdm-webkit-greeter", mode = "755" },
     { source = "crates/wdm-webkit-greeter/themes/default/*", dest = "/usr/share/wdm/webkit-greeter/themes/default/", mode = "644" },
+    # See the deb assets above: the glob does not descend, so vendor/ is named
+    # separately or the theme installs unstyled.
+    { source = "crates/wdm-webkit-greeter/themes/arch/index.html", dest = "/usr/share/wdm/webkit-greeter/themes/arch/", mode = "644" },
+    { source = "crates/wdm-webkit-greeter/themes/arch/style.css", dest = "/usr/share/wdm/webkit-greeter/themes/arch/", mode = "644" },
+    { source = "crates/wdm-webkit-greeter/themes/arch/theme.js", dest = "/usr/share/wdm/webkit-greeter/themes/arch/", mode = "644" },
+    { source = "crates/wdm-webkit-greeter/themes/arch/vendor/*", dest = "/usr/share/wdm/webkit-greeter/themes/arch/vendor/", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/wdm-webkit-greeter/LICENSE", mode = "644", doc = true },
 ]
 

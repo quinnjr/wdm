@@ -1,0 +1,170 @@
+<!doctype html>
+<!--
+  An Arch-flavoured theme, and the worked example of a theme that brings its
+  own toolkit.
+
+  Everything it does through the API is what themes/default does — the two
+  differ in appearance and in the clock, not in behaviour, because the parts
+  that are not appearance are the parts that lock accounts out when they are
+  got wrong. Read themes/default first; the comments there explain *why* each
+  step is shaped the way it is, and this file does not repeat them.
+
+  Tailwind and Font Awesome are vendored into this directory rather than
+  pulled from a CDN. The greeter runs before any network exists and its
+  content policy is `default-src file: data:`, so a <link> to a CDN does not
+  fail over to something plainer — it renders the login screen unstyled, with
+  every icon a missing-glyph box. Regenerate both with ./build.sh.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>wdm</title>
+    <link rel="stylesheet" href="vendor/tailwind.css" />
+    <link rel="stylesheet" href="vendor/fontawesome.css" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+
+  <body
+    class="min-h-screen flex items-center justify-center bg-arch-night text-slate-100 antialiased overflow-hidden"
+  >
+    <!-- The lattice behind everything. Pure CSS, no image to load. -->
+    <div class="pointer-events-none fixed inset-0 arch-backdrop" aria-hidden="true"></div>
+
+    <main class="relative w-full max-w-md px-6">
+      <!--
+        The clock. `role="timer"` and aria-live off: a screen reader announcing
+        the time every second would talk over the prompt, which is the one
+        thing on this screen that has to be heard.
+      -->
+      <div class="mb-8 text-center select-none">
+        <button
+          id="clock"
+          type="button"
+          title="Click to switch between 12- and 24-hour time"
+          class="group inline-flex flex-col items-center gap-1 rounded-2xl px-6 py-3
+                 transition hover:bg-white/5 focus:outline-none focus-visible:ring-2
+                 focus-visible:ring-arch-blue/60"
+        >
+          <span
+            id="clock-time"
+            class="font-mono text-6xl font-light tracking-tight tabular-nums"
+            >&nbsp;</span
+          >
+          <span class="flex items-center gap-2 text-sm text-slate-400">
+            <i class="fa-solid fa-clock text-xs" aria-hidden="true"></i>
+            <span id="clock-date">&nbsp;</span>
+            <span
+              id="clock-hint"
+              class="rounded border border-slate-600 px-1.5 py-px font-mono text-[10px]
+                     uppercase tracking-wide text-slate-500 transition
+                     group-hover:border-arch-blue group-hover:text-arch-blue"
+              >24h</span
+            >
+          </span>
+        </button>
+      </div>
+
+      <div
+        class="rounded-3xl border border-white/10 bg-slate-900/70 p-8 shadow-2xl
+               shadow-black/50 backdrop-blur-xl"
+      >
+        <div class="mb-7 flex items-center gap-3">
+          <!--
+            The official mark, vendored from the `filesystem` package — the
+            same /usr/share/pixmaps/archlinux-logo.svg every Arch install
+            carries, carrying its own registered-trademark glyph and its own
+            #1793d1 rather than an approximation of either.
+
+            An <img> and not inline: the file is shipped verbatim, so it can be
+            checked against the distribution's copy by its checksum, which a
+            path pasted into this document could not be. It therefore does not
+            inherit currentColor, which is correct — the logo has one colour and
+            it is not the theme's to change.
+
+            Vendored rather than read from /usr/share/pixmaps at runtime: a
+            theme is self-contained, and this one is installed on Debian and
+            Fedora too, where that path holds nothing.
+          -->
+          <img
+            src="vendor/archlinux-logo.svg"
+            alt="Arch Linux"
+            class="h-8 w-8"
+            aria-hidden="true"
+          />
+          <div>
+            <h1 class="text-xl font-semibold leading-tight">Arch Linux</h1>
+            <p id="hostline" class="text-xs text-slate-400">Sign in to continue</p>
+          </div>
+        </div>
+
+        <form id="login" autocomplete="off" class="space-y-5">
+          <div>
+            <label
+              for="user"
+              class="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase
+                     tracking-wider text-slate-400"
+            >
+              <i class="fa-solid fa-user text-[11px]" aria-hidden="true"></i>
+              User
+            </label>
+            <select id="user" class="wdm-field"></select>
+          </div>
+
+          <div>
+            <label
+              id="prompt"
+              for="answer"
+              class="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase
+                     tracking-wider text-slate-400"
+              >Waiting…</label
+            >
+            <div class="relative">
+              <i
+                class="fa-solid fa-lock pointer-events-none absolute left-4 top-1/2
+                       -translate-y-1/2 text-sm text-slate-500"
+                aria-hidden="true"
+              ></i>
+              <input id="answer" type="password" autofocus class="wdm-field pl-11" />
+            </div>
+          </div>
+
+          <!--
+            Two message elements, split by PAM's own severity, both appending.
+            The verdict arrives as one more error after the reason, so an
+            element that assigned would erase the only line the user can act
+            on. `hidden` rather than absent so the layout does not jump.
+          -->
+          <p id="error" hidden class="wdm-notice wdm-notice-error"></p>
+          <p id="message" hidden class="wdm-notice wdm-notice-info"></p>
+
+          <div>
+            <label
+              for="session"
+              class="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase
+                     tracking-wider text-slate-400"
+            >
+              <i class="fa-solid fa-display text-[11px]" aria-hidden="true"></i>
+              Session
+            </label>
+            <select id="session" class="wdm-field"></select>
+          </div>
+
+          <button
+            type="submit"
+            class="group flex w-full items-center justify-center gap-2 rounded-xl
+                   bg-arch-blue px-4 py-3 font-medium text-slate-950 transition
+                   hover:bg-arch-blue-bright focus:outline-none focus-visible:ring-2
+                   focus-visible:ring-arch-blue focus-visible:ring-offset-2
+                   focus-visible:ring-offset-slate-900
+                   disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <i class="fa-solid fa-arrow-right-to-bracket" aria-hidden="true"></i>
+            Log in
+          </button>
+        </form>
+      </div>
+    </main>
+
+    <script src="theme.js"></script>
+  </body>
+</html>

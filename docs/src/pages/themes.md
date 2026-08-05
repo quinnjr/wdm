@@ -27,6 +27,36 @@ The default theme is installed at
 `/usr/share/wdm/webkit-greeter/themes/default` and is the worked example of
 everything below. Copy it and start editing.
 
+## The shipped themes
+
+| Theme | |
+|---|---|
+| `default` | Hand-written HTML and CSS, no dependencies. The reference for the API. |
+| `arch` | Arch-flavoured, built with Tailwind and Font Awesome, with a clock. |
+
+`arch` is the worked example of a theme that **brings its own toolkit**. Its
+Tailwind build, its Font Awesome subset and the Arch logo are vendored into
+`vendor/` inside the theme, and `build.sh` regenerates them.
+
+They are vendored rather than linked because the greeter's content policy is
+`default-src file: data:` and the login screen is up before any network exists.
+A `<link>` to a CDN does not degrade to something plainer — it renders the login
+screen unstyled, with every icon a missing-glyph box, on the one screen whose
+failures nobody can read a log from. The same reasoning applies to a theme of
+your own: everything it loads must be a file beside it.
+
+The logo is the distribution's own `archlinux-logo.svg`, taken from the
+`filesystem` package and checked against a pinned sha256 by `build.sh`, with
+Arch's trademark notice shipped beside it. It is not read from
+`/usr/share/pixmaps` at runtime, because a theme is self-contained and this one
+installs on Debian and Fedora too, where that path holds nothing.
+
+The clock switches between 12- and 24-hour time when clicked. It writes the
+choice to `localStorage`, which the greeter builds on an ephemeral session — so
+the preference lasts as long as the page does and resets when the greeter is
+respawned. A theme that needs a preference to survive that has nowhere to put
+it today.
+
 ## The API
 
 `window.wdm` exists before your own scripts run, already populated — it is

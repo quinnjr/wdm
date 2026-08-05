@@ -806,17 +806,46 @@ mod tests {
         assert_eq!(error.take(), None);
     }
 
-    /// The default theme with its whole-line comments removed.
+    /// A theme's script with its whole-line comments removed.
     ///
-    /// The drift check below searches for names that also appear in the theme's
+    /// The drift checks below search for names that also appear in the theme's
     /// prose — it explains `wdm.default_session` two lines above using it — and
     /// a contract check a comment can satisfy checks nothing.
-    fn theme_code() -> String {
-        include_str!("../themes/default/theme.js")
+    fn strip_comments(source: &str) -> String {
+        source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn theme_code() -> String {
+        strip_comments(include_str!("../themes/default/theme.js"))
+    }
+
+    fn arch_theme_code() -> String {
+        strip_comments(include_str!("../themes/arch/theme.js"))
+    }
+
+    /// Every shipped theme, as (name, index.html, theme.js).
+    ///
+    /// Adding a theme here is what subjects it to the checks below. A theme
+    /// that is installed but not listed is one the drift checks do not cover,
+    /// and the failure that produces is a login screen — the one place nobody
+    /// can read a backtrace from.
+    fn shipped_themes() -> Vec<(&'static str, &'static str, String)> {
+        vec![
+            (
+                "default",
+                include_str!("../themes/default/index.html"),
+                theme_code(),
+            ),
+            (
+                "arch",
+                include_str!("../themes/arch/index.html"),
+                arch_theme_code(),
+            ),
+        ]
     }
 
     #[test]
@@ -978,6 +1007,202 @@ mod tests {
             guard[..spend].contains("kind === \"password\""),
             "the default theme spends its buffered answer without checking \
              whether the prompt is masked"
+        );
+    }
+
+    /// The API surface a theme must not lose, whichever theme it is.
+    ///
+    /// Shorter than the default theme's list because it is the intersection: a
+    /// theme is free to ignore `cancel` or `in_authentication`. Everything here
+    /// is something a theme cannot do its job without.
+    const REQUIRED_BY_EVERY_THEME: [&str; 9] = [
+        "wdm.users",
+        "wdm.sessions",
+        "wdm.default_session",
+        "wdm.is_authenticated",
+        "wdm._prompt",
+        "wdm.link_dead",
+        "wdm.authenticate(",
+        "wdm.respond(",
+        "wdm.start_session(",
+    ];
+
+    #[test]
+    fn every_shipped_theme_uses_the_api_it_is_shipped_with() {
+        // The same drift check the default theme gets, applied to every theme
+        // in the tree. Without it, a second theme is a second copy of the
+        // contract that nothing verifies: renaming a field would fail the
+        // default theme's test, get fixed there, and leave the other one
+        // reading `undefined` on a screen no test ever loads.
+        let script = bridge::api_script(&Model::default());
+
+        for (name, _html, code) in shipped_themes() {
+            for used in REQUIRED_BY_EVERY_THEME {
+                assert!(code.contains(used), "the {name} theme lost {used}");
+                // The theme's end and the bridge's end, checked together:
+                // matching only the theme would go green on a theme that kept
+                // using a name the API had dropped.
+                let bare = used.trim_start_matches("wdm.").trim_end_matches('(');
+                assert!(
+                    script.contains(&format!("{bare}:")) || script.contains(&format!("{bare}(")),
+                    "the injected API lost {used}, which the {name} theme uses"
+                );
+            }
+
+            for callback in ["show_prompt", "show_message", "authentication_complete"] {
+                assert!(
+                    code.contains(&format!("window.{callback} =")),
+                    "the {name} theme stopped defining {callback}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_shipped_theme_keeps_the_guards_that_stop_a_lockout() {
+        // These are the three behaviours that cost this project a locked
+        // account and a password in a log, and they are properties of the
+        // *theme* — the greeter cannot enforce any of them, because a greeter
+        // that decided them would be fighting every theme that disagreed.
+        //
+        // Checked with comments stripped, so a theme cannot satisfy them with
+        // the paragraph explaining the rule instead of the code applying it.
+        for (name, _html, code) in shipped_themes() {
+            // 1. The buffered answer reaches a masked prompt only. It was typed
+            //    into an input rendered type="password", so spending it on an
+            //    echo-on question hands the PAM stack a password it logs in the
+            //    clear.
+            let after = code
+                .split_once("window.show_prompt")
+                .unwrap_or_else(|| panic!("the {name} theme stopped defining show_prompt"))
+                .1;
+            let spend = after
+                .find("wdm.respond")
+                .unwrap_or_else(|| panic!("{name}'s show_prompt no longer answers anything"));
+            assert!(
+                after[..spend].contains("kind === \"password\""),
+                "the {name} theme spends its buffered answer without checking whether \
+                 the prompt is masked"
+            );
+
+            // 2. Nothing arms PAM before the user asks. A conversation is a
+            //    login attempt for its whole duration as far as pam_faillock is
+            //    concerned, so a theme that authenticates at load spends one
+            //    every time the screen is left alone. The call must be reached
+            //    from the submit handler, never from top level: `ready()` is
+            //    what runs at load, and it must not contain it.
+            let ready = code
+                .split_once("const ready = ")
+                .unwrap_or_else(|| panic!("the {name} theme has no ready()"))
+                .1;
+            let ready_body = &ready[..ready.find("\n};").unwrap_or(ready.len())];
+            assert!(
+                !ready_body.contains("wdm.authenticate("),
+                "the {name} theme arms PAM from ready(), which runs at load — this is \
+                 what locked an unattended account out in 0.4.0"
+            );
+
+            // 3. Messages accumulate rather than overwrite. The verdict arrives
+            //    as one more show_message after the reason, so a handler that
+            //    assigned would leave "Authentication failure" alone on screen
+            //    with the only actionable line erased.
+            assert!(
+                code.contains("node.append(line)"),
+                "the {name} theme no longer appends messages — the verdict will erase \
+                 the reason it failed"
+            );
+        }
+    }
+
+    #[test]
+    fn every_asset_a_theme_references_is_present_in_it() {
+        // A theme is installed by copying a list of files, and that list is
+        // written by hand in three packaging files. Forgetting one does not
+        // fail any build: it produces a login screen with no stylesheet and
+        // every icon a missing-glyph box, on the one screen whose failures
+        // nobody can read a log from.
+        //
+        // So the references are checked against the tree. This does not prove
+        // the packaging ships them — nothing here can see a PKGBUILD — but it
+        // does mean the list this test walks is the same list the packaging has
+        // to match, and it fails the moment a theme grows an asset.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
+
+        for (name, html, _code) in shipped_themes() {
+            let mut referenced = Vec::new();
+            for (attr, tail) in html
+                .match_indices("href=\"")
+                .chain(html.match_indices("src=\""))
+                .map(|(i, m)| (i + m.len(), &html[i + m.len()..]))
+            {
+                let _ = attr;
+                let value = &tail[..tail.find('"').expect("unterminated attribute")];
+                // Only what resolves to a file beside the theme. A data: URI
+                // carries its own payload and there is nothing to install.
+                if !value.is_empty() && !value.contains(':') && !value.starts_with('#') {
+                    referenced.push(value);
+                }
+            }
+
+            assert!(
+                !referenced.is_empty(),
+                "the {name} theme references no local assets — did index.html change shape?"
+            );
+
+            for asset in referenced {
+                let path = root.join(name).join(asset);
+                assert!(
+                    path.is_file(),
+                    "the {name} theme references {asset}, which is not in the theme \
+                     directory: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_arch_theme_clock_handles_midnight_and_noon() {
+        // The only arithmetic in the theme, and the only part of it that is
+        // wrong in a way nobody notices for eleven hours at a time: `hours % 12`
+        // is 0 at both midnight and noon, so the naive conversion renders
+        // "0:05 AM" and "0:05 PM". There is no JavaScript test runner in this
+        // repository, so this is a drift check on the guard rather than an
+        // execution of it — the same shape as the checks above, and for the
+        // same reason.
+        let code = arch_theme_code();
+        assert!(
+            code.contains("hours % 12 === 0 ? 12"),
+            "the arch theme's 12-hour clock lost its midnight/noon guard — it will \
+             render midnight as 0:00 AM"
+        );
+        // And that the meridiem is chosen from the 24-hour value, not from the
+        // converted one: `hour12 < 12` is true for every hour of the day.
+        assert!(
+            code.contains("hours < 12 ? \"AM\" : \"PM\""),
+            "the arch theme picks AM/PM from something other than the 24-hour value"
+        );
+    }
+
+    #[test]
+    fn the_arch_theme_ships_the_font_its_stylesheet_names() {
+        // The one asset no <link> or <src> names: the webfont is reached from
+        // inside vendor/fontawesome.css by a url(), which the scan above cannot
+        // see. Without the file every icon renders as a tofu box, and because
+        // font-display is `block` the boxes are what stays on screen.
+        let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("themes/arch/vendor");
+        let css = std::fs::read_to_string(vendor.join("fontawesome.css"))
+            .expect("the arch theme lost vendor/fontawesome.css");
+
+        let quoted = css
+            .split_once("url(\"")
+            .expect("fontawesome.css no longer references a font file")
+            .1;
+        let font = &quoted[..quoted.find('"').expect("unterminated url()")];
+
+        assert!(
+            vendor.join(font).is_file(),
+            "vendor/fontawesome.css names {font}, which is not shipped beside it"
         );
     }
 
