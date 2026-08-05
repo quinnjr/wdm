@@ -33,6 +33,7 @@ everything below. Copy it and start editing.
 |---|---|
 | `default` | Hand-written HTML and CSS, no dependencies. The reference for the API. |
 | `arch` | Arch-flavoured, built with Tailwind and Font Awesome, with a clock. |
+| `react` | React 19, built with Vite and tested with Vitest. |
 
 `arch` is the worked example of a theme that **brings its own toolkit**. Its
 Tailwind build, its Font Awesome subset and the Arch logo are vendored into
@@ -56,6 +57,43 @@ choice to `localStorage`, which the greeter builds on an ephemeral session — s
 the preference lasts as long as the page does and resets when the greeter is
 respawned. A theme that needs a preference to survive that has nowhere to put
 it today.
+
+### The React theme
+
+`react` is a full front-end project — Vite, JSX, components, Vitest — and the
+demonstration that being one costs none of the rules above. Its sources are in
+`src/`; `./build.sh` produces the two files it ships.
+
+Three things about React and this API are worth copying:
+
+- **The greeter's callbacks are globals, assigned outside React.** They are
+  installed in a **layout** effect, not `useEffect`: wdm can call them as soon
+  as the page's scripts have run, and a callback landing while React is still
+  mounting throws inside the web view, which the greeter counts as a failed
+  evaluation and retransmits.
+- **The state a callback decides from must be current, not captured.** `useWdm`
+  keeps the authoritative state in a ref and reads it when wdm calls, because a
+  handler closed over a render-old state would read a buffered password that
+  had already been spent. wdm also sends several statements in one evaluation —
+  a run of `show_message` and then `authentication_complete` — which execute
+  back to back before React re-renders once, so anything deriving the next
+  state from the rendered value would see the same stale state for all of them.
+- **The decisions are a pure reducer**, `src/machine.js`, which returns effects
+  rather than calling `wdm.respond` itself. That is what lets `src/machine.test.js`
+  execute every rule on this page with no compositor on the other end. It is
+  the only theme whose rules are run rather than read, and if you are writing a
+  theme with a build step it is the part worth stealing.
+
+`src/bundle.test.js` mounts the **built** bundle in a DOM and asserts it
+renders. That is not belt and braces: both bugs found while writing this theme
+were in the build rather than the logic — Vite's library mode leaves
+`process.env.NODE_ENV` for the consumer to define, and `@vitejs/plugin-react`
+chooses its JSX transform from that same variable rather than from Vite's
+`--mode`. Each produced a bundle that built cleanly and rendered a blank white
+login screen. Neither is visible to a unit test or to `vite build`.
+
+The bundle is committed, so packaging needs no npm and no network. CI rebuilds
+it and fails if it differs from what is committed.
 
 ## The API
 

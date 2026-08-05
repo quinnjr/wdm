@@ -47,6 +47,11 @@ assets = [
     # Carries the Font Awesome and Tailwind licences as well as the assets;
     # CC BY 4.0 and the OFL both require them to travel with the files.
     ["themes/arch/vendor/*", "usr/share/wdm/webkit-greeter/themes/arch/vendor/", "644"],
+    # The React theme ships only its built artefacts. src/, package.json,
+    # node_modules and the Vite config are how vendor/ is produced and are read
+    # by nothing at runtime.
+    ["themes/react/index.html", "usr/share/wdm/webkit-greeter/themes/react/", "644"],
+    ["themes/react/vendor/*", "usr/share/wdm/webkit-greeter/themes/react/vendor/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -63,6 +68,8 @@ assets = [
     { source = "crates/wdm-webkit-greeter/themes/arch/style.css", dest = "/usr/share/wdm/webkit-greeter/themes/arch/", mode = "644" },
     { source = "crates/wdm-webkit-greeter/themes/arch/theme.js", dest = "/usr/share/wdm/webkit-greeter/themes/arch/", mode = "644" },
     { source = "crates/wdm-webkit-greeter/themes/arch/vendor/*", dest = "/usr/share/wdm/webkit-greeter/themes/arch/vendor/", mode = "644" },
+    { source = "crates/wdm-webkit-greeter/themes/react/index.html", dest = "/usr/share/wdm/webkit-greeter/themes/react/", mode = "644" },
+    { source = "crates/wdm-webkit-greeter/themes/react/vendor/*", dest = "/usr/share/wdm/webkit-greeter/themes/react/vendor/", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/wdm-webkit-greeter/LICENSE", mode = "644", doc = true },
 ]
 

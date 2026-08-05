@@ -1,0 +1,31 @@
+/*
+ * Bundled into vendor/app.css by Vite, via @tailwindcss/vite.
+ *
+ * @source names the JSX explicitly. Tailwind emits only the utilities it can
+ * prove are used, and every class in this theme is a string inside a .jsx
+ * file rather than an attribute in HTML — so without these the generated
+ * stylesheet would be very nearly empty and the login screen unstyled.
+ */
+@import "tailwindcss";
+
+@source "./App.jsx";
+@source "./main.jsx";
+
+/*
+ * Matches the compositor's own background (0.07, 0.07, 0.10, set in
+ * wdm-webkit-greeter's main.rs) so the moment before the page paints is not a
+ * different colour than the moment after.
+ */
+@theme {
+  --color-wdm-night: #12121a;
+}
+
+/*
+ * The dropdown list is drawn by GTK and inherits nothing from the utilities on
+ * the <select>. Without this the open menu is black text on a white popup in
+ * the middle of a dark login screen.
+ */
+option {
+  background-color: #0f172a;
+  color: #f1f5f9;
+}

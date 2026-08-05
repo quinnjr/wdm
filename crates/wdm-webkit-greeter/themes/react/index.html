@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  A React theme, and the demonstration that a theme can be a real front-end
+  project — Vite, JSX, components, Vitest — without giving up any of the rules
+  a greeter theme has to follow.
+
+  Hand-written and shipped as-is; Vite builds only what is under vendor/. This
+  file names those artefacts by fixed names rather than being generated with
+  hashed ones, so the thing a person opens to understand the theme is a file
+  they can read.
+
+  The interesting part is src/machine.js and src/useWdm.js: the greeter's API
+  is three imperative globals that can fire before React has mounted, twice
+  for one event, or not at all, and React state is batched. machine.js holds
+  every decision as a pure reducer — which is why this is the only theme whose
+  rules are executed by tests (src/machine.test.js) rather than grepped for.
+
+  See docs/src/pages/themes.md.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>wdm</title>
+    <link rel="stylesheet" href="vendor/app.css" />
+  </head>
+
+  <body
+    class="min-h-screen flex items-center justify-center bg-wdm-night text-slate-100 antialiased overflow-hidden"
+  >
+    <div id="root"></div>
+
+    <!--
+      Not type="module". A module script on a file:// origin is fetched as a
+      cross-origin request and blocked: the page loads, the script never runs,
+      and the login screen is an empty div with no error anywhere the user can
+      see it. Vite is configured to emit an IIFE for this reason.
+    -->
+    <script src="vendor/app.js"></script>
+  </body>
+</html>

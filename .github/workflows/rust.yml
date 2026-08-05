@@ -106,6 +106,66 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # The React theme is the one theme whose rules are executed rather than
+  # pattern-matched, and the Rust suite cannot run them: they are Vitest, and
+  # `cargo test` has no node. Without this job the assertions in
+  # themes/react/src/machine.test.js are a file that nothing reads — and
+  # `every_shipped_theme_is_covered_somehow` would still pass, because all it
+  # can check is that the suite exists and names the rules.
+  #
+  # It also rebuilds vendor/ and diffs it against what is committed. The theme
+  # ships its bundle checked in, so that packaging needs no npm and no network;
+  # the hazard that creates is a bundle that no longer matches its source, and
+  # a stale one is invisible — the login screen still works, it is just not the
+  # code in the tree. Two failures during development were exactly this shape:
+  # a bundle that threw on `process` because Vite's library mode leaves
+  # `process.env.NODE_ENV` to the consumer, and one compiled to `jsxDEV`
+  # against a runtime that does not export it. Both built cleanly and produced
+  # a blank white login screen.
+  react-theme:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/wdm-webkit-greeter/themes/react
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned to the major the committed bundle was built with. The
+          # freshness check below diffs the rebuilt bundle against the
+          # committed one, and Rollup's and Tailwind's output is reproducible
+          # for a given toolchain — which package-lock.json pins — but that is
+          # a claim about the toolchain, not about node. Matching the major
+          # keeps the check measuring staleness rather than node's version.
+          node-version: 26
+          cache: npm
+          cache-dependency-path: crates/wdm-webkit-greeter/themes/react/package-lock.json
+
+      # ci, not install: exactly the lockfile, and a failure if it and
+      # package.json disagree.
+      - name: Install
+        run: npm ci
+
+      # Before the tests, because bundle.test.js mounts vendor/app.js in a DOM.
+      # Running the suite first would test whatever was committed rather than
+      # what this source produces — which is the whole point of the job.
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: The committed bundle matches its source
+        run: |
+          if ! git diff --exit-code -- vendor; then
+            echo
+            echo "vendor/ is stale: rebuilding it from src/ produced something"
+            echo "different from what is committed. Run ./build.sh in"
+            echo "crates/wdm-webkit-greeter/themes/react and commit the result."
+            exit 1
+          fi
+
   # greeters/plasma is a standalone CMake project that the Rust workspace does
   # not know about, so nothing above builds it and nothing above would notice it
   # breaking. Its own job, in this workflow rather than a new one, because it is
