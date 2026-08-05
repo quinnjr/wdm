@@ -49,9 +49,8 @@ with nothing but the display stack.
 does not know about, so that package build-depends on `cmake`, `ninja` and
 `catch2` and not on `rust` at all.
 
-All four are at `0.8.0`, which is one release ahead of the last tag: no
-published tarball contains `greeters/plasma` yet, so they name the first release
-that will, and share a placeholder checksum until it is tagged.
+All four are versioned together and share one checksum, because they are built
+from the same released tarball.
 
 In this repository the four are git submodules of `aur/`, each tracking its own
 AUR repository, so they are developed here and pushed there:

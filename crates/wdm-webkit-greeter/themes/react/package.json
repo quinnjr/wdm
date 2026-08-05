@@ -1,7 +1,7 @@
 {
   "name": "wdm-webkit-theme-react",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "description": "A React theme for wdm-webkit-greeter. Built with Vite, tested with Vitest.",
   "scripts": {
