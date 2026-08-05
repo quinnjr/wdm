@@ -1,0 +1,74 @@
+/*
+ * The hand-written half. Everything here is either something Tailwind has no
+ * utility for or something worth being able to edit without reinstalling npm,
+ * which for a theme somebody is tweaking on a machine they cannot log into is
+ * the difference between a five-second change and a toolchain.
+ *
+ * Loaded after vendor/tailwind.css, so these win where they overlap.
+ */
+
+/*
+ * The lattice. Two crossed repeating gradients and a radial vignette — no
+ * image file, so nothing to install and nothing to load before the screen can
+ * paint.
+ */
+.arch-backdrop {
+  background-image:
+    repeating-linear-gradient(
+      60deg,
+      rgba(23, 147, 209, 0.07) 0 1px,
+      transparent 1px 64px
+    ),
+    repeating-linear-gradient(
+      -60deg,
+      rgba(23, 147, 209, 0.07) 0 1px,
+      transparent 1px 64px
+    ),
+    radial-gradient(ellipse 80% 60% at 50% 0%, rgba(23, 147, 209, 0.14), transparent 70%);
+}
+
+/*
+ * The arrow Tailwind's `appearance-none` removed. A data: URI rather than a
+ * file: the content policy allows data:, and an extra install rule for 200
+ * bytes of SVG is an extra way for the packaging to be wrong.
+ */
+select.wdm-field {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2394a3b8'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.9rem center;
+  background-size: 1.1rem;
+  padding-right: 2.6rem;
+}
+
+/*
+ * The dropdown list itself is drawn by GTK, not by this stylesheet, and it
+ * inherits none of the above. Without these two the open menu is black text on
+ * a white popup in the middle of a dark login screen.
+ */
+select.wdm-field option {
+  background-color: #0f172a;
+  color: #f1f5f9;
+}
+
+/*
+ * Each message PAM sent is its own <span> inside the notice element, appended
+ * rather than assigned so the verdict cannot erase the reason. They are inline
+ * and carry their own leading separator (see theme.js), so all this has to do
+ * is keep them from running together visually when there are several.
+ */
+.wdm-notice .line + .line {
+  margin-left: 0.15rem;
+}
+
+/*
+ * The clock's seconds tick once a second forever. Somebody who asked the
+ * system not to animate things did not mean "except the login screen".
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

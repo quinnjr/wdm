@@ -5,6 +5,48 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-05
+
+Two more themes for `wdm-webkit-greeter`, which between them make the theme
+API's claim — that a theme holds the policy and can be written however you
+like — something the repository demonstrates rather than asserts.
+
+`arch` is Arch-flavoured, built with Tailwind and Font Awesome, with a clock
+that switches between 12- and 24-hour time when clicked. `react` is React 19
+and Font Awesome, built with Vite and tested with Vitest.
+
+**Everything both themes load is vendored into the theme directory.** The
+greeter's content security policy is `default-src file: data:` and the login
+screen is up before any network exists, so a CDN `<link>` does not degrade to
+something plainer — it renders the screen unstyled, with every icon a
+missing-glyph box, on the one screen whose failures nobody can read a log from.
+`arch` carries the distribution's own `archlinux-logo.svg`, taken from the
+`filesystem` package and checked against a pinned sha256 by its `build.sh`.
+
+`react` is the first theme whose rules are **executed** rather than
+pattern-matched. Every decision it makes is a pure reducer that returns effects
+instead of calling `wdm.respond` itself, so the whole rule set — nothing arms
+PAM before the user asks, an empty first answer costs no attempt, a buffered
+password never reaches an echo-on prompt, a failure is not retried — runs under
+Vitest with no compositor on the other end. Writing those tests found a defect:
+a retransmitted `authentication_complete` sent a second `start_session`, which
+wdm answers by killing the greeter.
+
+The drift checks are restructured to match. A theme now declares whether its
+rules are pattern-matched in the Rust suite or executed by a suite of its own,
+and two new tests make escaping both impossible — one refuses a theme whose
+claimed suite does not cover the lockout rules by name, and one walks `themes/`
+and refuses a directory missing from the list.
+
+`wdm-webkit-greeter`'s CI is new as well: a `react-theme` job runs Vitest and
+rebuilds the theme's bundle, failing if it differs from the one committed. The
+bundle is checked in so that packaging needs no npm and no network, and a
+bundle that has drifted from its source is otherwise invisible — the login
+screen still works, it is just not the code in the tree.
+
+**Breaking for nobody, but worth knowing:** `wdm.default_session` and the rest
+of the API are unchanged. Themes written against 0.8.0 continue to work.
+
 ## [0.8.0] — 2026-08-05
 
 A fourth greeter, `wdm-plasma-greeter`, written in C++ against Qt 6 and QML for
@@ -615,7 +657,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/quinnjr/wdm/releases/tag/v0.9.0
 [0.8.0]: https://github.com/quinnjr/wdm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/quinnjr/wdm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/quinnjr/wdm/releases/tag/v0.6.0
