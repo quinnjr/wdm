@@ -5,6 +5,12 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-18
+
+Every greeter is now configurable without recompiling or editing a theme:
+each one reads its own file in `/etc/wdm`, and every misread of that file is
+a loud startup failure rather than a quietly different login screen.
+
 ### Added
 
 - Every shipped greeter is now configurable through its own file in
@@ -688,7 +694,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/quinnjr/wdm/releases/tag/v0.10.0
 [0.9.0]: https://github.com/quinnjr/wdm/releases/tag/v0.9.0
 [0.8.0]: https://github.com/quinnjr/wdm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/quinnjr/wdm/releases/tag/v0.7.0
