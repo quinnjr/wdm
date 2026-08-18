@@ -35,7 +35,7 @@ cmake_minimum_required(VERSION 3.22)
 # linkage in C, and every one of the marshalling tables is a namespace-scope
 # const. Compiling them as C++ would hide wdm_greeter_v1_interface from the
 # linker.
-project(wdm-plasma-greeter VERSION 0.9.0 LANGUAGES C CXX)
+project(wdm-plasma-greeter VERSION 0.10.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -229,6 +229,7 @@ set_property(TARGET wdm-plasma-protocol PROPERTY POSITION_INDEPENDENT_CODE ON)
 # QGuiApplication, and therefore on a machine with no display of any kind.
 add_library(wdm-plasma-core STATIC
     src/link.cpp
+    src/settings.cpp
     src/theme.cpp)
 target_include_directories(wdm-plasma-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(wdm-plasma-core PUBLIC wdm-plasma-protocol PkgConfig::WaylandClient)
@@ -296,6 +297,14 @@ if(WDM_PLASMA_QT)
     # does not have yet and a theme copied from it will.
     install(DIRECTORY themes/default
         DESTINATION "${CMAKE_INSTALL_DATADIR}/wdm/plasma-greeter/themes")
+    # An absolute destination, deliberately: /etc is not under any install
+    # prefix, and the three Rust greeters install their config the same way
+    # through cargo-deb and cargo-generate-rpm. DESTDIR still relocates it for
+    # packaging; marking it as not-to-be-clobbered is the package's job
+    # (pacman's backup array, rpm's noreplace, dpkg's conffiles).
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/plasma-greeter.ini.example"
+        DESTINATION "/etc/wdm"
+        RENAME "plasma-greeter.ini")
 endif()
 
 # --------------------------------------------------------------------------
@@ -358,6 +367,11 @@ if(BUILD_TESTING AND Catch2_FOUND)
     target_compile_options(tst_theme PRIVATE ${WDM_PLASMA_WARNINGS})
     target_link_libraries(tst_theme PRIVATE wdm-plasma-core Catch2::Catch2WithMain)
     catch_discover_tests(tst_theme)
+
+    add_executable(tst_settings tests/tst_settings.cpp)
+    target_compile_options(tst_settings PRIVATE ${WDM_PLASMA_WARNINGS})
+    target_link_libraries(tst_settings PRIVATE wdm-plasma-core Catch2::Catch2WithMain)
+    catch_discover_tests(tst_settings)
 
     add_executable(tst_exitcode tests/tst_exitcode.cpp)
     target_compile_options(tst_exitcode PRIVATE ${WDM_PLASMA_WARNINGS})

@@ -31,6 +31,22 @@ import QtQuick.Layouts
 Item {
     id: root
 
+    // /etc/wdm/plasma-greeter.ini, surfaced by the greeter as wdmConfig. The
+    // greeter only reports; honouring the administrator's choices is this
+    // theme's policy, like everything else about how the login screen looks.
+    // Unset means dark, which is what this theme showed before the file
+    // existed. The palette below is the whole of the two schemes: a copied
+    // theme changes these ten values, or ignores wdmConfig entirely.
+    readonly property bool lightScheme: wdmConfig.colorScheme === "light"
+    readonly property color bgColor: lightScheme ? "#e9eaf0" : "#12131a"
+    readonly property color cardColor: lightScheme ? "#f7f7fa" : "#1c1e28"
+    readonly property color lineColor: lightScheme ? "#c9ccd8" : "#2c2f3d"
+    readonly property color fieldColor: lightScheme ? "#ffffff" : "#0d0e13"
+    readonly property color textColor: lightScheme ? "#191b24" : "#e8e8ef"
+    readonly property color dimColor: lightScheme ? "#5c6072" : "#8b8fa3"
+    readonly property color accentColor: lightScheme ? "#2757b8" : "#6f9dff"
+    readonly property color badColor: lightScheme ? "#b3261e" : "#ff7b72"
+
     // QQuickView sizes this to the window, and the window is a layer surface
     // anchored to all four edges of the output. These are what the theme looks
     // like in a designer with no compositor attached.
@@ -274,7 +290,21 @@ Item {
 
     Rectangle {
         anchors.fill: parent
-        color: "#12131a"
+        // A configured background colour replaces the scheme's own.
+        color: wdmConfig.background !== "" && !root.backgroundIsImage
+               ? wdmConfig.background
+               : root.bgColor
+    }
+
+    // file:// backgrounds arrive as a URL; colours as "#rrggbb". The greeter
+    // already refused anything else, so one prefix check is the whole test.
+    readonly property bool backgroundIsImage: String(wdmConfig.background).indexOf("file://") === 0
+
+    Image {
+        anchors.fill: parent
+        visible: root.backgroundIsImage
+        source: root.backgroundIsImage ? wdmConfig.background : ""
+        fillMode: Image.PreserveAspectCrop
     }
 
     Rectangle {
@@ -290,8 +320,8 @@ Item {
         // the two to disagree.
         implicitHeight: layout.implicitHeight + layout.anchors.margins * 2
         radius: 12
-        color: "#1c1e28"
-        border.color: "#2c2f3d"
+        color: root.cardColor
+        border.color: root.lineColor
         border.width: 1
 
         ColumnLayout {
@@ -303,14 +333,14 @@ Item {
 
             Label {
                 text: qsTr("Sign in")
-                color: "#e8e8ef"
+                color: root.textColor
                 font.pointSize: 20
                 font.bold: true
             }
 
             Label {
                 text: qsTr("User")
-                color: "#8b8fa3"
+                color: root.dimColor
                 font.pointSize: 9
             }
 
@@ -343,7 +373,7 @@ Item {
 
             Label {
                 text: root.promptLine
-                color: "#e8e8ef"
+                color: root.textColor
                 visible: text !== ""
                 Layout.fillWidth: true
                 wrapMode: Text.Wrap
@@ -359,10 +389,10 @@ Item {
                 // otherwise unmasks it, which is the direction that can be
                 // corrected on screen.
                 echoMode: wdm.promptSecret ? TextInput.Password : TextInput.Normal
-                color: "#e8e8ef"
+                color: root.textColor
                 background: Rectangle {
-                    color: "#0d0e13"
-                    border.color: answer.activeFocus ? "#6f9dff" : "#2c2f3d"
+                    color: root.fieldColor
+                    border.color: answer.activeFocus ? root.accentColor : root.lineColor
                     border.width: 1
                     radius: 4
                 }
@@ -371,7 +401,7 @@ Item {
 
             Label {
                 text: root.errorText
-                color: "#ff7b72"
+                color: root.badColor
                 font.pointSize: 9
                 visible: text !== ""
                 Layout.fillWidth: true
@@ -380,7 +410,7 @@ Item {
 
             Label {
                 text: root.infoText
-                color: "#8b8fa3"
+                color: root.dimColor
                 font.pointSize: 9
                 visible: text !== ""
                 Layout.fillWidth: true
@@ -389,7 +419,7 @@ Item {
 
             Label {
                 text: qsTr("Session")
-                color: "#8b8fa3"
+                color: root.dimColor
                 font.pointSize: 9
             }
 

@@ -24,24 +24,25 @@ as it is created.
 
 ### Arch
 
-There are four AUR packages, one per build-dependency set. `wdm` depends on the
+There are four AUR packages, one per build-dependency set. `wdm-wayland` — the
+AUR name `wdm` belongs to the unrelated WINGs Display Manager — depends on the
 virtual `wdm-greeter-implementation`, which every greeter provides, so pacman
 asks which one to install.
 
 | Package | Produces | Needs to build |
 |---|---|---|
-| `wdm` | `wdm`, `wdm-greeter` | the display stack only |
+| `wdm-wayland` | `wdm-wayland`, `wdm-greeter` | the display stack only |
 | `wdm-gtk-greeter` | `wdm-gtk-greeter` | GTK4, gtk4-layer-shell |
 | `wdm-webkit-greeter` | `wdm-webkit-greeter` | the above plus WebKitGTK |
 | `wdm-plasma-greeter` | `wdm-plasma-greeter` | Qt 6, layer-shell-qt, CMake |
 
 Four rather than one split package because a split package has a single
 `build()`, so every greeter was compiled whatever you asked for — installing the
-GTK greeter meant having WebKitGTK in the chroot, and installing `wdm` alone
+GTK greeter meant having WebKitGTK in the chroot, and installing `wdm-wayland` alone
 meant every toolkit. Each package now builds only its own greeter.
 
-`wdm` ships the reference greeter alongside the compositor because it is the one
-with no toolkit dependency: `wdm` on its own is installable, and satisfiable,
+`wdm-wayland` ships the reference greeter alongside the compositor because it is the one
+with no toolkit dependency: `wdm-wayland` on its own is installable, and satisfiable,
 with nothing but the display stack.
 
 `wdm-plasma-greeter` is the only one of the four that is not built with cargo.
@@ -57,7 +58,7 @@ AUR repository, so they are developed here and pushed there:
 
 ```bash
 git submodule update --init
-cd aur/wdm && makepkg -si            # or aur/wdm-gtk-greeter, aur/wdm-webkit-greeter,
+cd aur/wdm-wayland && makepkg -si    # or aur/wdm-gtk-greeter, aur/wdm-webkit-greeter,
                                      # aur/wdm-plasma-greeter
 ```
 
@@ -145,7 +146,7 @@ chown root:root /var/lib/wdm
 ```
 
 This is the same shape the deb's `postinst`, the rpm scriptlet and
-`aur/wdm/wdm.install` use — nested rather than conjoined, so the two failures say
+`aur/wdm-wayland/wdm.install` use — nested rather than conjoined, so the two failures say
 different things — and it can be diffed against them line for line. Both guards
 matter: the first leaves an administrator who chose a different home alone, and
 the second keeps `/etc/passwd` from naming a directory that is not there — wdm

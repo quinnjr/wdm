@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,7 @@
 #include <QQuickView>
 #include <QString>
 #include <QUrl>
+#include <QVariantMap>
 #include <QtGlobal>
 
 #include <qguiapplication_platform.h>
@@ -47,6 +49,7 @@
 #include "exitcode.h"
 #include "link.h"
 #include "logging.h"
+#include "settings.h"
 #include "theme.h"
 #include "wdm.h"
 
@@ -193,6 +196,27 @@ int main(int argc, char **argv) {
         return wdm::kGaveUpExit;
     }
 
+    // The administrator's file, read this early for the same reason the
+    // arguments are parsed this early: a config error must be a sentence from
+    // this program, not whatever Qt does after it. --theme outranks the
+    // file's theme — argv is written per-deployment in `greeter.command`, the
+    // file is the distribution-wide layer under it.
+    const wdm::SettingsResult loaded = wdm::loadSettings();
+    if (!loaded.ok()) {
+        fail(loaded.error);
+        return wdm::kGaveUpExit;
+    }
+    const wdm::Settings &settings = *loaded.settings;
+    if (!settings.background.empty() && settings.background.front() == '/'
+        && !std::filesystem::is_regular_file(settings.background)) {
+        // A background image the theme cannot load would fail silently inside
+        // the QML engine, which is exactly the class of error the settings
+        // file refuses to hide.
+        fail(std::string(wdm::kSettingsPath) + ": background " + settings.background
+             + " is not a readable file");
+        return wdm::kGaveUpExit;
+    }
+
     // Before QGuiApplication, because QQuickStyle reads this when the first
     // QtQuick.Controls import is resolved and the environment is the way to set
     // it without linking Qt6::QuickControls2 for one call. Only when unset, so
@@ -238,7 +262,7 @@ int main(int argc, char **argv) {
         return wdm::kGaveUpExit;
     }
 
-    const wdm::ThemeResult theme = wdm::resolveTheme(requested.name);
+    const wdm::ThemeResult theme = wdm::resolveTheme(wdm::chooseTheme(requested.name, settings));
     if (!theme.ok()) {
         // Never a fallback to the default theme. A misspelled name that
         // silently shows something else is a configuration bug nobody notices
@@ -259,6 +283,19 @@ int main(int argc, char **argv) {
     view.setResizeMode(QQuickView::SizeRootObjectToView);
     view.setTitle(QStringLiteral("wdm"));
     view.rootContext()->setContextProperty(QStringLiteral("wdm"), &bridge);
+    // The administrator's choices, handed to the theme as plain strings —
+    // empty when unset. Honouring them is the theme's policy, like everything
+    // else about how the login screen looks; the greeter only reports. The
+    // background is a colour as spelled, or a file:// URL, which is the form
+    // an Image source wants.
+    QVariantMap config;
+    config.insert(QStringLiteral("colorScheme"), QString::fromStdString(settings.colorScheme));
+    config.insert(QStringLiteral("background"),
+                  settings.background.empty() || settings.background.front() == '#'
+                      ? QString::fromStdString(settings.background)
+                      : QUrl::fromLocalFile(QString::fromStdString(settings.background))
+                            .toString());
+    view.rootContext()->setContextProperty(QStringLiteral("wdmConfig"), config);
     bridge.setQmlEngine(view.engine());
 
     view.setSource(QUrl::fromLocalFile(QString::fromStdString(theme.theme->mainQml.string())));

@@ -5,6 +5,43 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-18
+
+Every greeter is now configurable without recompiling or editing a theme:
+each one reads its own file in `/etc/wdm`, and every misread of that file is
+a loud startup failure rather than a quietly different login screen.
+
+### Added
+
+- Every shipped greeter is now configurable through its own file in
+  `/etc/wdm`, read by the greeter itself (wdm spawns greeters with a cleared
+  environment, so a file is the only channel besides `greeter.command`'s
+  arguments): `greeter.toml` (reference), `gtk-greeter.toml`,
+  `webkit-greeter.toml` and `plasma-greeter.ini`. Common keys: `color-scheme`
+  (`dark`/`light`) and `background` (`#rrggbb` or an absolute image path).
+  The webkit and plasma greeters also take `theme` — `--theme` still outranks
+  it — and the GTK greeter takes `css`, extra CSS loaded after the built-in
+  stylesheet. Every file is optional; a file that exists and cannot be
+  understood is a startup error whose reason reaches the give-up screen,
+  never a silent fallback.
+- The webkit greeter hands the administrator's choices to themes as
+  `wdm.config` and mirrors `color-scheme` into the page's
+  `prefers-color-scheme`; the plasma greeter exposes them as the `wdmConfig`
+  context property. The default themes of both, the GTK greeter and the
+  reference greeter all gained a light palette.
+- The packages install each file fully commented out and marked as
+  configuration, so upgrades never clobber an edited one.
+
+### Changed
+
+- The webkit greeter now sets GTK's dark preference (unless
+  `color-scheme = "light"`), so a page's `prefers-color-scheme` reads dark
+  where it previously read light. None of the shipped themes changes
+  appearance — none had a dark media query before this release — but a
+  third-party theme with a light-scheme block will now get its dark styling
+  by default, which is what a login screen on a dark compositor should have
+  been doing all along.
+
 ## [0.9.0] — 2026-08-05
 
 Two more themes for `wdm-webkit-greeter`, which between them make the theme
@@ -657,7 +694,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/quinnjr/wdm/releases/tag/v0.10.0
 [0.9.0]: https://github.com/quinnjr/wdm/releases/tag/v0.9.0
 [0.8.0]: https://github.com/quinnjr/wdm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/quinnjr/wdm/releases/tag/v0.7.0

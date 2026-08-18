@@ -58,10 +58,10 @@ cargo build --release
 ```
 
 Arch packaging lives in `aur/` as four AUR packages, submodules of this repo:
-`wdm` (the compositor and the toolkit-free reference greeter),
+`wdm-wayland` (the compositor and the toolkit-free reference greeter),
 `wdm-gtk-greeter`, `wdm-webkit-greeter` and `wdm-plasma-greeter`. Four rather
 than one split package so that building one greeter does not build the others —
-`cd aur/wdm && makepkg -si`. `wdm-plasma-greeter` is the only one built with
+`cd aur/wdm-wayland && makepkg -si`. `wdm-plasma-greeter` is the only one built with
 CMake rather than cargo, because `greeters/plasma` is a standalone CMake project
 the Rust workspace does not know about.
 Debian and Fedora packages are built from metadata in the crate manifests, so

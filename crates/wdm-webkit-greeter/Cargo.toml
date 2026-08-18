@@ -19,6 +19,8 @@ webkit6 = "0.6"
 # from PAM and from the account database, so escaping them by hand is a code
 # injection waiting to happen.
 serde_json = "1"
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -34,8 +36,10 @@ section = "x11"
 priority = "optional"
 depends = "libc6, libgtk-4-1, libgtk4-layer-shell0, libwebkitgtk-6.0-4"
 provides = "wdm-greeter-implementation"
+conf-files = ["/etc/wdm/webkit-greeter.toml"]
 assets = [
     ["../../target/release/wdm-webkit-greeter", "usr/lib/wdm/wdm-webkit-greeter", "755"],
+    ["../../packaging/webkit-greeter.toml.example", "etc/wdm/webkit-greeter.toml", "644"],
     ["themes/default/*", "usr/share/wdm/webkit-greeter/themes/default/", "644"],
     # Three entries for the arch theme, not one glob: `themes/arch/*` does not
     # descend, so vendor/ would be dropped and the theme would install as an
@@ -61,6 +65,7 @@ license = "MIT"
 provides = { wdm-greeter-implementation = "*" }
 assets = [
     { source = "target/release/wdm-webkit-greeter", dest = "/usr/lib/wdm/wdm-webkit-greeter", mode = "755" },
+    { source = "packaging/webkit-greeter.toml.example", dest = "/etc/wdm/webkit-greeter.toml", mode = "644", config = "noreplace" },
     { source = "crates/wdm-webkit-greeter/themes/default/*", dest = "/usr/share/wdm/webkit-greeter/themes/default/", mode = "644" },
     # See the deb assets above: the glob does not descend, so vendor/ is named
     # separately or the theme installs unstyled.

@@ -9,6 +9,7 @@
 //! draws only on the rank 0 output, and preselects each user's last session,
 //! falling back to the machine default for a user with no history.
 
+mod config;
 mod text;
 mod ui;
 
@@ -216,6 +217,12 @@ struct App {
     /// as one.
     attempted: bool,
 
+    /// How `/etc/wdm/greeter.toml` says the form should look. Immutable
+    /// after startup; the file is read once, before the compositor is even
+    /// connected to, because a bad config must fail the process rather than
+    /// paint a default nobody asked for.
+    style: ui::Style,
+
     /// The frame's pixels, reused across frames and rebuilt only on resize.
     /// `ui::paint` overwrites every pixel, so it needs no clearing between
     /// frames.
@@ -227,8 +234,9 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(style: ui::Style) -> Self {
         Self {
+            style,
             compositor: None,
             shm: None,
             layer_shell: None,
@@ -602,11 +610,11 @@ impl App {
         let canvas = self.canvas.as_mut().expect("just ensured above");
 
         if !self.ready {
-            ui::paint_message(canvas, "Connecting…", false);
+            ui::paint_message(canvas, "Connecting…", false, &self.style);
         } else if self.users.is_empty() {
-            ui::paint_message(canvas, "No users available to log in", true);
+            ui::paint_message(canvas, "No users available to log in", true, &self.style);
         } else if self.sessions.is_empty() {
-            ui::paint_message(canvas, "No sessions installed", true);
+            ui::paint_message(canvas, "No sessions installed", true, &self.style);
         } else {
             let user = &self.users[self.user_index];
 
@@ -634,6 +642,7 @@ impl App {
                     multiple_users: self.users.len() > 1,
                     multiple_sessions: self.sessions.len() > 1,
                 },
+                &self.style,
             );
         }
 
@@ -1084,6 +1093,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before the Wayland connection: a config error must be the only thing
+    // this process does, so the message on stderr is not buried in protocol
+    // noise when wdm shows it on the give-up screen.
+    let config = config::load(std::path::Path::new(config::DEFAULT_PATH))?;
+    let style = ui::Style::from_config(&config)?;
+
     if !text::have_font() {
         // The form would render as empty boxes. Saying so beats leaving someone
         // staring at an unreadable login screen.
@@ -1096,7 +1111,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     connection.display().get_registry(&qh, ());
 
-    let mut app = App::new();
+    let mut app = App::new(style);
 
     // The first roundtrip collects globals; the second collects the events that
     // arrive as a result of binding them, including the enumerate phase.
@@ -1146,7 +1161,7 @@ mod tests {
     /// so the pure selection and conversation logic runs and anything that
     /// would talk to the compositor returns early.
     fn app() -> App {
-        let mut app = App::new();
+        let mut app = App::new(ui::Style::default());
         app.sessions = ["sway", "gnome", "plasma"]
             .iter()
             .map(|id| Session {

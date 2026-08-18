@@ -12,6 +12,23 @@
   --bad: #ff7b72;
 }
 
+/* color-scheme = "light" in /etc/wdm/webkit-greeter.toml reaches the page as
+   prefers-color-scheme, via GTK's dark preference. Same roles, light values;
+   accent and error darkened because the dark set was chosen against
+   near-black and washes out on white. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #e9eaf0;
+    --card: #f7f7fa;
+    --field: #ffffff;
+    --line: #c9ccd8;
+    --text: #191b24;
+    --dim: #5c6072;
+    --accent: #2757b8;
+    --bad: #b3261e;
+  }
+}
+
 * {
   box-sizing: border-box;
 }

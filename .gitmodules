@@ -1,6 +1,6 @@
-[submodule "aur/wdm"]
-	path = aur/wdm
-	url = ssh://aur@aur.archlinux.org/wdm.git
+[submodule "aur/wdm-wayland"]
+	path = aur/wdm-wayland
+	url = ssh://aur@aur.archlinux.org/wdm-wayland.git
 [submodule "aur/wdm-gtk-greeter"]
 	path = aur/wdm-gtk-greeter
 	url = ssh://aur@aur.archlinux.org/wdm-gtk-greeter.git

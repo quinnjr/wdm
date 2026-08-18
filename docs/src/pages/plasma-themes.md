@@ -15,7 +15,10 @@ command = "/usr/lib/wdm/wdm-plasma-greeter --theme default"
 ```
 
 `--theme` takes a name under `/usr/share/wdm/plasma-greeter/themes`, or a path
-if it contains a `/`. A theme that cannot be found is a startup failure, not a
+if it contains a `/`. The theme can also come from `theme=` in
+`/etc/wdm/plasma-greeter.ini` — `--theme` outranks it, because argv is written
+per-deployment in `greeter.command` and the file is the distribution-wide
+layer under it. A theme that cannot be found is a startup failure, not a
 fallback to the default: a misspelled name that silently shows something else is
 a configuration bug nobody notices until they are looking at the wrong login
 screen. For the same reason a trailing `--theme` with no value, `--theme=` with
@@ -67,6 +70,26 @@ One object, `wdm`, is a context property on the engine's root context. It exists
 before your bindings are evaluated and its models are already populated — the
 greeter does not create the QML engine until wdm's enumerate phase has ended, so
 there is no loading state to render and no ready callback to wait for.
+
+A second context property, `wdmConfig`, carries the administrator's
+`/etc/wdm/plasma-greeter.ini` as plain strings — empty when unset:
+
+| `wdmConfig` key | |
+|---|---|
+| `colorScheme` | `"dark"`, `"light"`, or `""` when the file did not choose |
+| `background` | a `"#rrggbb"` colour, a `file://…` image URL ready for an `Image.source`, or `""` |
+
+Honouring them is your policy, like everything else about how the login
+screen looks; the greeter only reports. The default theme is the worked
+example: a palette of `readonly property color` values switched on
+`wdmConfig.colorScheme`, and an `Image` with `PreserveAspectCrop` when
+`background` is a URL. The greeter refuses a background image that is not a
+readable file at startup, so a theme may use the URL without checking it.
+
+The INI accepts `theme`, `colorScheme` and `background`, optionally under a
+`[General]` header. An unknown key, an unknown section, a repeated key or a
+value that fits neither form is a startup error carrying the file and line,
+by the same no-silent-fallback rule `--theme` follows.
 
 ### Models
 

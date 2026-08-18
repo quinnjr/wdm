@@ -12,6 +12,8 @@ gtk4.workspace = true
 gtk4-layer-shell.workspace = true
 env_logger.workspace = true
 log.workspace = true
+serde.workspace = true
+toml.workspace = true
 
 # See crates/wdm/Cargo.toml.
 [package.metadata.deb]
@@ -23,7 +25,11 @@ section = "x11"
 priority = "optional"
 depends = "libc6, libgtk-4-1, libgtk4-layer-shell0"
 provides = "wdm-greeter-implementation"
-assets = [["../../target/release/wdm-gtk-greeter", "usr/lib/wdm/wdm-gtk-greeter", "755"]]
+conf-files = ["/etc/wdm/gtk-greeter.toml"]
+assets = [
+    ["../../target/release/wdm-gtk-greeter", "usr/lib/wdm/wdm-gtk-greeter", "755"],
+    ["../../packaging/gtk-greeter.toml.example", "etc/wdm/gtk-greeter.toml", "644"],
+]
 
 [package.metadata.generate-rpm]
 name = "wdm-gtk-greeter"
@@ -32,6 +38,7 @@ license = "MIT"
 provides = { wdm-greeter-implementation = "*" }
 assets = [
     { source = "target/release/wdm-gtk-greeter", dest = "/usr/lib/wdm/wdm-gtk-greeter", mode = "755" },
+    { source = "packaging/gtk-greeter.toml.example", dest = "/etc/wdm/gtk-greeter.toml", mode = "644", config = "noreplace" },
     { source = "LICENSE", dest = "/usr/share/licenses/wdm-gtk-greeter/LICENSE", mode = "644", doc = true },
 ]
 

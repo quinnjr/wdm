@@ -1,0 +1,21 @@
+# wdm-plasma-greeter configuration.
+# Install as /etc/wdm/plasma-greeter.ini. The file is optional: absent means
+# the defaults shown here. A file that exists and cannot be understood — an
+# unknown key or section, a repeated key, a malformed value, a background
+# image that is not a readable file — is a startup error, never a fallback,
+# and the reason appears on wdm's give-up screen.
+
+[General]
+# Theme: a name under /usr/share/wdm/plasma-greeter/themes, or a path.
+# --theme in greeter.command outranks this key.
+#theme=default
+
+# dark or light. Reaches the theme as wdmConfig.colorScheme; unset means the
+# theme's own default (the shipped theme is dark-first).
+#colorScheme=dark
+
+# A #rrggbb colour or an absolute path to an image. Reaches the theme as
+# wdmConfig.background — honouring it is the theme's policy, which the
+# shipped default theme does.
+#background=#12131a
+#background=/usr/share/backgrounds/login.jpg

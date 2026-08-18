@@ -1,0 +1,21 @@
+# wdm-webkit-greeter configuration.
+# Install as /etc/wdm/webkit-greeter.toml. The file is optional: absent means
+# the defaults shown here. A file that exists and cannot be understood — an
+# unknown key, a malformed value, a background image that is not a readable
+# file — is a startup error, never a fallback, and the reason appears on
+# wdm's give-up screen.
+
+# Theme: a name under /usr/share/wdm/webkit-greeter/themes, or a path.
+# --theme in greeter.command outranks this key.
+#theme = "default"
+
+# "dark" or "light". Reaches the theme as the page's prefers-color-scheme and
+# as wdm.config.color_scheme; unset means the theme's own default (the
+# shipped themes are dark-first).
+#color-scheme = "dark"
+
+# A "#rrggbb" colour or an absolute path to an image. Handed to the theme as
+# wdm.config.background — honouring it is the theme's policy, which the
+# shipped default theme does. A colour is also painted behind the page.
+#background = "#12131a"
+#background = "/usr/share/backgrounds/login.jpg"
