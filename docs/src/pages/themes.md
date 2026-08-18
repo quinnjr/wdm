@@ -121,6 +121,15 @@ works and there is no ready callback to wait for.
 | `wdm.in_authentication` | whether one is in progress |
 | `wdm.link_dead` | true once the connection to wdm is gone; it never becomes false again |
 | `wdm._prompt` | the pending prompt as `{ id, text, secret }`, or `null` — the underscore marks it as owned by the bridge rather than part of the API's shape, but a theme may read it |
+| `wdm.config` | the administrator's `/etc/wdm/webkit-greeter.toml`, as `{ color_scheme, background }` — each `null` when the file did not set it |
+
+`wdm.config` carries the administrator's choices; honouring them is your
+policy, like everything else in a theme. `color_scheme` is `"dark"`, `"light"`
+or `null`, and usually needs no code at all: the greeter mirrors it into the
+page's `prefers-color-scheme`, so a `@media` block is enough — which is how
+the default theme supports it. `background` is a `#rrggbb` colour, a
+`file://…` image URL, or `null`; the greeter also paints a colour behind the
+page, so a theme with a transparent body shows it without doing anything.
 
 `wdm._prompt` is an **object, not a string**: `text` is what to display, `id` is
 the prompt's id, and `secret` is whether the answer should be masked — the same

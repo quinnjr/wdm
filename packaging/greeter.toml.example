@@ -1,0 +1,14 @@
+# wdm-greeter (the reference greeter) configuration.
+# Install as /etc/wdm/greeter.toml. The file is optional: absent means the
+# defaults shown here. A file that exists and cannot be understood — an
+# unknown key, a malformed value — is a startup error, never a fallback, and
+# the reason appears on wdm's give-up screen.
+
+# "dark" (the default) or "light".
+#color-scheme = "dark"
+
+# What fills the screen behind the login panel: a "#rrggbb" colour, or an
+# absolute path to a PNG, scaled to cover and centre-cropped. Default is the
+# scheme's own background colour.
+#background = "#12131a"
+#background = "/usr/share/backgrounds/login.png"

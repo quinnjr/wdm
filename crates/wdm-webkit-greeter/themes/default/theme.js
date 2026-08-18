@@ -4,6 +4,20 @@
 // authentication_complete and nothing else — and everything a theme asks for
 // goes through window.wdm. There is no other channel.
 
+// The administrator's /etc/wdm/webkit-greeter.toml, surfaced by the greeter
+// as wdm.config. The greeter only reports; whether and how to honour it is
+// this theme's policy, and this theme honours background here. color_scheme
+// needs no code: the greeter mirrors it into prefers-color-scheme, which
+// style.css already watches.
+if (wdm.config && wdm.config.background) {
+  // JSON.stringify is CSS string escaping: the greeter already
+  // percent-encodes the URI, but a theme is contract and should not lean on
+  // that.
+  document.body.style.background = wdm.config.background.startsWith("file://")
+    ? `url(${JSON.stringify(wdm.config.background)}) center / cover no-repeat`
+    : wdm.config.background;
+}
+
 const el = (id) => document.getElementById(id);
 const form = el("login");
 

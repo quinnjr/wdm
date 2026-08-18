@@ -12,6 +12,7 @@
 //! and because it demonstrates the protocol works from a toolkit that owns its
 //! own event loop and its own Wayland connection.
 
+mod config;
 mod ui;
 
 // gtk4-layer-shell works by interposing a handful of libwayland-client symbols,
@@ -50,6 +51,20 @@ const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::new().filter("WDM_GREETER_LOG")).init();
 
+    // Before GTK is even initialised: a config error must be the only thing
+    // this process does, so the message on stderr is not buried in toolkit
+    // noise when wdm shows it on the give-up screen. The `css` file is read
+    // here too — a path that cannot be read is the same class of error as a
+    // key that cannot be parsed, not something to shrug off after the window
+    // is already up.
+    let (greeter_config, user_css) = match load_configuration() {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            log::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let app = Application::builder().application_id(APP_ID).build();
 
     // Exit code is decided by whether the connection came up, which is only
@@ -59,7 +74,7 @@ fn main() -> ExitCode {
     app.connect_activate({
         let failed = failed.clone();
         move |app| {
-            if let Err(e) = activate(app) {
+            if let Err(e) = activate(app, &greeter_config, user_css.as_deref()) {
                 log::error!("{e}");
                 failed.set(true);
                 app.quit();
@@ -78,7 +93,34 @@ fn main() -> ExitCode {
     }
 }
 
-fn activate(app: &Application) -> Result<(), Box<dyn std::error::Error>> {
+/// Read `/etc/wdm/gtk-greeter.toml` and whatever `css` file it names.
+fn load_configuration() -> Result<(config::Config, Option<String>), String> {
+    let greeter_config = config::load(std::path::Path::new(config::DEFAULT_PATH))?;
+    if let Some(config::Background::Image(path)) = &greeter_config.background
+        && !path.is_file()
+    {
+        // GTK would log a warning nobody reads and paint the base colour,
+        // which is the administrator's choice ignored without a word said —
+        // the bug class the config file exists to refuse.
+        return Err(format!(
+            "background {}: not a readable file",
+            path.display()
+        ));
+    }
+    let user_css = match &greeter_config.css {
+        None => None,
+        Some(path) => Some(
+            std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?,
+        ),
+    };
+    Ok((greeter_config, user_css))
+}
+
+fn activate(
+    app: &Application,
+    greeter_config: &config::Config,
+    user_css: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let display = gtk4::gdk::Display::default().ok_or("no display")?;
     let (link, model) = Link::connect(&display)?;
 
@@ -91,7 +133,7 @@ fn activate(app: &Application) -> Result<(), Box<dyn std::error::Error>> {
     let model: wdm_greeter_client::Shared = Rc::new(RefCell::new(model));
     let link: wdm_greeter_client::SharedLink = Rc::new(RefCell::new(link));
 
-    let (window, ui) = ui::build(app, model.clone(), link.clone());
+    let (window, ui) = ui::build(app, model.clone(), link.clone(), greeter_config, user_css);
     window.present();
 
     // Wayland events arrive independently of GTK's own event sources, so the

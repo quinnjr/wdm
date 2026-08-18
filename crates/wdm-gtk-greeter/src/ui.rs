@@ -12,7 +12,9 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use wdm_greeter_client::{Model, Shared, SharedLink};
 
-const STYLE: &str = "
+use crate::config::{Background, ColorScheme, Config};
+
+const STYLE_DARK: &str = "
 window { background: #12131a; }
 .card {
     background: #1c1e28;
@@ -53,6 +55,92 @@ window { background: #12131a; }
     font-weight: 600;
 }
 ";
+
+/// The dark stylesheet's roles re-cast for `color-scheme = "light"`. The
+/// accent and error colours are darkened rather than reused, because the dark
+/// set's values were chosen against a near-black ground and wash out on
+/// white. A drift test below pins the two sheets to the same selectors, so a
+/// widget styled in one cannot quietly go unstyled in the other.
+const STYLE_LIGHT: &str = "
+window { background: #e9eaf0; }
+.card {
+    background: #f7f7fa;
+    border: 1px solid #c9ccd8;
+    border-radius: 12px;
+    padding: 36px;
+    min-width: 420px;
+}
+.title { font-size: 22pt; font-weight: 700; color: #191b24; margin-bottom: 8px; }
+.hint { color: #5c6072; font-size: 10pt; }
+.error { color: #b3261e; font-size: 10pt; }
+.notice {
+    color: #191b24;
+    font-size: 10pt;
+    background: rgba(179, 38, 30, 0.08);
+    border-left: 3px solid #b3261e;
+    padding: 8px 10px;
+    border-radius: 4px;
+}
+.card entry {
+    min-height: 38px;
+    background: #ffffff;
+    color: #191b24;
+    border: 1px solid #c9ccd8;
+}
+.card entry:focus-within { border-color: #2757b8; }
+.card dropdown > button {
+    min-height: 34px;
+    background: #ffffff;
+    color: #191b24;
+    border: 1px solid #c9ccd8;
+}
+.card button.text-button {
+    min-height: 36px;
+    padding: 0 20px;
+    background: #2757b8;
+    color: #ffffff;
+    font-weight: 600;
+}
+";
+
+/// The one stylesheet the window loads: the scheme's base sheet, then the
+/// `background` override, then the administrator's own CSS — in that order,
+/// so each later layer wins ties with the one before it.
+pub fn stylesheet(config: &Config, user_css: Option<&str>) -> String {
+    let mut sheet = String::from(match config.color_scheme {
+        ColorScheme::Dark => STYLE_DARK,
+        ColorScheme::Light => STYLE_LIGHT,
+    });
+    match &config.background {
+        None => {}
+        Some(Background::Color(color)) => {
+            sheet.push_str(&format!("\nwindow {{ background: {color}; }}\n"));
+        }
+        Some(Background::Image(path)) => {
+            // filename_to_uri and not a hand-rolled `file://{path}`: percent
+            // encoding is what keeps a space, `#`, `%` or a newline in the
+            // path from ending the URI early or injecting CSS — the webkit
+            // greeter has a regression test for exactly this class of bug.
+            // The parser guaranteed the path is absolute, which is the only
+            // way this conversion fails.
+            let uri = gtk4::glib::filename_to_uri(path, None)
+                .expect("config::load only accepts absolute paths");
+            // Longhand rather than the `background:` shorthand: the fewer
+            // constructs the parser meets, the fewer chances a GTK version
+            // has to disagree about one of them.
+            sheet.push_str(&format!(
+                "\nwindow {{ background-image: url(\"{uri}\"); \
+                 background-size: cover; background-position: center; \
+                 background-repeat: no-repeat; }}\n"
+            ));
+        }
+    }
+    if let Some(user_css) = user_css {
+        sheet.push('\n');
+        sheet.push_str(user_css);
+    }
+    sheet
+}
 
 /// The widgets, and the small amount of state that is the greeter's own rather
 /// than the compositor's.
@@ -103,17 +191,35 @@ pub struct Ui {
 }
 
 /// Build the window and wire it up.
-pub fn build(app: &Application, model: Shared, link: SharedLink) -> (ApplicationWindow, Rc<Ui>) {
+pub fn build(
+    app: &Application,
+    model: Shared,
+    link: SharedLink,
+    config: &Config,
+    user_css: Option<&str>,
+) -> (ApplicationWindow, Rc<Ui>) {
     // A login screen runs before any user session, so there is no per-user theme
-    // preference to honour and no settings daemon to ask. Without this GTK falls
-    // back to the light Adwaita theme, whose entries and buttons are unreadable
-    // against the dark background below.
+    // preference to honour and no settings daemon to ask: the scheme comes from
+    // /etc/wdm/gtk-greeter.toml or defaults to dark. Without an explicit choice
+    // GTK falls back to the light Adwaita theme, whose entries and buttons are
+    // unreadable against the dark background below.
     if let Some(settings) = gtk4::Settings::default() {
-        settings.set_gtk_application_prefer_dark_theme(true);
+        settings.set_gtk_application_prefer_dark_theme(matches!(
+            config.color_scheme,
+            ColorScheme::Dark
+        ));
     }
 
     let provider = CssProvider::new();
-    provider.load_from_data(STYLE);
+    // GTK4's CSS parser recovers per-rule rather than dropping the sheet, so
+    // without this a typo in the administrator's `css` file is skipped with a
+    // warning nobody reads. Surfaced through the greeter's own log instead;
+    // not fatal, because GTK also reports rules it merely does not support,
+    // and a login screen that looks wrong still beats none.
+    provider.connect_parsing_error(|_, section, error| {
+        log::error!("stylesheet: {section}: {error}");
+    });
+    provider.load_from_data(&stylesheet(config, user_css));
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -1203,11 +1309,11 @@ mod tests {
         for (shared, call_site) in [
             (
                 no_users,
-                format!(r#"ui::paint_message(canvas, "{no_users}", true)"#),
+                format!(r#"ui::paint_message(canvas, "{no_users}", true, &self.style)"#),
             ),
             (
                 no_sessions,
-                format!(r#"ui::paint_message(canvas, "{no_sessions}", true)"#),
+                format!(r#"ui::paint_message(canvas, "{no_sessions}", true, &self.style)"#),
             ),
             (
                 no_sessions,
@@ -1270,6 +1376,94 @@ mod tests {
         assert!(
             reference.contains(&format!(r#""{}""#, wait_prompt(true, true))),
             "wdm-greeter no longer offers the retry its `idle_prompt` was added for"
+        );
+    }
+
+    /// The selectors of a GTK CSS sheet, in order of appearance.
+    fn selectors(sheet: &str) -> Vec<String> {
+        sheet
+            .split('}')
+            .filter_map(|block| block.split('{').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn light_and_dark_sheets_style_the_same_selectors() {
+        // A widget styled in one scheme and not the other is invisible drift:
+        // it looks fine in whichever scheme the developer runs, and wrong in
+        // the one the deployment picked.
+        assert_eq!(selectors(STYLE_DARK), selectors(STYLE_LIGHT));
+    }
+
+    #[test]
+    fn the_stylesheet_follows_the_scheme() {
+        let dark = stylesheet(&Config::default(), None);
+        assert!(dark.contains("#12131a"), "dark sheet lost its background");
+        let light = stylesheet(
+            &Config {
+                color_scheme: ColorScheme::Light,
+                ..Config::default()
+            },
+            None,
+        );
+        assert!(light.contains("#e9eaf0"), "light sheet lost its background");
+        assert!(!light.contains("#12131a"), "light sheet still paints dark");
+    }
+
+    #[test]
+    fn a_background_color_lands_after_the_base_sheet() {
+        let sheet = stylesheet(
+            &Config {
+                background: Some(crate::config::Background::Color("#336699".to_owned())),
+                ..Config::default()
+            },
+            None,
+        );
+        let base = sheet.find("window { background: #12131a; }").unwrap();
+        let over = sheet.find("window { background: #336699; }").unwrap();
+        // Later rules win ties in one provider, so order is the behaviour.
+        assert!(over > base);
+    }
+
+    #[test]
+    fn a_background_image_becomes_a_percent_encoded_uri() {
+        // The path goes through filename_to_uri, so a space, quote or `#`
+        // is percent-encoded instead of ending the CSS string or the URI —
+        // the same bug class the webkit greeter's
+        // `the_initial_uri_survives_a_space_in_the_path` pins.
+        let sheet = stylesheet(
+            &Config {
+                background: Some(crate::config::Background::Image(
+                    "/usr/share/wall \"paper\" #2.jpg".into(),
+                )),
+                ..Config::default()
+            },
+            None,
+        );
+        assert!(
+            sheet.contains("url(\"file:///usr/share/wall%20%22paper%22%20%232.jpg\")"),
+            "{sheet}"
+        );
+        assert!(sheet.contains("background-size: cover"));
+    }
+
+    #[test]
+    fn user_css_is_the_last_word() {
+        let sheet = stylesheet(
+            &Config {
+                background: Some(crate::config::Background::Color("#336699".to_owned())),
+                ..Config::default()
+            },
+            Some(".card { padding: 1px; }"),
+        );
+        let over = sheet.find("#336699").unwrap();
+        let user = sheet.find(".card { padding: 1px; }").unwrap();
+        assert!(
+            user > over,
+            "the administrator's CSS must override everything"
         );
     }
 }

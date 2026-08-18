@@ -1,0 +1,21 @@
+# wdm-gtk-greeter configuration.
+# Install as /etc/wdm/gtk-greeter.toml. The file is optional: absent means the
+# defaults shown here. A file that exists and cannot be understood — an
+# unknown key, a malformed value, a css file that cannot be read — is a
+# startup error, never a fallback, and the reason appears on wdm's give-up
+# screen.
+
+# "dark" (the default) or "light". Also drives GTK's own dark preference, so
+# the toolkit's widgets match.
+#color-scheme = "dark"
+
+# What fills the window behind the login card: a "#rrggbb" colour, or an
+# absolute path to an image (any format GTK loads), scaled to cover. Default
+# is the scheme's own background colour.
+#background = "#12131a"
+#background = "/usr/share/backgrounds/login.jpg"
+
+# Extra CSS loaded after the built-in stylesheet, so it overrides. See the
+# built-in sheet in the wdm source for the selectors it styles (.card, .title,
+# .hint, .error, .notice).
+#css = "/etc/wdm/gtk-greeter.css"

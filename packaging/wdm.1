@@ -225,6 +225,13 @@ at a wrapper script that exports
 .I /etc/wdm/wdm.toml
 Configuration.
 .TP
+.I /etc/wdm/greeter.toml, /etc/wdm/gtk\-greeter.toml, /etc/wdm/webkit\-greeter.toml, /etc/wdm/plasma\-greeter.ini
+Each shipped greeter's own appearance configuration (colour scheme,
+background, theme where the greeter has themes). Read by the greeter, not by
+.BR wdm ;
+optional, but a file that exists and cannot be understood is a greeter
+startup error and its reason reaches the give\-up screen.
+.TP
 .I /etc/pam.d/wdm
 PAM stack.
 .B Authentication fails until this exists;

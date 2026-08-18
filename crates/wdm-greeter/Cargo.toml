@@ -9,7 +9,13 @@ publish.workspace = true
 env_logger = "0.11.11"
 fontdue = "0.9.4"
 log.workspace = true
+# The "no toolkit" claim survives these: serde/toml because a hand-rolled
+# parser for /etc/wdm/greeter.toml would be the bug-prone kind of minimalism,
+# png because `background` accepts an image and wl_shm has no decoder.
+png = "0.18.1"
 rustix = { version = "1.1.4", features = ["fs"] }
+serde.workspace = true
+toml.workspace = true
 wayland-client.workspace = true
 wayland-protocols-wlr = { workspace = true, features = ["client"] }
 wdm-protocol = { workspace = true, features = ["client"] }
@@ -27,7 +33,11 @@ section = "x11"
 priority = "optional"
 depends = "libc6, libxkbcommon0"
 provides = "wdm-greeter-implementation"
-assets = [["../../target/release/wdm-greeter", "usr/lib/wdm/wdm-greeter", "755"]]
+conf-files = ["/etc/wdm/greeter.toml"]
+assets = [
+    ["../../target/release/wdm-greeter", "usr/lib/wdm/wdm-greeter", "755"],
+    ["../../packaging/greeter.toml.example", "etc/wdm/greeter.toml", "644"],
+]
 
 [package.metadata.generate-rpm]
 name = "wdm-greeter"
@@ -36,6 +46,7 @@ license = "MIT"
 provides = { wdm-greeter-implementation = "*" }
 assets = [
     { source = "target/release/wdm-greeter", dest = "/usr/lib/wdm/wdm-greeter", mode = "755" },
+    { source = "packaging/greeter.toml.example", dest = "/etc/wdm/greeter.toml", mode = "644", config = "noreplace" },
     { source = "LICENSE", dest = "/usr/share/licenses/wdm-greeter/LICENSE", mode = "644", doc = true },
 ]
 

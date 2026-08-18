@@ -4,18 +4,268 @@
 //! `wdm_greeter_v1` is implementable by something that is not wdm; anyone wanting
 //! a themed login screen writes their own client against the same protocol.
 
+use std::path::Path;
+
+use crate::config::{Background, ColorScheme, Config};
 use crate::text::{self, Canvas};
 
-const BACKGROUND: u32 = 0xff12131a;
-const PANEL: u32 = 0xff1c1e28;
-const PANEL_EDGE: u32 = 0xff2c2f3d;
-const FIELD: u32 = 0xff0d0e13;
-const TEXT: u32 = 0xffe8e8ef;
-const DIM: u32 = 0xff8b8fa3;
-const ACCENT: u32 = 0xff6f9dff;
-const ERROR: u32 = 0xffff7b72;
+/// Every colour the form is drawn in. Two fixed sets, selected by
+/// `color-scheme` in `/etc/wdm/greeter.toml`; anyone wanting more than a
+/// light and a dark look writes their own greeter, which is this crate's
+/// whole thesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub background: u32,
+    pub panel: u32,
+    pub panel_edge: u32,
+    pub field: u32,
+    pub text: u32,
+    pub dim: u32,
+    pub accent: u32,
+    pub error: u32,
+    pub selected: u32,
+}
 
-const SELECTED: u32 = 0xff2a3350;
+impl Palette {
+    /// The colours this greeter has always painted.
+    pub const fn dark() -> Self {
+        Palette {
+            background: 0xff12131a,
+            panel: 0xff1c1e28,
+            panel_edge: 0xff2c2f3d,
+            field: 0xff0d0e13,
+            text: 0xffe8e8ef,
+            dim: 0xff8b8fa3,
+            accent: 0xff6f9dff,
+            error: 0xffff7b72,
+            selected: 0xff2a3350,
+        }
+    }
+
+    /// The dark palette's roles, re-cast in light greys. The error red and
+    /// accent blue are darkened rather than reused, because the dark set's
+    /// values were chosen against a near-black ground and wash out on white.
+    pub const fn light() -> Self {
+        Palette {
+            background: 0xffe9eaf0,
+            panel: 0xfff7f7fa,
+            panel_edge: 0xffc9ccd8,
+            field: 0xffffffff,
+            text: 0xff191b24,
+            dim: 0xff5c6072,
+            accent: 0xff2757b8,
+            error: 0xffb3261e,
+            selected: 0xffd4ddf5,
+        }
+    }
+}
+
+/// What the screen is filled with before the panel is drawn on top.
+#[derive(Debug)]
+pub enum Backdrop {
+    /// The palette's own background colour — today's behaviour.
+    Palette,
+    Color(u32),
+    Image(Image),
+}
+
+/// A decoded background image, 0xAARRGGBB per pixel like [`Canvas`].
+#[derive(Debug)]
+pub struct Image {
+    pub width: i32,
+    pub height: i32,
+    pub pixels: Vec<u32>,
+    /// The cover-scaled frame for the last canvas size drawn. `draw_cover`
+    /// runs on every repaint and a repaint is every keystroke, so without
+    /// this the scaling loop — 8.3M samples at 4K — sat on the one path a
+    /// login screen actually exercises; with it, a repaint is a memcpy and
+    /// the loop runs only on resize. RefCell because the painter takes the
+    /// style immutably, and this process is single-threaded.
+    cover: std::cell::RefCell<Option<(i32, i32, Vec<u8>)>>,
+}
+
+/// Everything `/etc/wdm/greeter.toml` decides about how the form looks.
+#[derive(Debug)]
+pub struct Style {
+    pub palette: Palette,
+    pub backdrop: Backdrop,
+}
+
+impl Style {
+    /// Build the style, decoding the background image if there is one.
+    ///
+    /// Decoding happens here, once at startup, because a file that cannot be
+    /// decoded is a configuration error and configuration errors are startup
+    /// errors — not something to discover on the first frame.
+    pub fn from_config(config: &Config) -> Result<Self, String> {
+        let palette = match config.color_scheme {
+            ColorScheme::Dark => Palette::dark(),
+            ColorScheme::Light => Palette::light(),
+        };
+        let backdrop = match &config.background {
+            None => Backdrop::Palette,
+            Some(Background::Color(color)) => Backdrop::Color(*color),
+            Some(Background::Image(path)) => Backdrop::Image(Image::load_png(path)?),
+        };
+        Ok(Style { palette, backdrop })
+    }
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            palette: Palette::dark(),
+            backdrop: Backdrop::Palette,
+        }
+    }
+}
+
+impl Image {
+    /// Decode a PNG. PNG only: the point of `background` accepting an image
+    /// is a wallpaper, not an image pipeline, and every wallpaper tool can
+    /// write one.
+    pub fn load_png(path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+        // EXPAND turns indexed PNGs — what pngquant, optipng and GIMP's
+        // indexed export produce — into RGB, and sub-byte greys into whole
+        // bytes; STRIP_16 folds 16-bit channels to 8. Without these the
+        // decoder hands back palette indices and the match below refuses a
+        // perfectly valid wallpaper, blaming the administrator's file.
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder
+            .read_info()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        let mut buf = vec![0; reader.output_buffer_size().unwrap_or(0)];
+        let info = reader
+            .next_frame(&mut buf)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        let buf = &buf[..info.buffer_size()];
+
+        // Normalise every colour type to opaque ARGB. A translucent wallpaper
+        // would put the previous session's framebuffer on the login screen,
+        // so alpha is composited against black here, once, rather than
+        // trusted at draw time.
+        let (width, height) = (info.width as i32, info.height as i32);
+        if width <= 0 || height <= 0 {
+            return Err(format!("{}: image is empty", path.display()));
+        }
+        let pixels: Vec<u32> = match info.color_type {
+            png::ColorType::Rgb => buf
+                .chunks_exact(3)
+                .map(|p| {
+                    0xff00_0000 | u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2])
+                })
+                .collect(),
+            png::ColorType::Rgba => buf
+                .chunks_exact(4)
+                .map(|p| {
+                    let a = u32::from(p[3]);
+                    let ch = |v: u8| u32::from(v) * a / 255;
+                    0xff00_0000 | ch(p[0]) << 16 | ch(p[1]) << 8 | ch(p[2])
+                })
+                .collect(),
+            png::ColorType::Grayscale => buf
+                .iter()
+                .map(|&g| {
+                    let g = u32::from(g);
+                    0xff00_0000 | g << 16 | g << 8 | g
+                })
+                .collect(),
+            png::ColorType::GrayscaleAlpha => buf
+                .chunks_exact(2)
+                .map(|p| {
+                    let g = u32::from(p[0]) * u32::from(p[1]) / 255;
+                    0xff00_0000 | g << 16 | g << 8 | g
+                })
+                .collect(),
+            other => {
+                // Unreachable for a well-formed file: EXPAND above rewrites
+                // Indexed to Rgb/Rgba. Kept as an error rather than a panic
+                // because the file is the administrator's, not ours.
+                return Err(format!(
+                    "{}: unsupported colour type {other:?}",
+                    path.display()
+                ));
+            }
+        };
+        if pixels.len() != (width * height) as usize {
+            return Err(format!("{}: truncated image data", path.display()));
+        }
+        Ok(Image::new(width, height, pixels))
+    }
+
+    pub fn new(width: i32, height: i32, pixels: Vec<u32>) -> Self {
+        Image {
+            width,
+            height,
+            pixels,
+            cover: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Fill the canvas with the image, scaled to cover and centre-cropped —
+    /// what every wallpaper setter calls "fill". Nearest-neighbour, because
+    /// this runs on resize only and a login screen's wallpaper does not
+    /// justify a resampling kernel.
+    pub fn draw_cover(&self, canvas: &mut Canvas) {
+        let (cw, ch) = (canvas.width, canvas.height);
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
+        let mut cover = self.cover.borrow_mut();
+        if !matches!(&*cover, Some((w, h, _)) if *w == cw && *h == ch) {
+            *cover = Some((cw, ch, self.render_cover(cw, ch)));
+        }
+        let Some((_, _, bytes)) = &*cover else {
+            unreachable!("filled above");
+        };
+        canvas.data.copy_from_slice(bytes);
+    }
+
+    /// The scaling pass behind [`Image::draw_cover`]'s cache: runs on resize,
+    /// never on an ordinary repaint.
+    fn render_cover(&self, cw: i32, ch: i32) -> Vec<u8> {
+        let scale = f64::max(
+            f64::from(cw) / f64::from(self.width),
+            f64::from(ch) / f64::from(self.height),
+        );
+        // The scaled image overhangs the canvas on one axis; centring the
+        // crop keeps the subject of the picture on screen.
+        let ox = (f64::from(self.width) * scale - f64::from(cw)) / 2.0;
+        let oy = (f64::from(self.height) * scale - f64::from(ch)) / 2.0;
+
+        // One column table instead of a division per pixel: every row samples
+        // the same source columns.
+        let columns: Vec<i32> = (0..cw)
+            .map(|x| (((f64::from(x) + 0.5 + ox) / scale) as i32).clamp(0, self.width - 1))
+            .collect();
+
+        let mut bytes = vec![0u8; (cw * ch * 4) as usize];
+        for y in 0..ch {
+            let sy = (((f64::from(y) + 0.5 + oy) / scale) as i32).clamp(0, self.height - 1);
+            let row = (sy * self.width) as usize;
+            for (x, &sx) in columns.iter().enumerate() {
+                let pixel = self.pixels[row + sx as usize];
+                let offset = (y as usize * cw as usize + x) * 4;
+                // Same byte order `Canvas::fill` writes: the u32's native
+                // bytes, so the compositor reads it as the ARGB it expects.
+                bytes[offset..offset + 4].copy_from_slice(&pixel.to_ne_bytes());
+            }
+        }
+        bytes
+    }
+}
+
+/// Fill the screen with whatever sits behind the panel.
+fn draw_backdrop(canvas: &mut Canvas, style: &Style) {
+    match &style.backdrop {
+        Backdrop::Palette => canvas.fill(style.palette.background),
+        Backdrop::Color(color) => canvas.fill(*color),
+        Backdrop::Image(image) => image.draw_cover(canvas),
+    }
+}
+
 const PANEL_WIDTH: i32 = 460;
 const PANEL_HEIGHT: i32 = 300;
 const PADDING: i32 = 32;
@@ -66,8 +316,9 @@ pub struct View<'a> {
 }
 
 /// Paint the whole screen.
-pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
-    canvas.fill(BACKGROUND);
+pub fn paint(canvas: &mut Canvas, view: &View<'_>, style: &Style) {
+    draw_backdrop(canvas, style);
+    let palette = &style.palette;
 
     let panel_x = (canvas.width - PANEL_WIDTH) / 2;
     let panel_y = (canvas.height - PANEL_HEIGHT) / 2;
@@ -79,9 +330,9 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
         panel_y - 1,
         PANEL_WIDTH + 2,
         PANEL_HEIGHT + 2,
-        PANEL_EDGE,
+        palette.panel_edge,
     );
-    canvas.rect(panel_x, panel_y, PANEL_WIDTH, PANEL_HEIGHT, PANEL);
+    canvas.rect(panel_x, panel_y, PANEL_WIDTH, PANEL_HEIGHT, palette.panel);
 
     let left = (panel_x + PADDING) as f32;
     let mut y = (panel_y + PADDING) as f32;
@@ -91,24 +342,31 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     } else {
         format!("{} ({})", view.display_name, view.username)
     };
-    text::draw(canvas, left, y, TITLE_SIZE, TEXT, &title);
+    text::draw(canvas, left, y, TITLE_SIZE, palette.text, &title);
     y += TITLE_SIZE * 2.0;
 
     if view.launching {
-        text::draw(canvas, left, y, BODY_SIZE, ACCENT, "Starting session…");
+        text::draw(
+            canvas,
+            left,
+            y,
+            BODY_SIZE,
+            palette.accent,
+            "Starting session…",
+        );
         return;
     }
 
     // Prompt label, then the field. PAM decides the wording, so it is shown
     // verbatim rather than replaced with "Password:".
     let label = view.prompt.unwrap_or("Waiting…");
-    text::draw(canvas, left, y, SMALL_SIZE, DIM, label);
+    text::draw(canvas, left, y, SMALL_SIZE, palette.dim, label);
     y += SMALL_SIZE * 1.8;
 
     let field_height = (BODY_SIZE * 1.9) as i32;
     let field_x = panel_x + PADDING;
     let field_width = PANEL_WIDTH - PADDING * 2;
-    canvas.rect(field_x, y as i32, field_width, field_height, FIELD);
+    canvas.rect(field_x, y as i32, field_width, field_height, palette.field);
 
     let shown = if view.secret {
         // Fixed-width mask: revealing the length of a password is a small leak,
@@ -139,22 +397,22 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
         x1: field_x + field_width,
         y1: y as i32 + field_height,
     };
-    shown.draw_clipped(canvas, left + 8.0, text_y, TEXT, Some(field));
+    shown.draw_clipped(canvas, left + 8.0, text_y, palette.text, Some(field));
 
     // Caret, so an empty field still looks focused. Pinned inside the field for
     // the same reason: `Canvas::rect` clips to the canvas, not to the widget.
     let caret_x = (left + 8.0 + shown.width() + 1.0) as i32;
     let caret_x = caret_x.min(field.x1 - 2);
-    canvas.rect(caret_x, text_y as i32, 2, BODY_SIZE as i32, ACCENT);
+    canvas.rect(caret_x, text_y as i32, 2, BODY_SIZE as i32, palette.accent);
 
     y += field_height as f32 + BODY_SIZE * 1.4;
 
     if let Some(error) = view.error {
-        text::draw(canvas, left, y, SMALL_SIZE, ERROR, error);
+        text::draw(canvas, left, y, SMALL_SIZE, palette.error, error);
         y += SMALL_SIZE * 1.6;
     }
     if let Some(info) = view.info {
-        text::draw(canvas, left, y, SMALL_SIZE, DIM, info);
+        text::draw(canvas, left, y, SMALL_SIZE, palette.dim, info);
     }
 
     // Footer: the session about to start, and the keys that change things. A
@@ -170,13 +428,13 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     // geometrically rather than as U+25BE, because the fonts wdm falls back to
     // are not guaranteed to have that glyph and a tofu box is worse than none.
     let session_label = text::Shaped::new(&format!("Session: {current} "), SMALL_SIZE);
-    session_label.draw(canvas, left, footer_y, DIM);
+    session_label.draw(canvas, left, footer_y, palette.dim);
     triangle(
         canvas,
         (left + session_label.width()) as i32,
         footer_y as i32 + (SMALL_SIZE / 2.0) as i32,
         7,
-        DIM,
+        palette.dim,
     );
 
     let mut hints = Vec::new();
@@ -189,12 +447,12 @@ pub fn paint(canvas: &mut Canvas, view: &View<'_>) {
     hints.push("Esc clear");
     let hint = text::Shaped::new(&hints.join("   "), SMALL_SIZE);
     let hint_x = (panel_x + PANEL_WIDTH - PADDING) as f32 - hint.width();
-    hint.draw(canvas, hint_x, footer_y, DIM);
+    hint.draw(canvas, hint_x, footer_y, palette.dim);
 
     // Drawn last so it sits over everything, and outside the panel bounds so a
     // long list is not clipped by the panel.
     if view.menu_open {
-        draw_menu(canvas, panel_x, footer_y, view);
+        draw_menu(canvas, panel_x, footer_y, view, palette);
     }
 }
 
@@ -248,7 +506,7 @@ pub fn menu_window(len: usize, selected: usize, rows: usize) -> std::ops::Range<
     start..start + rows
 }
 
-fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>) {
+fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>, palette: &Palette) {
     let window = menu_window(view.sessions.len(), view.session_index, MENU_ROWS);
     let shown = window.len() as i32;
     if shown == 0 {
@@ -266,20 +524,20 @@ fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>) 
 
     let y = menu_origin(anchor_y as i32, height, canvas.height, MENU_ROW_HEIGHT);
 
-    canvas.rect(x - 1, y - 1, width + 2, height + 2, PANEL_EDGE);
-    canvas.rect(x, y, width, height, FIELD);
+    canvas.rect(x - 1, y - 1, width + 2, height + 2, palette.panel_edge);
+    canvas.rect(x, y, width, height, palette.field);
 
     for (row, index) in window.enumerate() {
         let row_y = y + 4 + row as i32 * MENU_ROW_HEIGHT;
 
         if index == view.session_index {
-            canvas.rect(x + 2, row_y, width - 4, MENU_ROW_HEIGHT, SELECTED);
+            canvas.rect(x + 2, row_y, width - 4, MENU_ROW_HEIGHT, palette.selected);
         }
 
         let color = if index == view.session_index {
-            TEXT
+            palette.text
         } else {
-            DIM
+            palette.dim
         };
         let baseline = row_y as f32 + (MENU_ROW_HEIGHT as f32 - BODY_SIZE) / 2.0 - 2.0;
         text::draw(
@@ -300,15 +558,24 @@ fn draw_menu(canvas: &mut Canvas, panel_x: i32, anchor_y: f32, view: &View<'_>) 
             SMALL_SIZE,
         );
         let more_x = (x + width) as f32 - more.width() - 8.0;
-        more.draw(canvas, more_x, (y + height) as f32 - SMALL_SIZE - 2.0, DIM);
+        more.draw(
+            canvas,
+            more_x,
+            (y + height) as f32 - SMALL_SIZE - 2.0,
+            palette.dim,
+        );
     }
 }
 
 /// Draw a message with no login form, used before the enumerate phase completes
 /// and when there is nothing to log in as.
-pub fn paint_message(canvas: &mut Canvas, message: &str, is_error: bool) {
-    canvas.fill(BACKGROUND);
-    let color = if is_error { ERROR } else { DIM };
+pub fn paint_message(canvas: &mut Canvas, message: &str, is_error: bool, style: &Style) {
+    draw_backdrop(canvas, style);
+    let color = if is_error {
+        style.palette.error
+    } else {
+        style.palette.dim
+    };
     text::draw_centered(
         canvas,
         (canvas.height / 2) as f32 - BODY_SIZE,
@@ -371,7 +638,7 @@ mod tests {
             (3840, 2160),
         ] {
             let mut canvas = Canvas::new(w, h);
-            paint(&mut canvas, &view());
+            paint(&mut canvas, &view(), &Style::default());
             assert_opaque(&canvas);
         }
     }
@@ -382,7 +649,7 @@ mod tests {
             return;
         }
         let mut secret = Canvas::new(800, 600);
-        paint(&mut secret, &view());
+        paint(&mut secret, &view(), &Style::default());
 
         let mut visible = Canvas::new(800, 600);
         paint(
@@ -391,6 +658,7 @@ mod tests {
                 secret: false,
                 ..view()
             },
+            &Style::default(),
         );
 
         // The masked and unmasked renderings must differ, or the password is on
@@ -409,6 +677,7 @@ mod tests {
                 secret: true,
                 ..view()
             },
+            &Style::default(),
         );
         paint(
             &mut canvas,
@@ -417,6 +686,7 @@ mod tests {
                 secret: false,
                 ..view()
             },
+            &Style::default(),
         );
     }
 
@@ -480,6 +750,7 @@ mod tests {
                 secret: false,
                 ..view()
             },
+            &Style::default(),
         );
         canvas
     }
@@ -490,7 +761,7 @@ mod tests {
             return;
         }
         let mut plain = Canvas::new(800, 600);
-        paint(&mut plain, &view());
+        paint(&mut plain, &view(), &Style::default());
 
         let mut annotated = Canvas::new(800, 600);
         paint(
@@ -500,6 +771,7 @@ mod tests {
                 info: Some("Password expires in 3 days"),
                 ..view()
             },
+            &Style::default(),
         );
 
         assert_ne!(plain.data, annotated.data);
@@ -517,6 +789,7 @@ mod tests {
                 launching: true,
                 ..view()
             },
+            &Style::default(),
         );
         assert_opaque(&canvas);
     }
@@ -524,9 +797,9 @@ mod tests {
     #[test]
     fn message_screen_is_opaque() {
         let mut canvas = Canvas::new(400, 300);
-        paint_message(&mut canvas, "Connecting…", false);
+        paint_message(&mut canvas, "Connecting…", false, &Style::default());
         assert_opaque(&canvas);
-        paint_message(&mut canvas, "No users available", true);
+        paint_message(&mut canvas, "No users available", true, &Style::default());
         assert_opaque(&canvas);
     }
 
@@ -593,6 +866,7 @@ mod tests {
                         session_index: count - 1,
                         ..view_with(&sessions)
                     },
+                    &Style::default(),
                 );
                 assert_opaque(&canvas);
             }
@@ -607,7 +881,7 @@ mod tests {
         let sessions = names(4);
 
         let mut closed = Canvas::new(800, 600);
-        paint(&mut closed, &view_with(&sessions));
+        paint(&mut closed, &view_with(&sessions), &Style::default());
 
         let mut open = Canvas::new(800, 600);
         paint(
@@ -616,6 +890,7 @@ mod tests {
                 menu_open: true,
                 ..view_with(&sessions)
             },
+            &Style::default(),
         );
 
         assert_ne!(closed.data, open.data, "the drop-down drew nothing");
@@ -636,6 +911,7 @@ mod tests {
                 session_index: 0,
                 ..view_with(&sessions)
             },
+            &Style::default(),
         );
 
         let mut second = Canvas::new(800, 600);
@@ -646,6 +922,7 @@ mod tests {
                 session_index: 1,
                 ..view_with(&sessions)
             },
+            &Style::default(),
         );
 
         // Moving the selection must move the highlight, or the list gives the
@@ -665,7 +942,187 @@ mod tests {
                 display_name: "",
                 ..view()
             },
+            &Style::default(),
         );
         assert_opaque(&canvas);
+    }
+
+    /// The first pixel, decoded back to the u32 the palette speaks.
+    fn corner(canvas: &Canvas) -> u32 {
+        u32::from_ne_bytes(canvas.data[0..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn the_light_scheme_actually_changes_the_frame() {
+        let light = Style {
+            palette: Palette::light(),
+            backdrop: Backdrop::Palette,
+        };
+        // Larger than the panel, so the corner shows the backdrop.
+        let mut dark_canvas = Canvas::new(800, 600);
+        paint(&mut dark_canvas, &view(), &Style::default());
+        let mut light_canvas = Canvas::new(800, 600);
+        paint(&mut light_canvas, &view(), &light);
+
+        assert_ne!(dark_canvas.data, light_canvas.data);
+        assert_eq!(corner(&light_canvas), Palette::light().background);
+        assert_opaque(&light_canvas);
+    }
+
+    #[test]
+    fn a_background_color_fills_behind_the_panel() {
+        let style = Style {
+            palette: Palette::dark(),
+            backdrop: Backdrop::Color(0xff336699),
+        };
+        let mut canvas = Canvas::new(800, 600);
+        paint(&mut canvas, &view(), &style);
+        assert_eq!(corner(&canvas), 0xff336699);
+
+        let mut message = Canvas::new(320, 200);
+        paint_message(&mut message, "Connecting…", false, &style);
+        assert_eq!(corner(&message), 0xff336699);
+    }
+
+    #[test]
+    fn a_background_image_is_scaled_to_cover_and_centre_cropped() {
+        // A 2x1 image on a square canvas must scale by height (the larger
+        // ratio), leaving one source column visible: the crop is centred, so
+        // both halves of the canvas sample from the middle of the image —
+        // which for 2 columns means each half keeps its own column.
+        let image = Image::new(2, 1, vec![0xffff0000, 0xff0000ff]);
+        let mut canvas = Canvas::new(4, 4);
+        image.draw_cover(&mut canvas);
+        assert_eq!(corner(&canvas), 0xffff0000);
+        let last = (4 * 4 - 1) * 4;
+        assert_eq!(
+            u32::from_ne_bytes(canvas.data[last..last + 4].try_into().unwrap()),
+            0xff0000ff
+        );
+        assert_opaque(&canvas);
+    }
+
+    #[test]
+    fn an_exact_fit_image_maps_pixel_for_pixel() {
+        let image = Image::new(2, 2, vec![0xff102030, 0xff405060, 0xff708090, 0xffa0b0c0]);
+        let mut canvas = Canvas::new(2, 2);
+        image.draw_cover(&mut canvas);
+        let px = |i: usize| u32::from_ne_bytes(canvas.data[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(
+            [px(0), px(1), px(2), px(3)],
+            [0xff102030, 0xff405060, 0xff708090, 0xffa0b0c0]
+        );
+    }
+
+    #[test]
+    fn a_png_background_loads_and_a_missing_one_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("wdm-greeter-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bg.png");
+
+        // A 2x1 RGBA PNG: opaque red, half-transparent blue. The transparent
+        // pixel must come back darkened and opaque, or the previous session's
+        // framebuffer shows through the wallpaper.
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 2, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&[0xff, 0, 0, 0xff, 0, 0, 0xff, 0x80])
+            .unwrap();
+        writer.finish().unwrap();
+
+        let image = Image::load_png(&path).unwrap();
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.pixels[0], 0xffff0000);
+        assert_eq!(image.pixels[1] >> 24, 0xff, "alpha must be composited away");
+        assert!(
+            image.pixels[1] & 0xff <= 0x81,
+            "half-transparent blue must darken"
+        );
+
+        let missing = Image::load_png(&dir.join("nope.png")).unwrap_err();
+        assert!(missing.contains("nope.png"), "{missing}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_config_surfaces_a_bad_image_as_an_error() {
+        let config = crate::config::Config {
+            color_scheme: ColorScheme::Light,
+            background: Some(Background::Image("/nonexistent/wall.png".into())),
+        };
+        let err = Style::from_config(&config).unwrap_err();
+        assert!(err.contains("wall.png"), "{err}");
+
+        let plain = crate::config::Config {
+            color_scheme: ColorScheme::Light,
+            background: Some(Background::Color(0xff123456)),
+        };
+        let style = Style::from_config(&plain).unwrap();
+        assert_eq!(style.palette, Palette::light());
+        assert!(matches!(style.backdrop, Backdrop::Color(0xff123456)));
+    }
+
+    #[test]
+    fn indexed_and_sixteen_bit_pngs_load_too() {
+        // The defect this guards: the decoder was left on IDENTITY
+        // transformations, so a colour-indexed PNG — what pngquant, optipng
+        // and GIMP's indexed export all produce — arrived as ColorType::Indexed
+        // and was refused, blaming the administrator's perfectly valid file.
+        let dir = std::env::temp_dir().join(format!("wdm-greeter-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let indexed = dir.join("indexed.png");
+        let file = std::fs::File::create(&indexed).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 2, 1);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        // Palette: entry 0 red, entry 1 blue.
+        encoder.set_palette(vec![0xff, 0, 0, 0, 0, 0xff]);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0, 1]).unwrap();
+        writer.finish().unwrap();
+
+        let image = Image::load_png(&indexed).unwrap();
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.pixels, vec![0xffff0000, 0xff0000ff]);
+
+        let deep = dir.join("sixteen.png");
+        let file = std::fs::File::create(&deep).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 1, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        let mut writer = encoder.write_header().unwrap();
+        // 16-bit big-endian: pure green at full depth.
+        writer.write_image_data(&[0, 0, 0xff, 0xff, 0, 0]).unwrap();
+        writer.finish().unwrap();
+
+        let image = Image::load_png(&deep).unwrap();
+        assert_eq!(image.pixels, vec![0xff00ff00]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_cover_cache_survives_a_resize() {
+        // One Image drawn at two sizes: the cached frame for the first size
+        // must not be pasted onto the second.
+        let image = Image::new(2, 2, vec![0xff102030, 0xff405060, 0xff708090, 0xffa0b0c0]);
+        let mut small = Canvas::new(2, 2);
+        image.draw_cover(&mut small);
+
+        let mut big = Canvas::new(4, 4);
+        image.draw_cover(&mut big);
+        let px =
+            |c: &Canvas, i: usize| u32::from_ne_bytes(c.data[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(px(&big, 0), 0xff102030);
+        assert_eq!(px(&big, 15), 0xffa0b0c0);
+
+        // And back again, so the cache is a cache and not a latch.
+        let mut small_again = Canvas::new(2, 2);
+        image.draw_cover(&mut small_again);
+        assert_eq!(small.data, small_again.data);
     }
 }

@@ -31,6 +31,7 @@
 //!   developer tools unless `WDM_GREETER_DEBUG` is set.
 
 mod bridge;
+mod config;
 
 // See wdm-gtk-greeter's crate root: gtk4-layer-shell interposes libwayland
 // symbols and only takes effect if it is loaded first, which is what declaring
@@ -145,8 +146,11 @@ pub(crate) const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::new().filter("WDM_GREETER_LOG")).init();
 
-    let theme = match theme_directory() {
-        Ok(theme) => theme,
+    // Config before theme: `--theme` outranks the file's `theme`, but both
+    // feed the same resolution, and a config error must be the only thing
+    // this process reports.
+    let (greeter_config, theme) = match configure() {
+        Ok(loaded) => loaded,
         Err(e) => {
             log::error!("{e}");
             return ExitCode::FAILURE;
@@ -163,7 +167,7 @@ fn main() -> ExitCode {
         let failure = failure.clone();
         let theme = theme.clone();
         move |app| {
-            if let Err(e) = activate(app, &theme, failure.clone()) {
+            if let Err(e) = activate(app, &theme, &greeter_config, failure.clone()) {
                 log::error!("{e}");
                 failure.set(1);
                 app.quit();
@@ -181,15 +185,31 @@ fn main() -> ExitCode {
     }
 }
 
-/// Resolve `--theme`, which is a name under [`THEME_ROOT`] or a path.
+/// Read `/etc/wdm/webkit-greeter.toml` and resolve the theme.
 ///
-/// Failing here rather than falling back to a built-in is deliberate: a
-/// misspelled theme that silently shows something else is a configuration bug
-/// nobody notices until they are looking at the wrong login screen.
-fn theme_directory() -> Result<PathBuf, String> {
-    let name = theme_argument(std::env::args().skip(1))?;
-    let name = name.unwrap_or_else(|| "default".to_owned());
-    resolve_theme(&name, Path::new(THEME_ROOT))
+/// The theme is `--theme`, or the file's `theme`, or "default" — a name under
+/// [`THEME_ROOT`] or a path. Failing on anything malformed rather than
+/// falling back to a built-in is deliberate: a misspelled theme that silently
+/// shows something else is a configuration bug nobody notices until they are
+/// looking at the wrong login screen.
+fn configure() -> Result<(config::Config, PathBuf), String> {
+    let greeter_config = config::load(Path::new(config::DEFAULT_PATH))?;
+
+    // A background image the page cannot load would fail silently inside the
+    // theme, which is exactly the class of error this file refuses to hide.
+    if let Some(config::Background::Image(path)) = &greeter_config.background
+        && !path.is_file()
+    {
+        return Err(format!(
+            "background {}: not a readable file",
+            path.display()
+        ));
+    }
+
+    let cli = theme_argument(std::env::args().skip(1))?;
+    let name = config::pick_theme(cli, &greeter_config);
+    let theme = resolve_theme(&name, Path::new(THEME_ROOT))?;
+    Ok((greeter_config, theme))
 }
 
 /// Pull `--theme` out of the argument list.
@@ -247,8 +267,19 @@ fn resolve_theme(name: &str, root: &Path) -> Result<PathBuf, String> {
 fn activate(
     app: &Application,
     theme: &Path,
+    greeter_config: &config::Config,
     failure: Rc<std::cell::Cell<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // WebKit maps GTK's dark preference to the page's `prefers-color-scheme`,
+    // so this is how `color-scheme` reaches a theme that only speaks CSS.
+    // Absent from the file means dark: the shipped themes are dark-first, and
+    // before this key existed dark is what they got.
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(!matches!(
+            greeter_config.color_scheme,
+            Some(config::ColorScheme::Light)
+        ));
+    }
     let display = gtk4::gdk::Display::default().ok_or("no display")?;
     let (link, model) = Link::connect(&display)?;
     log::info!(
@@ -262,7 +293,7 @@ fn activate(
     // is guaranteed to exist. See StartupError for why it is held there.
     let startup_error = Rc::new(StartupError::new(model.error.clone()));
 
-    let webview = build_webview(&model, theme)?;
+    let webview = build_webview(&model, theme, greeter_config)?;
     let window = build_window(app, &webview);
 
     let model: wdm_greeter_client::Shared = Rc::new(RefCell::new(model));
@@ -394,6 +425,42 @@ fn activate(
     Ok(())
 }
 
+/// The colour behind the page. See the call site in [`build_webview`].
+fn behind_page_color(greeter_config: &config::Config) -> gtk4::gdk::RGBA {
+    if let Some(config::Background::Color(color)) = &greeter_config.background
+        && let Some(rgba) = parse_hex_color(color)
+    {
+        return rgba;
+    }
+    match greeter_config.color_scheme {
+        // The values the two schemes' shipped stylesheets use for their page
+        // background, so a flash of it during load is not a flash of contrast.
+        Some(config::ColorScheme::Light) => gtk4::gdk::RGBA::new(0.91, 0.92, 0.94, 1.0),
+        _ => gtk4::gdk::RGBA::new(0.07, 0.07, 0.10, 1.0),
+    }
+}
+
+/// `#rrggbb` to RGBA. `None` only on a malformed string, which `config::load`
+/// already refused — kept as an Option so this stays a pure function of its
+/// argument rather than a second opinion about validation.
+fn parse_hex_color(color: &str) -> Option<gtk4::gdk::RGBA> {
+    let hex = color.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |range: std::ops::Range<usize>| {
+        u8::from_str_radix(&hex[range], 16)
+            .ok()
+            .map(|v| f32::from(v) / 255.0)
+    };
+    Some(gtk4::gdk::RGBA::new(
+        channel(0..2)?,
+        channel(2..4)?,
+        channel(4..6)?,
+        1.0,
+    ))
+}
+
 fn build_window(app: &Application, webview: &WebView) -> ApplicationWindow {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -412,13 +479,26 @@ fn build_window(app: &Application, webview: &WebView) -> ApplicationWindow {
     window
 }
 
-fn build_webview(model: &Model, theme: &Path) -> Result<WebView, Box<dyn std::error::Error>> {
+fn build_webview(
+    model: &Model,
+    theme: &Path,
+    greeter_config: &config::Config,
+) -> Result<WebView, Box<dyn std::error::Error>> {
     let content = webkit6::UserContentManager::new();
 
     // At document-start, so a theme's own top-level script can read wdm.users
     // instead of having to wait for a callback.
     content.add_script(&webkit6::UserScript::new(
         &bridge::api_script(model),
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+    // After the API script — scripts run in insertion order — so it decorates
+    // the `window.wdm` the API script just created.
+    content.add_script(&webkit6::UserScript::new(
+        &config::script(greeter_config),
         webkit6::UserContentInjectedFrames::TopFrame,
         webkit6::UserScriptInjectionTime::Start,
         &[],
@@ -473,8 +553,11 @@ fn build_webview(model: &Model, theme: &Path) -> Result<WebView, Box<dyn std::er
     settings.set_allow_universal_access_from_file_urls(false);
     webkit6::prelude::WebViewExt::set_settings(&webview, &settings);
 
-    // Nothing behind the page but the compositor's own background.
-    webview.set_background_color(&gtk4::gdk::RGBA::new(0.07, 0.07, 0.10, 1.0));
+    // What shows through a page that leaves its body transparent: the
+    // configured background colour, or a plain tone matching the scheme.
+    // An image background is the page's business — the URL is in
+    // `wdm.config.background` — because WebKit cannot paint one back here.
+    webview.set_background_color(&behind_page_color(greeter_config));
 
     // No context menu: right-clicking a login screen should not offer to
     // reload, inspect, or open anything.
@@ -825,6 +908,39 @@ mod tests {
 
     fn arch_theme_code() -> String {
         strip_comments(include_str!("../themes/arch/theme.js"))
+    }
+
+    #[test]
+    fn the_config_surface_is_pinned_on_all_three_ends() {
+        // Same shape as the API drift check below: the injected script, the
+        // default theme and themes.md all speak `wdm.config`, and renaming it
+        // in one place must fail the build rather than the login screen.
+        let script = config::script(&config::Config::default());
+        assert!(
+            script.contains("window.wdm.config"),
+            "the config script no longer sets wdm.config"
+        );
+        for field in ["color_scheme", "background"] {
+            assert!(
+                script.contains(&format!("\"{field}\"")),
+                "the config script lost wdm.config.{field}"
+            );
+        }
+        assert!(
+            theme_code().contains("wdm.config"),
+            "the default theme no longer reads wdm.config"
+        );
+        // The light scheme rides prefers-color-scheme rather than JS, so the
+        // stylesheet is the end to pin for color_scheme.
+        assert!(
+            include_str!("../themes/default/style.css").contains("prefers-color-scheme: light"),
+            "the default theme lost its light scheme"
+        );
+        let doc = include_str!("../../../docs/src/pages/themes.md");
+        assert!(
+            doc.contains("wdm.config"),
+            "themes.md no longer documents wdm.config"
+        );
     }
 
     /// How a theme's rules are held to account.

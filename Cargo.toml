@@ -33,6 +33,11 @@ wayland-protocols-wlr = "0.3"
 thiserror = "2"
 log = "0.4"
 
+# Every greeter reads its own /etc/wdm/<name>.toml; wdm reads wdm.toml. One
+# workspace version so the four parsers cannot drift apart.
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+
 # Shared by both toolkit greeters. GTK owns the Wayland connection, so they
 # bind wdm_greeter_v1 on GDK's rather than opening one of their own.
 # v4_10 gates gtk::Accessible, which webkit6 needs to declare its widget's

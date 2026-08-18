@@ -51,6 +51,31 @@ drop-in and is the authoritative statement of the rule.
 The command is never passed to a shell, so a config file cannot inject shell
 into a root process.
 
+### The greeters' own files
+
+How a greeter *looks* is not wdm's business, so it is not configured here.
+Each shipped greeter reads its own file in `/etc/wdm` — wdm spawns greeters
+with a cleared environment, so a file is the only channel to them besides
+`command`'s arguments:
+
+| Greeter | File | Keys |
+| --- | --- | --- |
+| `wdm-greeter` | `/etc/wdm/greeter.toml` | `color-scheme`, `background` |
+| `wdm-gtk-greeter` | `/etc/wdm/gtk-greeter.toml` | `color-scheme`, `background`, `css` |
+| `wdm-webkit-greeter` | `/etc/wdm/webkit-greeter.toml` | `theme`, `color-scheme`, `background` |
+| `wdm-plasma-greeter` | `/etc/wdm/plasma-greeter.ini` | `theme`, `colorScheme`, `background` |
+
+Every file is optional, and every file that exists but cannot be understood —
+an unknown key, a malformed value — is a startup error rather than a
+fallback, for the same reason a malformed `wdm.toml` is: continuing would
+silently ignore a deliberate choice. `color-scheme` is `"dark"` or `"light"`;
+`background` is a `#rrggbb` colour or an absolute path to an image
+(`wdm-greeter` decodes it itself and takes PNG only; the toolkit greeters
+take anything their toolkit loads); `theme`
+names a theme exactly as `--theme` does, and `--theme` in `command` outranks
+it. The packages install each file fully commented out, so the defaults are
+also the documentation.
+
 ## `[keyboard]`
 
 `rules`, `model`, `layout` (default `us`), `variant`, `options` — the usual xkb
