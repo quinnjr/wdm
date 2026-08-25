@@ -445,7 +445,11 @@ fn behind_page_color(greeter_config: &config::Config) -> gtk4::gdk::RGBA {
 /// argument rather than a second opinion about validation.
 fn parse_hex_color(color: &str) -> Option<gtk4::gdk::RGBA> {
     let hex = color.strip_prefix('#')?;
-    if hex.len() != 6 {
+    // Byte length, not char length: an in-range byte count that in fact
+    // encodes fewer chars (e.g. a two-byte UTF-8 char) means the slices below
+    // land mid-codepoint. Requiring every byte to be an ASCII hex digit rules
+    // that out before any slicing happens.
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let channel = |range: std::ops::Range<usize>| {
@@ -1264,6 +1268,7 @@ mod tests {
                     "refuses an empty first answer",
                     "never sends the buffered password to an echo-on prompt",
                     "does not retry on its own after a failure",
+                    "sends the session the user chose",
                 ] {
                     assert!(
                         source.contains(rule),
@@ -1298,6 +1303,32 @@ mod tests {
         }
     }
 
+    /// The hand-written themes: those covered by pattern-matching rather than
+    /// an executed suite.
+    ///
+    /// Shared by every grep-based check below, so filtering to this subset —
+    /// and panicking with the theme's name when a named arrow function is
+    /// missing — is written once instead of once per test.
+    fn grep_themes() -> impl Iterator<Item = Theme> {
+        shipped_themes()
+            .into_iter()
+            .filter(|theme| matches!(theme.coverage, Coverage::Grep))
+    }
+
+    /// The body of `const {name} = () => { ... };` inside `code`, for a
+    /// grep-based drift check that needs to look only inside one function.
+    ///
+    /// Panics naming `theme` (not `name`) when the function is missing,
+    /// because the caller already knows which function it asked for — what it
+    /// does not know without help is which theme's copy is missing it.
+    fn arrow_body<'a>(code: &'a str, theme: &str, name: &str) -> &'a str {
+        let after = code
+            .split_once(&format!("const {name} = "))
+            .unwrap_or_else(|| panic!("the {theme} theme has no {name}()"))
+            .1;
+        &after[..after.find("\n};").unwrap_or(after.len())]
+    }
+
     #[test]
     fn the_hand_written_themes_keep_the_guards_that_stop_a_lockout() {
         // These are the three behaviours that cost this project a locked
@@ -1314,10 +1345,7 @@ mod tests {
         //
         // Checked with comments stripped, so a theme cannot satisfy them with
         // the paragraph explaining the rule instead of the code applying it.
-        for theme in shipped_themes() {
-            if !matches!(theme.coverage, Coverage::Grep) {
-                continue;
-            }
+        for theme in grep_themes() {
             let name = theme.name;
             let code = &theme.code;
 
@@ -1344,11 +1372,7 @@ mod tests {
             //    every time the screen is left alone. The call must be reached
             //    from the submit handler, never from top level: `ready()` is
             //    what runs at load, and it must not contain it.
-            let ready = code
-                .split_once("const ready = ")
-                .unwrap_or_else(|| panic!("the {name} theme has no ready()"))
-                .1;
-            let ready_body = &ready[..ready.find("\n};").unwrap_or(ready.len())];
+            let ready_body = arrow_body(code, name, "ready");
             assert!(
                 !ready_body.contains("wdm.authenticate("),
                 "the {name} theme arms PAM from ready(), which runs at load — this is \
@@ -1378,21 +1402,35 @@ mod tests {
         // symptom is a choice that is never persisted, because it was never
         // sent: wdm records what it launches, and it launched the old one.
         //
+        // Two halves, because `selectPreferredSession` is now nested inside
+        // `ready()` — deleting the preselection call from ready() should fail
+        // this test just as surely as adding one to start() should:
+        //
+        // 1. ready() actually calls it. Without this half, deleting the
+        //    preselection entirely — nesting notwithstanding — would satisfy
+        //    the negative half below by leaving nothing in start() to find.
+        // 2. start() calls neither `selectPreferredSession(` — which, being
+        //    nested inside ready(), would be a ReferenceError at load if it
+        //    somehow appeared there — nor assigns the dropdown directly
+        //    (`el("session").value =`), which would silently reproduce the
+        //    same bug without going through the now-unreachable name.
+        //
         // Pattern-matched for the same reason as the lockout guards above. The
         // React theme's reducer is held to this by machine.test.js.
-        for theme in shipped_themes() {
-            if !matches!(theme.coverage, Coverage::Grep) {
-                continue;
-            }
+        for theme in grep_themes() {
             let name = theme.name;
-            let start = theme
-                .code
-                .split_once("const start = ")
-                .unwrap_or_else(|| panic!("the {name} theme has no start()"))
-                .1;
-            let start_body = &start[..start.find("\n};").unwrap_or(start.len())];
+            let ready_body = arrow_body(&theme.code, name, "ready");
             assert!(
-                !start_body.contains("selectPreferredSession("),
+                ready_body.contains("selectPreferredSession()"),
+                "the {name} theme no longer preselects the session from ready() — a \
+                 caller from start() would now be a ReferenceError, since the \
+                 function is nested inside ready()"
+            );
+
+            let start_body = arrow_body(&theme.code, name, "start");
+            assert!(
+                !start_body.contains("selectPreferredSession(")
+                    && !start_body.contains("el(\"session\").value ="),
                 "the {name} theme re-preselects the session from start(), discarding \
                  the one the user chose in the dropdown"
             );
@@ -1514,6 +1552,11 @@ mod tests {
         assert_eq!(parse_hex_color("#abc"), None);
         assert_eq!(parse_hex_color("#gggggg"), None);
         assert_eq!(parse_hex_color("no-hash"), None);
+        // Six *bytes* that are not six *chars*: "é" is two UTF-8 bytes, so
+        // hex.len() == 6 here even though there are only 5 characters, and
+        // slicing at a fixed byte offset used to panic on the char boundary
+        // instead of returning None.
+        assert_eq!(parse_hex_color("#aécde"), None);
     }
 
     #[test]

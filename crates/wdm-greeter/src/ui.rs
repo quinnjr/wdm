@@ -1016,8 +1016,8 @@ mod tests {
 
     #[test]
     fn a_png_background_loads_and_a_missing_one_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("wdm-greeter-ui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let path = dir.join("bg.png");
 
         // A 2x1 RGBA PNG: opaque red, half-transparent blue. The transparent
@@ -1044,7 +1044,6 @@ mod tests {
 
         let missing = Image::load_png(&dir.join("nope.png")).unwrap_err();
         assert!(missing.contains("nope.png"), "{missing}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1071,8 +1070,8 @@ mod tests {
         // transformations, so a colour-indexed PNG — what pngquant, optipng
         // and GIMP's indexed export all produce — arrived as ColorType::Indexed
         // and was refused, blaming the administrator's perfectly valid file.
-        let dir = std::env::temp_dir().join(format!("wdm-greeter-idx-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
 
         let indexed = dir.join("indexed.png");
         let file = std::fs::File::create(&indexed).unwrap();
@@ -1101,8 +1100,6 @@ mod tests {
 
         let image = Image::load_png(&deep).unwrap();
         assert_eq!(image.pixels, vec![0xff00ff00]);
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1130,14 +1127,11 @@ mod tests {
     fn a_corrupt_png_is_an_error_not_a_blank_wallpaper() {
         // An administrator's file that exists and is readable but cannot be
         // decoded is a startup error, never a silent fallback.
-        let dir = std::env::temp_dir().join(format!("wdm-greeter-corrupt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bg.png");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bg.png");
         std::fs::write(&path, b"not a png").unwrap();
 
         let err = Image::load_png(&path).unwrap_err();
         assert!(err.contains("bg.png"), "{err}");
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

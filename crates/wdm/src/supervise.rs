@@ -1372,7 +1372,7 @@ mod tests {
         // Once policy has given up, spawn() must not be talked back into
         // trying again — that would resurrect a greeter the backoff table
         // already decided to stop restarting.
-        let mut g = Greeter::new("/nonexistent/greeter", "nobody", "wayland-test", false).unwrap();
+        let mut g = greeter("/nonexistent/greeter");
 
         assert!(g.spawn().is_err());
         g.note_spawn_failure("no such file");

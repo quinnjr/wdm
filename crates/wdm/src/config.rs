@@ -760,6 +760,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_non_finite_scale() {
+        // toml 1.x accepts `nan`, `inf`, and `-inf` as float literals; none
+        // of them are a positive number, so `is_finite()` must catch what
+        // the sign check alone would not.
+        let nan: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = nan
+            "#,
+        )
+        .unwrap();
+        assert!(nan.validate().is_err());
+
+        let inf: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = inf
+            "#,
+        )
+        .unwrap();
+        assert!(inf.validate().is_err());
+
+        let neg_inf: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = -inf
+            "#,
+        )
+        .unwrap();
+        assert!(neg_inf.validate().is_err());
+    }
+
+    #[test]
     fn load_or_default_does_not_silently_swallow_a_permission_error() {
         // Only a NotFound read error falls back to defaults; any other read
         // failure (e.g. permission denied) must propagate as ConfigError::Read,

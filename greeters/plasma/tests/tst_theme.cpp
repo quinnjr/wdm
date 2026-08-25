@@ -6,8 +6,10 @@
 // shows something else is a configuration bug nobody notices until they are
 // looking at the wrong login screen.
 
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 #include <unistd.h>
@@ -240,5 +242,134 @@ TEST_CASE("a malformed argument list is refused rather than defaulted", "[theme]
         // Named, because the person reading this is looking at a login screen
         // that did not appear and needs to know which word was the problem.
         CHECK(parsed.error.find("--verbose") != std::string::npos);
+    }
+}
+
+// --------------------------------------------------------------------------
+// The shipped default theme: preselection runs once, not on submit
+// --------------------------------------------------------------------------
+//
+// The mirror of the bug fixed in the hand-written webkit themes (commit
+// 25e4876): selectPreferredSession() re-run from the submit path, after the
+// user has already changed the drop-down, silently replaces their choice with
+// last time's before onAuthenticationComplete reads sessionBox.currentValue to
+// launch it. The choice is never sent, so it is never recorded, and every
+// login relaunches the old session.
+//
+// Checked by reading the real Main.qml under themes/default rather than by
+// asserting behaviour some other test drives through a fake wdm — this is the
+// same "grep the shipped source" style tst_wdm.cpp already uses for the
+// authenticate()-only-from-submit() and onActivated-not-onCurrentIndexChanged
+// guards, and nothing else here currently checks the file's *content* except
+// qmllint, which only tells you the QML parses.
+
+namespace {
+
+/// Everything from `//` to the end of each line, removed — so a comment that
+/// happens to name the call under test (as the ones above and in Main.qml
+/// itself do) is never mistaken for the call.
+std::string stripLineComments(const std::string &source) {
+    std::ostringstream out;
+    std::istringstream lines(source);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::size_t comment = line.find("//");
+        out << (comment == std::string::npos ? line : line.substr(0, comment)) << '\n';
+    }
+    return out.str();
+}
+
+/// The body of the first `{ ... }` block that opens at or after `startNeedle`,
+/// found by counting braces rather than by any real QML parsing. Good enough
+/// here because neither body this test extracts contains a string literal with
+/// a brace in it — see the functions themselves in Main.qml.
+std::string extractBraceBody(const std::string &source, const std::string &startNeedle) {
+    const std::size_t needleAt = source.find(startNeedle);
+    if (needleAt == std::string::npos) {
+        FAIL("did not find '" << startNeedle << "' in the theme");
+    }
+    const std::size_t braceAt = source.find('{', needleAt);
+    if (braceAt == std::string::npos) {
+        FAIL("'" << startNeedle << "' has no opening brace");
+    }
+    int depth = 0;
+    std::size_t at = braceAt;
+    for (; at < source.size(); ++at) {
+        if (source[at] == '{') {
+            ++depth;
+        } else if (source[at] == '}') {
+            --depth;
+            if (depth == 0) {
+                break;
+            }
+        }
+    }
+    if (depth != 0) {
+        FAIL("'" << startNeedle << "' has no matching closing brace");
+    }
+    return source.substr(braceAt + 1, at - braceAt - 1);
+}
+
+/// Whether `body` assigns to `target` — `target = ...` — rather than merely
+/// reading it or comparing it (`target === ...`). onAuthenticationComplete
+/// legitimately *reads* sessionBox.currentValue to launch it; what it must
+/// never do is set it.
+bool assignsTo(const std::string &body, const std::string &target) {
+    std::size_t at = 0;
+    while ((at = body.find(target, at)) != std::string::npos) {
+        std::size_t after = at + target.size();
+        while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after]))) {
+            ++after;
+        }
+        if (after < body.size() && body[after] == '='
+            && (after + 1 >= body.size() || body[after + 1] != '=')) {
+            return true;
+        }
+        at = after;
+    }
+    return false;
+}
+
+std::string readThemeSource() {
+    std::ifstream file(WDM_DEFAULT_THEME_QML_PATH);
+    if (!file.is_open()) {
+        FAIL("cannot read " WDM_DEFAULT_THEME_QML_PATH);
+    }
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    return contents.str();
+}
+
+} // namespace
+
+TEST_CASE("the default theme preselects the session only outside the submit path",
+          "[theme]") {
+    const std::string theme = stripLineComments(readThemeSource());
+
+    // Where preselection belongs: once when the greeter first has something to
+    // show, and again whenever the user picks a different account, because a
+    // different account has a different history.
+    const std::string onCompleted = extractBraceBody(theme, "Component.onCompleted: {");
+    const std::string onUserChanged = extractBraceBody(theme, "onActivated: {");
+    CHECK(onCompleted.find("selectPreferredSession(") != std::string::npos);
+    CHECK(onUserChanged.find("selectPreferredSession(") != std::string::npos);
+
+    // Where it must never run again: the submit handler, and the completion
+    // handler that reads the drop-down to decide what to launch. Either one
+    // calling selectPreferredSession(), or assigning the drop-down directly,
+    // reproduces the webkit defect — the user's choice is overwritten before
+    // it is ever read.
+    const std::string submitBody = extractBraceBody(theme, "function submit() {");
+    const std::string onAuthComplete =
+        extractBraceBody(theme, "function onAuthenticationComplete(): void {");
+
+    for (const auto &[name, body] : {
+             std::pair{"submit()", submitBody},
+             std::pair{"onAuthenticationComplete()", onAuthComplete},
+         }) {
+        INFO("checking " << name);
+        CHECK(body.find("selectPreferredSession(") == std::string::npos);
+        CHECK(!assignsTo(body, "sessionBox.currentIndex"));
+        CHECK(!assignsTo(body, "sessionBox.currentValue"));
     }
 }

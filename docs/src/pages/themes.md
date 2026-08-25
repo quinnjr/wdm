@@ -269,6 +269,12 @@ those would be fighting every theme that disagreed. So a theme must:
   and assigns only an id it has found in `wdm.sessions`: a recorded id can name
   a session that has since been uninstalled, and setting a `<select>` to a value
   no `<option>` carries leaves the dropdown showing nothing at all.
+
+  Preselect only at load and when the user drop-down changes — never from the
+  submit path. Once the form is on screen the dropdown holds what the user
+  chose, and `start_session` should send exactly that. A theme that re-ran the
+  preselection on submit silently launched last time's session instead, and
+  because wdm records what it launches, the user's choice never persisted.
 - **Refuse an empty first answer.** Enter on an empty field is not a login
   attempt and must not cost one: submitting nothing runs the whole PAM stack
   against an empty password, fails, and is charged to the user by

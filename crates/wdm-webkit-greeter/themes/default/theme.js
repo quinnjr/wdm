@@ -31,24 +31,6 @@ for (const session of wdm.sessions) {
   el("session").add(new Option(session.name, session.id));
 }
 
-// The session to preselect: the user's history, then the machine's configured
-// default, then whatever is first. That chain is Model::preferred_session in
-// wdm-greeter-client, which is the reference implementation the other greeters
-// share; this is the same chain written in the theme, because wdm reports the
-// facts and choosing between them is policy. Each candidate is checked against
-// the installed sessions: history can name one that was uninstalled since, and
-// assigning a value no <option> carries leaves the dropdown showing nothing at
-// all. Falling through to the first session is that same guarantee — like
-// preferred_session's unwrap_or(0), never leave the dropdown blank.
-const selectPreferredSession = () => {
-  const user = wdm.users.find((u) => u.name === el("user").value);
-  const installed = (id) => wdm.sessions.some((s) => s.id === id);
-  const wanted = [user && user.last_session, wdm.default_session].find(
-    (id) => id && installed(id),
-  );
-  el("session").value = wanted || wdm.sessions[0].id;
-};
-
 // Two elements, not one, and the split is PAM's own severity: whatever PAM
 // called an error goes in "error", whatever it called info goes in "message".
 // The verdict — "Authentication failure" — arrives through the same
@@ -208,6 +190,29 @@ const usable = () => {
 // conversation cannot be ended without failing it. A login screen that armed
 // PAM on its own used to lock out the first user in the list, unattended.
 const ready = () => {
+  // The session to preselect: the user's history, then the machine's
+  // configured default, then whatever is first. That chain is
+  // Model::preferred_session in wdm-greeter-client, which is the reference
+  // implementation the other greeters share; this is the same chain written
+  // in the theme, because wdm reports the facts and choosing between them is
+  // policy. Each candidate is checked against the installed sessions: history
+  // can name one that was uninstalled since, and assigning a value no
+  // <option> carries leaves the dropdown showing nothing at all. Falling
+  // through to the first session is that same guarantee — like
+  // preferred_session's unwrap_or(0), never leave the dropdown blank.
+  //
+  // Nested here rather than module scope: this is the only place it may be
+  // called from, and a call from start() below must be a ReferenceError, not
+  // a silent re-preselection over what the user chose in the dropdown.
+  const selectPreferredSession = () => {
+    const user = wdm.users.find((u) => u.name === el("user").value);
+    const installed = (id) => wdm.sessions.some((s) => s.id === id);
+    const wanted = [user && user.last_session, wdm.default_session].find(
+      (id) => id && installed(id),
+    );
+    el("session").value = wanted || wdm.sessions[0].id;
+  };
+
   if (!usable()) {
     return;
   }
@@ -228,9 +233,10 @@ const start = () => {
   replaceText("message", "");
   replaceText("error", "");
   el("prompt").textContent = "Waiting…";
-  // Not selectPreferredSession(): the dropdown holds what the user chose,
-  // and authentication_complete starts whatever it holds. Re-preselecting
-  // here silently sent last time's session instead.
+  // Not selectPreferredSession(): it is nested inside ready() and does not
+  // exist at this scope — calling it here would be a ReferenceError, not a
+  // silent re-preselection. The dropdown holds what the user chose, and
+  // authentication_complete starts whatever it holds.
   wdm.authenticate(el("user").value);
 };
 

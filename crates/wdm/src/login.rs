@@ -2252,18 +2252,7 @@ mod tests {
 
         let second = h.bind_greeter(2);
 
-        let error = second
-            .events()
-            .iter()
-            .find(|m| m.object == wire::DISPLAY && m.opcode == wire::DISPLAY_ERROR)
-            .expect("the second bind was accepted");
-        let mut args = error.args();
-        assert_eq!(args.uint(), wire::GREETER, "the error named another object");
-        assert_eq!(
-            args.uint(),
-            wdm_greeter_v1::Error::AlreadyBound as u32,
-            "refused with the wrong error code"
-        );
+        expect_protocol_error(&second, wdm_greeter_v1::Error::AlreadyBound);
         assert!(
             second.greeter_events().is_empty(),
             "a refused bind was still sent the enumerate phase"
@@ -2427,6 +2416,23 @@ mod tests {
         // Force the too_soon gate so the call defers rather than reaching
         // AuthHandle::start, which would spawn a real PAM helper process.
         h.state.login.last_attempt = Some(Instant::now());
+
+        // Populate the state that `reset()` clears but the rate-limit path
+        // does not touch, so a stub that skipped the reset (e.g. a
+        // `phase = Idle` in the `Authenticated` arm) would still be caught.
+        h.state.login.pending_prompt = Some(7);
+        h.state.login.chosen = Some((
+            crate::sessions::Session {
+                id: "sway.desktop".to_owned(),
+                name: "Sway".to_owned(),
+                exec: "sway".to_owned(),
+                session_type: crate::sessions::SessionType::Wayland,
+                path: PathBuf::from("/nonexistent/sway.desktop"),
+            },
+            Vec::new(),
+        ));
+        let generation_before = h.state.login.generation;
+
         h.state.create_session(&resource, "testuser".to_owned());
         h.dispatch();
         client.pump();
@@ -2435,6 +2441,18 @@ mod tests {
             h.state.login.phase,
             Phase::Authenticated,
             "create_session after auth_ok left the conversation as it was"
+        );
+        assert_ne!(
+            h.state.login.generation, generation_before,
+            "create_session after auth_ok did not start a fresh generation"
+        );
+        assert!(
+            h.state.login.pending_prompt.is_none(),
+            "create_session after auth_ok left a stale prompt outstanding"
+        );
+        assert!(
+            h.state.login.chosen.is_none(),
+            "create_session after auth_ok left the previous account's choice in place"
         );
         assert!(
             !client

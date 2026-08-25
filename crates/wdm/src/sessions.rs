@@ -497,11 +497,7 @@ mod tests {
             "[Desktop Entry]\nName=Broken\nExec=%f\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("good.desktop"),
-            "[Desktop Entry]\nName=Good\nExec=river\n",
-        )
-        .unwrap();
+        write_entry(dir.path(), "good.desktop", "Good");
         let found = scan_dir(dir.path(), SessionType::Wayland, &[]);
         assert_eq!(found.len(), 1, "found: {found:?}");
         assert_eq!(found[0].name, "Good");
@@ -518,11 +514,7 @@ mod tests {
             "Name=Broken\nExec=broken\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("good.desktop"),
-            "[Desktop Entry]\nName=Good\nExec=river\n",
-        )
-        .unwrap();
+        write_entry(dir.path(), "good.desktop", "Good");
         let found = scan_dir(dir.path(), SessionType::Wayland, &[]);
         assert_eq!(found.len(), 1, "found: {found:?}");
         assert_eq!(found[0].name, "Good");

@@ -186,6 +186,41 @@ describe("the built bundle", () => {
   });
 });
 
+describe("choosing a session in the running bundle", () => {
+  it("starts the session the user picked, not the preselected one", async () => {
+    // stubApi's one user has last_session "sway", so the dropdown starts
+    // there; picking "hyprland" instead is what tells this apart from a
+    // regression that re-sends the preselection.
+    const api = stubApi();
+    const { dom, doc } = await mount(api);
+
+    const setValue = (el, value) => {
+      const proto = Object.getPrototypeOf(el);
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+      el.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+    };
+
+    const sessionSelect = doc.querySelectorAll("select")[1];
+    expect(sessionSelect.value).toBe("sway");
+    setValue(sessionSelect, "hyprland");
+
+    setValue(doc.querySelector("input"), "hunter2");
+    doc.querySelector('button[type="submit"]').click();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    dom.window.show_prompt("Password:", "password");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    api.is_authenticated = true;
+    dom.window.authentication_complete();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(api.calls.at(-1)).toEqual(["start_session", "hyprland"]);
+
+    dom.window.close();
+  });
+});
+
 describe("the built stylesheet", () => {
   const css = () => readFileSync(join(theme, "vendor/app.css"), "utf8");
 

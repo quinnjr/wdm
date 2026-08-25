@@ -113,11 +113,15 @@ describe("the rules that stop a lockout", () => {
     expect(waiting.state.phase).toBe("waiting");
     expect(kinds(waiting.effects)).toEqual(["authenticate"]);
 
+    // Snapshotted rather than compared to itself: a reducer that quietly
+    // recomputed `buffered` from the new answer would still return the same
+    // object reference here and pass a same-reference check.
+    const waitingSnapshot = structuredClone(waiting.state);
     const resubmitWhileWaiting = reduce(waiting.state, {
       type: "submit",
-      answer: "hunter2",
+      answer: "different",
     });
-    expect(resubmitWhileWaiting.state).toEqual(waiting.state);
+    expect(resubmitWhileWaiting.state).toEqual(waitingSnapshot);
     expect(resubmitWhileWaiting.effects).toEqual([]);
 
     const checking = reduce(waiting.state, {
@@ -127,11 +131,12 @@ describe("the rules that stop a lockout", () => {
     });
     expect(checking.state.phase).toBe("checking");
 
+    const checkingSnapshot = structuredClone(checking.state);
     const resubmitWhileChecking = reduce(checking.state, {
       type: "submit",
-      answer: "hunter2",
+      answer: "different",
     });
-    expect(resubmitWhileChecking.state).toEqual(checking.state);
+    expect(resubmitWhileChecking.state).toEqual(checkingSnapshot);
     expect(resubmitWhileChecking.effects).toEqual([]);
   });
 
@@ -272,9 +277,10 @@ describe("session preselection", () => {
 
   it("re-runs when the user changes", () => {
     const { state } = run(boot(), [
-      { type: "selectUser", username: "ada" },
+      { type: "selectUser", username: "bob" },
     ]);
-    expect(state.sessionId).toBe("sway");
+    // Bob has no history, so this falls back to the configured default.
+    expect(state.sessionId).toBe("hyprland");
   });
 
   it("cancels the conversation when the user changes", () => {
@@ -330,8 +336,11 @@ describe("callbacks arriving twice or not at all", () => {
 
 describe("the happy path", () => {
   it("authenticates, answers, and starts the selected session", () => {
+    // ada's own history preselects "sway" — picking "hyprland" instead is
+    // what tells this test apart from one that merely re-sent the
+    // preselection.
     const { state, effects } = run(boot(), [
-      { type: "selectSession", sessionId: "sway" },
+      { type: "selectSession", sessionId: "hyprland" },
       { type: "submit", answer: "hunter2" },
       { type: "prompt", text: "Password:", secret: true },
       { type: "complete", authenticated: true, linkDead: false },
@@ -339,9 +348,27 @@ describe("the happy path", () => {
     expect(effects).toEqual([
       { type: "authenticate", username: "ada" },
       { type: "respond", answer: "hunter2" },
-      { type: "startSession", sessionId: "sway" },
+      { type: "startSession", sessionId: "hyprland" },
     ]);
     expect(state.phase).toBe("starting");
     expect(state.buffered).toBeNull();
+  });
+
+  // The exact title below is pinned by a Rust test in src/main.rs — do not
+  // reword it.
+  it("sends the session the user chose", () => {
+    // ada's history preselects "sway"; choosing "hyprland" is what proves the
+    // effect carries the user's pick rather than the preselection recomputed
+    // from `state.username`.
+    const { effects } = run(boot(), [
+      { type: "selectSession", sessionId: "hyprland" },
+      { type: "submit", answer: "hunter2" },
+      { type: "prompt", text: "Password:", secret: true },
+      { type: "complete", authenticated: true, linkDead: false },
+    ]);
+    expect(effects).toContainEqual({
+      type: "startSession",
+      sessionId: "hyprland",
+    });
   });
 });
