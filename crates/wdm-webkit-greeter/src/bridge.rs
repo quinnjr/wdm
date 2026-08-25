@@ -2000,4 +2000,49 @@ mod tests {
         assert!(script.contains("\\\";window.evil=1;//"), "{script}");
         assert!(!script.contains("\"\";window.evil"), "{script}");
     }
+    #[test]
+    // A missing guard here is silence, not an error: without it `_post` would
+    // still fire on an empty username or a stray `respond` with no prompt
+    // pending, and the theme would sit waiting for a callback that PAM never
+    // sends. The guard is what turns that into a thrown exception instead.
+    fn authenticate_and_respond_refuse_to_post_nothing() {
+        let script = api_script(&Model::default());
+        assert!(
+            script.contains("wdm.authenticate needs a username"),
+            "{script}"
+        );
+        assert!(
+            script.contains("wdm.respond with no prompt pending"),
+            "{script}"
+        );
+        let find = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("no {needle} in {script}"))
+        };
+        let authenticate_guarded = find("wdm.authenticate needs a username");
+        let authenticate_posted = find("'authenticate'");
+        let respond_guarded = find("wdm.respond with no prompt pending");
+        let respond_posted = find("'respond'");
+        assert!(
+            authenticate_guarded < authenticate_posted,
+            "nothing is posted unguarded: {script}"
+        );
+        assert!(
+            respond_guarded < respond_posted,
+            "nothing is posted unguarded: {script}"
+        );
+    }
+
+    #[test]
+    // Valid JSON of the wrong shape is a different serde path from a syntax
+    // error, and this is the untrusted boundary the module doc names: a
+    // scalar, an object, or an array with a non-string element must fail
+    // `from_str::<Vec<String>>` and come back `None`, not panic or coerce.
+    fn rejects_the_wrong_json_shape() {
+        assert_eq!(parse("[]"), None);
+        assert_eq!(parse("123"), None);
+        assert_eq!(parse(r#"{"verb":"cancel"}"#), None);
+        assert_eq!(parse(r#"["respond", 5]"#), None);
+    }
 }

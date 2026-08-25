@@ -21,6 +21,9 @@ wayland-protocols-wlr = { workspace = true, features = ["client"] }
 wdm-protocol = { workspace = true, features = ["client"] }
 xkbcommon = "0.9.0"
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 # See crates/wdm/Cargo.toml for why the packaging lives in the manifests.
 # The greeters deliberately do not depend on wdm: wdm depends on one of them,
 # and naming wdm here would make the pair circular.

@@ -366,6 +366,15 @@ if(BUILD_TESTING AND Catch2_FOUND)
     add_executable(tst_theme tests/tst_theme.cpp)
     target_compile_options(tst_theme PRIVATE ${WDM_PLASMA_WARNINGS})
     target_link_libraries(tst_theme PRIVATE wdm-plasma-core Catch2::Catch2WithMain)
+    # A source-text guard over the shipped default theme's Main.qml, on the
+    # same model as tst_wdm's WDM_DEFAULT_THEME_QML_PATH below: a path rather
+    # than a guess from the test binary's own location, so a tree that has
+    # moved fails loudly instead of quietly finding nothing to check. It is a
+    # plain string check with no Qt in it, which is why it lives here rather
+    # than in tst_wdm — tst_theme is the Qt-free half, and this test needs no
+    # more than a file on disk.
+    target_compile_definitions(tst_theme PRIVATE
+        WDM_DEFAULT_THEME_QML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/themes/default/Main.qml")
     catch_discover_tests(tst_theme)
 
     add_executable(tst_settings tests/tst_settings.cpp)

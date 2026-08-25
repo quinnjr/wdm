@@ -111,19 +111,6 @@ for (const session of wdm.sessions) {
   el("session").add(new Option(session.name, session.id));
 }
 
-// History → the machine's configured default → whatever is first, each checked
-// against the sessions actually installed: a recorded id can name one that has
-// been uninstalled since, and assigning a value no <option> carries leaves the
-// dropdown blank.
-const selectPreferredSession = () => {
-  const user = wdm.users.find((u) => u.name === el("user").value);
-  const installed = (id) => wdm.sessions.some((s) => s.id === id);
-  const wanted = [user && user.last_session, wdm.default_session].find(
-    (id) => id && installed(id),
-  );
-  el("session").value = wanted || wdm.sessions[0].id;
-};
-
 const replaceText = (id, text) => {
   const node = el(id);
   node.replaceChildren();
@@ -222,6 +209,23 @@ const usable = () => {
 // that armed PAM on its own used to lock out the first user in the list,
 // unattended.
 const ready = () => {
+  // History → the machine's configured default → whatever is first, each
+  // checked against the sessions actually installed: a recorded id can name
+  // one that has been uninstalled since, and assigning a value no <option>
+  // carries leaves the dropdown blank.
+  //
+  // Nested here rather than module scope: this is the only place it may be
+  // called from, and a call from start() below must be a ReferenceError, not
+  // a silent re-preselection over what the user chose in the dropdown.
+  const selectPreferredSession = () => {
+    const user = wdm.users.find((u) => u.name === el("user").value);
+    const installed = (id) => wdm.sessions.some((s) => s.id === id);
+    const wanted = [user && user.last_session, wdm.default_session].find(
+      (id) => id && installed(id),
+    );
+    el("session").value = wanted || wdm.sessions[0].id;
+  };
+
   if (!usable()) {
     return;
   }
@@ -242,7 +246,10 @@ const start = () => {
   replaceText("message", "");
   replaceText("error", "");
   el("prompt").textContent = "Waiting…";
-  selectPreferredSession();
+  // Not selectPreferredSession(): it is nested inside ready() and does not
+  // exist at this scope — calling it here would be a ReferenceError, not a
+  // silent re-preselection. The dropdown holds what the user chose, and
+  // authentication_complete starts whatever it holds.
   wdm.authenticate(el("user").value);
 };
 

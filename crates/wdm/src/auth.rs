@@ -1695,4 +1695,87 @@ mod tests {
             "the helper inherited blocked signals: SigBlk {mask:016x}"
         );
     }
+
+    #[test]
+    fn an_undecodable_message_from_the_helper_fails_the_attempt_rather_than_hangs() {
+        // Msg::decode returning None used to just `break` the reader loop with
+        // no verdict recorded, which `pump` reads as BeforeVerdict — a failure
+        // — but only once the reader actually gets there. This drives it end to
+        // end so a regression that instead falls into a silent hang (e.g. a
+        // `continue` in place of the `break`) shows up as `next` timing out
+        // rather than as something only inspection would catch.
+        let (ours, helper) = fake_helper();
+        let (events_tx, events_rx) = calloop::channel::channel();
+        let mut events = EventStream::new(events_rx);
+
+        let _handle = AuthHandle::adopt(ours, None, "testuser", events_tx);
+
+        // Not a valid tag byte for any Msg variant.
+        helper.send(&[0xff, 0x00, 0x01, 0x02]).unwrap();
+
+        let AuthEvent::Failed(reason) = events.next("a failure") else {
+            panic!("an undecodable message must fail the attempt, not hang");
+        };
+        assert!(reason.contains("helper"), "{reason}");
+    }
+
+    #[test]
+    fn os_to_string_drops_non_utf8_rather_than_corrupting_it() {
+        // A PAM environment entry with invalid UTF-8 must be dropped, not
+        // lossily reencoded into something that no longer matches what the
+        // module actually set.
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f]);
+        assert_eq!(
+            os_to_string(invalid),
+            None,
+            "non-UTF-8 bytes were silently reencoded instead of dropped"
+        );
+
+        assert_eq!(os_to_string(OsStr::new("valid")), Some("valid".to_owned()));
+    }
+
+    #[test]
+    fn a_wdm_direction_message_from_the_helper_is_ignored() {
+        // Response is wdm's own direction on the wire; a helper sending one is
+        // confused or hostile. It must be silently dropped rather than emitting
+        // an event or killing the reader loop, and the socket must still work
+        // for a legitimate message that follows.
+        let (ours, helper) = fake_helper();
+        let (events_tx, events_rx) = calloop::channel::channel();
+        let mut events = EventStream::new(events_rx);
+
+        let _handle = AuthHandle::adopt(ours, None, "testuser", events_tx);
+
+        helper
+            .send(
+                &Msg::Response {
+                    id: 1,
+                    secret: "hunter2".to_owned(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        assert!(
+            events.is_quiet(),
+            "a wdm-direction message from the helper produced an event"
+        );
+
+        // The reader is still alive and forwards a legitimate message normally.
+        helper
+            .send(
+                &Msg::Prompt {
+                    id: 9,
+                    text: "Password: ".to_owned(),
+                    style: PromptStyle::Secret,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let AuthEvent::Prompt { id, .. } = events.next("a prompt") else {
+            panic!("a well-formed message after the ignored one must still arrive");
+        };
+        assert_eq!(id, 9);
+    }
 }

@@ -652,4 +652,25 @@ mod tests {
             assert!(!user.name.is_empty());
         }
     }
+    #[test]
+    fn login_defs_falls_back_when_a_value_overflows_u32() {
+        // A numeric-looking value that does not fit u32 must fall back like
+        // garbage text does, not panic and not wrap.
+        assert_eq!(
+            UidRange::parse_login_defs("UID_MIN 99999999999\n").min,
+            FALLBACK_UID_MIN
+        );
+    }
+
+    #[test]
+    fn save_reports_an_error_when_the_parent_cannot_be_created() {
+        // create_dir_all fails when a path component is a regular file, not a
+        // directory; save() must surface that as an error, not panic.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let store = LastSessions::default();
+        assert!(store.save(&blocker.join("last-session")).is_err());
+    }
 }

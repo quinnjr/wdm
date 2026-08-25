@@ -769,6 +769,36 @@ TEST_CASE("a dispatch failure latches the link dead", "[link]") {
         CHECK(!harness.link->respond(1, "hunter2"));
         harness.link->createSession("alice");
         harness.link->startSession("plasma.desktop");
+        harness.link->cancel();
         CHECK(harness.link->dead());
+        CHECK(harness.recorder.linkDeads == 1);
     }
+}
+
+TEST_CASE("the compositor hanging up mid-roundtrip is reported, not hung on", "[link]") {
+    // "Accepts the connection" is the socketpair FakeWdm's constructor already
+    // set up — a wl_client exists on the server thread from the moment the fd
+    // was handed over. Hanging it up before connect() is ever called leaves
+    // exactly the shape the description above means: the connection was
+    // accepted, and nothing ever answers the registry roundtrip. connect()'s
+    // first wl_display_sync has to notice the hangup rather than the deadline —
+    // this must resolve well inside kEnumerateTimeoutMs, or the test would be
+    // proving the deadline works and not this.
+    Harness harness(2);
+    harness.withOrdinaryEnumerate();
+    harness.display = wl_display_connect_to_fd(harness.server.takeClientFd());
+    REQUIRE(harness.display != nullptr);
+    harness.link = std::make_unique<Link>(harness.display, &harness.recorder);
+
+    harness.server.hangUp();
+
+    std::string error;
+    const bool ok = harness.link->connect(&error);
+
+    // A bare false is not enough here: connect() also returns false when
+    // wdm_greeter_v1 is simply not advertised, and a greeter that showed that
+    // sentence for a broken connection would send the user chasing a
+    // misconfigured compositor that was never the problem.
+    CHECK(!ok);
+    CHECK(error.find("lost the connection to the compositor") != std::string::npos);
 }

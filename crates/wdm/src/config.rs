@@ -685,4 +685,149 @@ mod tests {
         // silently ignored, since the user believed they configured something.
         assert!(toml::from_str::<Config>("vtt = 7").is_err());
     }
+
+    #[test]
+    fn rejects_vt_zero() {
+        // Off-by-one / unvalidated-range bug: vt 0 does not exist.
+        let c: Config = toml::from_str("vt = 0").unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_greeter_command() {
+        // Whitespace-only string treated as present: `.trim().is_empty()` must
+        // actually be exercised, not just non-empty checked.
+        let c: Config = toml::from_str(
+            r#"
+            [greeter]
+            command = "   "
+            user = "wdm"
+            "#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_greeter_user() {
+        // Empty string bypassing the "not root" check but still invalid.
+        let c: Config = toml::from_str(
+            r#"
+            [greeter]
+            command = "/bin/true"
+            user = ""
+            "#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_connector_name() {
+        // Whitespace-only connector name treated as present.
+        let c: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "  "
+            "#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_positive_scale() {
+        // Zero and negative scale must be rejected, not just non-finite.
+        let zero: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = 0
+            "#,
+        )
+        .unwrap();
+        assert!(zero.validate().is_err());
+
+        let negative: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = -1.5
+            "#,
+        )
+        .unwrap();
+        assert!(negative.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_finite_scale() {
+        // toml 1.x accepts `nan`, `inf`, and `-inf` as float literals; none
+        // of them are a positive number, so `is_finite()` must catch what
+        // the sign check alone would not.
+        let nan: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = nan
+            "#,
+        )
+        .unwrap();
+        assert!(nan.validate().is_err());
+
+        let inf: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = inf
+            "#,
+        )
+        .unwrap();
+        assert!(inf.validate().is_err());
+
+        let neg_inf: Config = toml::from_str(
+            r#"
+            [[output]]
+            connector = "DP-1"
+            scale = -inf
+            "#,
+        )
+        .unwrap();
+        assert!(neg_inf.validate().is_err());
+    }
+
+    #[test]
+    fn load_or_default_does_not_silently_swallow_a_permission_error() {
+        // Only a NotFound read error falls back to defaults; any other read
+        // failure (e.g. permission denied) must propagate as ConfigError::Read,
+        // not be treated the same as "no config file present".
+        if unsafe { libc::geteuid() } == 0 {
+            // Root ignores mode bits, so this test cannot exercise the guard.
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wdm.toml");
+        std::fs::write(&path, "vt = 7").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        let result = Config::load_or_default(&path);
+        assert!(matches!(result, Err(ConfigError::Read { .. })));
+
+        // Restore permissions so the tempdir can clean itself up.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+    }
+
+    #[test]
+    fn load_reports_malformed_toml_as_a_parse_error() {
+        // Syntactically invalid TOML must surface as ConfigError::Parse, not
+        // be swallowed or misreported as ConfigError::Read/Invalid.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wdm.toml");
+        std::fs::write(&path, "vt = [this is not valid toml").unwrap();
+
+        let result = Config::load(&path);
+        assert!(matches!(result, Err(ConfigError::Parse { .. })));
+    }
 }

@@ -359,6 +359,12 @@ entry, and check each candidate against the installed sessions with `indexOf`: a
 recorded id can name a session that has been uninstalled since, and a ComboBox
 pointed at an id no row carries shows nothing at all.
 
+Do this at `Component.onCompleted` and when the user ComboBox changes — never
+from the submit handler or from `onAuthenticationComplete`. By then the session
+ComboBox holds what the user chose, and `startSession` should send exactly
+that; re-running the preselection there silently launches last time's session
+and, since wdm records what it launches, the user's choice never persists.
+
 ### Not retry on its own
 
 After a failure, show the verdict and wait for a keypress. Restarting
