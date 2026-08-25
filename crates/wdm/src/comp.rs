@@ -493,7 +493,7 @@ impl Wdm {
                         // coordinates; this API takes physical. They only agree
                         // at scale 1, which is why the nested backend never
                         // showed this.
-                        to_physical(offset, scale),
+                        to_physical(popup_origin(offset, popup.geometry().loc), scale),
                         scale,
                         1.0,
                         Kind::Unspecified,
@@ -791,6 +791,24 @@ impl CompositorHandler for Wdm {
 /// one.
 fn to_physical(offset: Point<i32, Logical>, scale: f64) -> Point<i32, Physical> {
     offset.to_f64().to_physical(scale).to_i32_round()
+}
+
+/// Where a popup's `wl_surface` starts, in its parent's coordinate space.
+///
+/// `PopupManager` hands out the position of the popup's *geometry* — the
+/// window proper, which is what the positioner placed. The surface can start
+/// above and left of that: GTK4 popovers draw their shadow inside the surface,
+/// so `xdg_surface.set_window_geometry` puts the geometry a margin in from the
+/// buffer's corner. Drawing the buffer at the geometry's position shifts the
+/// visible menu down-right by that margin, and hit-testing at it delivers
+/// clicks to the wrong item. Both [`Wdm::elements`] and the pointer's
+/// `focus_under` go through here so they cannot disagree about where a popup
+/// is, which is what `smithay::desktop::LayerSurface` does for its own popups.
+pub fn popup_origin(
+    location: Point<i32, Logical>,
+    geometry: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    location - geometry
 }
 
 /// The rectangle a popup is unconstrained against, in its *parent surface's*
@@ -1341,6 +1359,26 @@ mod tests {
         let single = to_physical(offset, 1.0);
         let double = to_physical(offset, 2.0);
         assert!(double.x > single.x && double.y > single.y);
+    }
+
+    #[test]
+    fn a_popup_with_a_shadow_margin_starts_above_and_left_of_its_geometry() {
+        // A GTK4 popover positioned at (400, 300) with a 12px shadow inside the
+        // surface reports its geometry at (12, 12) within the buffer. The
+        // buffer's top-left corner is therefore at (388, 288): drawing or
+        // hit-testing it at (400, 300) is off by the whole margin.
+        assert_eq!(
+            popup_origin(Point::from((400, 300)), Point::from((12, 12))),
+            Point::from((388, 288))
+        );
+    }
+
+    #[test]
+    fn a_popup_without_a_margin_starts_at_its_geometry() {
+        assert_eq!(
+            popup_origin(Point::from((400, 300)), Point::from((0, 0))),
+            Point::from((400, 300))
+        );
     }
 
     #[test]
