@@ -5,6 +5,41 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-08-25
+
+The session you pick on the WebKit greeter's login screen is the one that
+launches — and, from then on, the one it preselects for you.
+
+### Fixed
+
+- The WebKit greeter's `default` and `arch` themes re-ran their session
+  preselection from the submit handler, after the user had already chosen a
+  session in the dropdown. `authentication_complete` then read the dropdown
+  back and launched the preselected session — the user's history, or the
+  configured default — instead of the chosen one. Because wdm records what it
+  launches, the choice was never persisted either, so every login relaunched
+  the previous session. Preselection now runs only at load and on user change;
+  it is defined inside `ready()`, so a call from the submit path is a
+  `ReferenceError` rather than a silent regression, and a guard test in the
+  greeter refuses a theme that assigns the dropdown from `start()`. The React
+  theme was already correct and is now tested for it; the Plasma theme gains
+  the same guard.
+- `wdm-webkit-greeter` no longer panics in `parse_hex_color` on a six-byte,
+  non-ASCII colour string. Unreachable from the config file, which validates
+  first, but the function itself now refuses it.
+
+### Added
+
+- Thirty-three negative tests from a coverage audit. The greeter-facing phase
+  checks in wdm — `AuthInProgress`, `NoAuth`, `StalePrompt`, `InvalidSession`
+  and `InvalidEnv` — each have a failing-case test for the first time, as do an
+  undecodable message from the PAM helper, NUL bytes in a home directory or
+  username, an out-of-range prompt style on the wire, every `Config::validate`
+  guard, and the Plasma `Link` being hung up on mid-roundtrip. None found a
+  live defect.
+- The theme documentation for the WebKit and Plasma greeters now says *when*
+  preselection may run, alongside the existing rule for `authenticate()`.
+
 ## [0.10.0] — 2026-08-18
 
 Every greeter is now configurable without recompiling or editing a theme:
@@ -694,7 +729,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/quinnjr/wdm/releases/tag/v0.10.1
 [0.10.0]: https://github.com/quinnjr/wdm/releases/tag/v0.10.0
 [0.9.0]: https://github.com/quinnjr/wdm/releases/tag/v0.9.0
 [0.8.0]: https://github.com/quinnjr/wdm/releases/tag/v0.8.0
