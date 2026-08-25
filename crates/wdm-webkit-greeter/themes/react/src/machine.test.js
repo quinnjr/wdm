@@ -106,6 +106,35 @@ describe("the rules that stop a lockout", () => {
     ]);
   });
 
+  it("ignores a second submit while an attempt is already outstanding", () => {
+    // wdm refuses a second create_session while one is live, and re-arming
+    // here is the loop that locked an account out in 0.4.0.
+    const waiting = reduce(boot(), { type: "submit", answer: "hunter2" });
+    expect(waiting.state.phase).toBe("waiting");
+    expect(kinds(waiting.effects)).toEqual(["authenticate"]);
+
+    const resubmitWhileWaiting = reduce(waiting.state, {
+      type: "submit",
+      answer: "hunter2",
+    });
+    expect(resubmitWhileWaiting.state).toEqual(waiting.state);
+    expect(resubmitWhileWaiting.effects).toEqual([]);
+
+    const checking = reduce(waiting.state, {
+      type: "prompt",
+      text: "Password:",
+      secret: true,
+    });
+    expect(checking.state.phase).toBe("checking");
+
+    const resubmitWhileChecking = reduce(checking.state, {
+      type: "submit",
+      answer: "hunter2",
+    });
+    expect(resubmitWhileChecking.state).toEqual(checking.state);
+    expect(resubmitWhileChecking.effects).toEqual([]);
+  });
+
   it("does not retry on its own after a failure", () => {
     // Restarting here would clear the message saying why it failed, and
     // against pam_faillock each attempt can extend the lock.

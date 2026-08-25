@@ -797,4 +797,24 @@ mod tests {
         assert_eq!(env_of(&launch.env, "LANG").as_deref(), Some("de_DE.UTF-8"));
         assert_eq!(env_of(&launch.env, "XDG_VTNR").as_deref(), Some("7"));
     }
+
+    #[test]
+    fn cstring_refuses_a_nul_byte_in_the_path() {
+        // A NUL-poisoned passwd home dir must be refused, not silently
+        // truncated at the NUL by the C string conversion `spawn` relies on.
+        use std::os::unix::ffi::OsStrExt;
+
+        let poisoned = std::ffi::OsStr::from_bytes(b"/home/evil\0/etc/shadow").to_owned();
+        let err = cstring(poisoned, "evil").unwrap_err();
+        assert!(matches!(err, LaunchError::NulInPath(_)), "{err:?}");
+    }
+
+    #[test]
+    fn supplementary_groups_refuses_a_nul_byte_in_the_username() {
+        // Otherwise getgrouplist would resolve groups for a different,
+        // shorter name than the one that authenticated.
+        let err = supplementary_groups("evil\0user", 1000).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("NUL"), "{err}");
+    }
 }

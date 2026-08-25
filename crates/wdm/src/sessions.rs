@@ -485,4 +485,46 @@ mod tests {
         let found = scan_dir(dir.path(), SessionType::Wayland, &["de".to_owned()]);
         assert_eq!(found[0].name, "Arbeitsfläche");
     }
+
+    #[test]
+    fn entry_whose_exec_is_only_field_codes_is_skipped() {
+        // Exec is non-empty before strip_field_codes runs, so the "entry has no
+        // Exec key" check alone would let this through; only the post-strip
+        // emptiness check catches it. Covers the one place the two checks compose.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fieldcodes.desktop"),
+            "[Desktop Entry]\nName=Broken\nExec=%f\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("good.desktop"),
+            "[Desktop Entry]\nName=Good\nExec=river\n",
+        )
+        .unwrap();
+        let found = scan_dir(dir.path(), SessionType::Wayland, &[]);
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].name, "Good");
+    }
+
+    #[test]
+    fn a_syntactically_broken_desktop_file_is_skipped_not_fatal() {
+        // A file the parser rejects outright (here: no [Desktop Entry] group
+        // header, so every key-value pair is "without a group") must not take
+        // down the whole scan; the sibling entry is still returned.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("broken.desktop"),
+            "Name=Broken\nExec=broken\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("good.desktop"),
+            "[Desktop Entry]\nName=Good\nExec=river\n",
+        )
+        .unwrap();
+        let found = scan_dir(dir.path(), SessionType::Wayland, &[]);
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].name, "Good");
+    }
 }

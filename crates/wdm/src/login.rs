@@ -2286,4 +2286,162 @@ mod tests {
             "the surviving greeter stopped receiving events"
         );
     }
+
+    /// Assert `client` was sent exactly the given protocol error on the
+    /// greeter object, after a dispatch has had the chance to flush it.
+    fn expect_protocol_error(client: &wire::Client, code: wdm_greeter_v1::Error) {
+        let error = client
+            .events()
+            .iter()
+            .find(|m| m.object == wire::DISPLAY && m.opcode == wire::DISPLAY_ERROR)
+            .expect("no protocol error was posted");
+        let mut args = error.args();
+        assert_eq!(args.uint(), wire::GREETER, "the error named another object");
+        assert_eq!(args.uint(), code as u32, "posted the wrong error code");
+    }
+
+    #[test]
+    fn a_second_create_session_while_authenticating_is_a_protocol_error() {
+        // The XML mandates auth_in_progress for a create_session that arrives
+        // while a conversation is already running — checked first, ahead of
+        // the rate limit, because a deferred auth_failed is not a substitute
+        // for a protocol error the client is required to see.
+        for phase in [Phase::Authenticating, Phase::Launching] {
+            let mut h = Harness::new(vec![test_user("")], None);
+            let mut client = h.bind_greeter(2);
+            let resource = h.state.login.bound[0].clone();
+
+            h.state.login.phase = phase;
+            h.state.create_session(&resource, "testuser".to_owned());
+            h.dispatch();
+            client.pump();
+
+            expect_protocol_error(&client, wdm_greeter_v1::Error::AuthInProgress);
+        }
+    }
+
+    #[test]
+    fn respond_with_no_conversation_in_progress_is_a_protocol_error() {
+        // respond has nothing to answer when the phase is Idle: no attempt
+        // was ever started for it to be a stale reply to.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        assert_eq!(h.state.login.phase, Phase::Idle);
+        h.state.respond(&resource, 7, "hunter2".to_owned());
+        h.dispatch();
+        client.pump();
+
+        expect_protocol_error(&client, wdm_greeter_v1::Error::NoAuth);
+    }
+
+    #[test]
+    fn respond_with_a_stale_prompt_id_is_a_protocol_error() {
+        // An id that does not match the one prompt outstanding must not be
+        // forwarded to PAM as if it were the answer to it.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.phase = Phase::Authenticating;
+        h.state.login.pending_prompt = Some(7);
+        h.state.respond(&resource, 42, "hunter2".to_owned());
+        h.dispatch();
+        client.pump();
+
+        expect_protocol_error(&client, wdm_greeter_v1::Error::StalePrompt);
+    }
+
+    #[test]
+    fn start_session_before_authenticating_is_a_protocol_error() {
+        // start_session is only meaningful once auth_ok has been delivered;
+        // a greeter that skips straight to it gets no_auth, not a session.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        assert_eq!(h.state.login.phase, Phase::Idle);
+        h.state
+            .start_session(&resource, "sway.desktop".to_owned(), Vec::new());
+        h.dispatch();
+        client.pump();
+
+        expect_protocol_error(&client, wdm_greeter_v1::Error::NoAuth);
+    }
+
+    #[test]
+    fn start_session_with_an_unadvertised_session_id_is_a_protocol_error() {
+        // A session id the greeter was never enumerated must not be
+        // launchable just because the string happens to arrive.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.phase = Phase::Authenticated;
+        assert!(h.state.login.sessions.is_empty());
+        h.state
+            .start_session(&resource, "no-such.desktop".to_owned(), Vec::new());
+        h.dispatch();
+        client.pump();
+
+        expect_protocol_error(&client, wdm_greeter_v1::Error::InvalidSession);
+    }
+
+    #[test]
+    fn start_session_with_undecodable_env_bytes_is_a_protocol_error() {
+        // The env array is untrusted greeter input; an entry decode rejects
+        // — here, one with no '=' separator — must not reach Launch::build.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.phase = Phase::Authenticated;
+        h.state.login.sessions.push(crate::sessions::Session {
+            id: "sway.desktop".to_owned(),
+            name: "Sway".to_owned(),
+            exec: "sway".to_owned(),
+            session_type: crate::sessions::SessionType::Wayland,
+            path: PathBuf::from("/nonexistent/sway.desktop"),
+        });
+
+        let bad_env = b"NOSEPARATOR\0".to_vec();
+        h.state
+            .start_session(&resource, "sway.desktop".to_owned(), bad_env);
+        h.dispatch();
+        client.pump();
+
+        expect_protocol_error(&client, wdm_greeter_v1::Error::InvalidEnv);
+    }
+
+    #[test]
+    fn create_session_after_auth_ok_restarts_rather_than_errors() {
+        // The XML never requires cancel after auth_ok, so a greeter backing
+        // out to pick a different account must be treated as an implicit
+        // cancel, not punished with auth_in_progress.
+        let mut h = Harness::new(vec![test_user("")], None);
+        let mut client = h.bind_greeter(2);
+        let resource = h.state.login.bound[0].clone();
+
+        h.state.login.phase = Phase::Authenticated;
+        // Force the too_soon gate so the call defers rather than reaching
+        // AuthHandle::start, which would spawn a real PAM helper process.
+        h.state.login.last_attempt = Some(Instant::now());
+        h.state.create_session(&resource, "testuser".to_owned());
+        h.dispatch();
+        client.pump();
+
+        assert_ne!(
+            h.state.login.phase,
+            Phase::Authenticated,
+            "create_session after auth_ok left the conversation as it was"
+        );
+        assert!(
+            !client
+                .events()
+                .iter()
+                .any(|m| m.object == wire::DISPLAY && m.opcode == wire::DISPLAY_ERROR),
+            "create_session after auth_ok was treated as a protocol error"
+        );
+    }
 }

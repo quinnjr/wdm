@@ -1366,4 +1366,37 @@ mod tests {
         // normal user and make `--backend winit` unusable.
         assert!(greeter("/bin/true").credentials.is_none());
     }
+
+    #[test]
+    fn spawn_refuses_once_the_greeter_has_given_up() {
+        // Once policy has given up, spawn() must not be talked back into
+        // trying again — that would resurrect a greeter the backoff table
+        // already decided to stop restarting.
+        let mut g = Greeter::new("/nonexistent/greeter", "nobody", "wayland-test", false).unwrap();
+
+        assert!(g.spawn().is_err());
+        g.note_spawn_failure("no such file");
+        g.note_spawn_failure("no such file");
+        assert!(matches!(
+            g.note_spawn_failure("no such file"),
+            Disposition::GaveUp { .. }
+        ));
+        assert!(g.gave_up());
+
+        assert!(matches!(g.spawn(), Err(GreeterError::GaveUp)));
+    }
+
+    #[test]
+    fn spawn_refuses_while_a_child_is_already_running() {
+        // A second spawn() over a live child would overwrite the handle and
+        // orphan the running process: nothing would ever kill or reap it.
+        let mut g = greeter("/bin/sleep 60");
+        g.spawn().unwrap();
+        assert!(g.is_running());
+
+        assert!(matches!(g.spawn(), Err(GreeterError::AlreadyRunning)));
+
+        g.kill();
+        assert!(!g.is_running());
+    }
 }

@@ -1503,4 +1503,40 @@ mod tests {
             &theme
         ));
     }
+
+    #[test]
+    fn parse_hex_color_rejects_malformed_colours() {
+        // Shape this parser is meant to accept: '#' plus six hex digits.
+        assert!(parse_hex_color("#1a2b3c").is_some());
+
+        // Wrong length, invalid hex digits, and no '#' at all — all rejected
+        // rather than partially parsed or panicking on a bad slice index.
+        assert_eq!(parse_hex_color("#abc"), None);
+        assert_eq!(parse_hex_color("#gggggg"), None);
+        assert_eq!(parse_hex_color("no-hash"), None);
+    }
+
+    #[test]
+    fn behind_page_color_falls_back_to_the_scheme_when_the_configured_colour_is_bad() {
+        // config::parse validates `background`, so the only way to reach
+        // behind_page_color's own fallback is to construct a Config directly
+        // with a colour that parse_hex_color refuses — the fields are pub for
+        // exactly this: it stays a pure function of its argument, not a
+        // second opinion about validation.
+        let mut greeter_config = config::Config {
+            color_scheme: Some(config::ColorScheme::Light),
+            background: Some(config::Background::Color("not-a-colour".to_owned())),
+            ..Default::default()
+        };
+        assert_eq!(
+            behind_page_color(&greeter_config),
+            gtk4::gdk::RGBA::new(0.91, 0.92, 0.94, 1.0)
+        );
+
+        greeter_config.color_scheme = Some(config::ColorScheme::Dark);
+        assert_eq!(
+            behind_page_color(&greeter_config),
+            gtk4::gdk::RGBA::new(0.07, 0.07, 0.10, 1.0)
+        );
+    }
 }

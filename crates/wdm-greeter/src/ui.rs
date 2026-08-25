@@ -1125,4 +1125,19 @@ mod tests {
         image.draw_cover(&mut small_again);
         assert_eq!(small.data, small_again.data);
     }
+
+    #[test]
+    fn a_corrupt_png_is_an_error_not_a_blank_wallpaper() {
+        // An administrator's file that exists and is readable but cannot be
+        // decoded is a startup error, never a silent fallback.
+        let dir = std::env::temp_dir().join(format!("wdm-greeter-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bg.png");
+        std::fs::write(&path, b"not a png").unwrap();
+
+        let err = Image::load_png(&path).unwrap_err();
+        assert!(err.contains("bg.png"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

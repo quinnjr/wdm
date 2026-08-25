@@ -782,4 +782,23 @@ mod tests {
         let after = unsafe { std::slice::from_raw_parts(ptr, len) };
         assert_ne!(after, b"correct horse", "the secret survived the drop");
     }
+
+    #[test]
+    fn an_invalid_prompt_style_byte_is_refused() {
+        // style_from_tag only maps 0..=3; a style that decoded as Secret
+        // (tag 0) when it was not would hide an explanation behind a
+        // password box. An out-of-range byte must not be guessed into any
+        // style at all.
+        let mut bytes = vec![TAG_PROMPT];
+        put_u32(&mut bytes, 9);
+        put_str(&mut bytes, "Password: ");
+        bytes.push(4);
+        assert!(Msg::decode(&bytes).is_none());
+
+        let mut bytes = vec![TAG_PROMPT];
+        put_u32(&mut bytes, 9);
+        put_str(&mut bytes, "Password: ");
+        bytes.push(255);
+        assert!(Msg::decode(&bytes).is_none());
+    }
 }
