@@ -5,6 +5,25 @@ Notable changes to wdm. Format follows [Keep a Changelog]; versions follow
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-08-25
+
+The WebKit greeter's session dropdown now keeps the entry you click on.
+
+### Fixed
+
+- wdm delivered every pointer and touch event to the greeter's layer surface,
+  whatever was under the cursor. A `<select>` menu in the WebKit greeter is an
+  `xdg_popup` under a popup grab, and the grab forwards a click to whichever
+  surface wdm names as the focus — so the client saw a press on the page
+  *beneath* its open menu, dismissed it, and the dropdown snapped back to the
+  previous session. The chosen session never reached wdm. Popups are now
+  hit-tested first, with the layer surface as the fallback, the same order
+  smithay's own `LayerSurface` uses; touch goes through the same path.
+- Popups were drawn at their geometry's position rather than their surface's.
+  GTK4 popovers keep their shadow inside the surface, so the visible menu sat a
+  shadow-margin down-right of where the client placed it. Rendering and
+  hit-testing now share one `popup_origin`, so they cannot disagree.
+
 ## [0.10.1] — 2026-08-25
 
 The session you pick on the WebKit greeter's login screen is the one that
@@ -729,7 +748,8 @@ the loginable uid range are refused at launch even when PAM authenticates them.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/quinnjr/wdm/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/quinnjr/wdm/releases/tag/v0.10.2
 [0.10.1]: https://github.com/quinnjr/wdm/releases/tag/v0.10.1
 [0.10.0]: https://github.com/quinnjr/wdm/releases/tag/v0.10.0
 [0.9.0]: https://github.com/quinnjr/wdm/releases/tag/v0.9.0
