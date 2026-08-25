@@ -9,12 +9,14 @@ use smithay::backend::input::{
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     TouchEvent,
 };
+use smithay::desktop::utils::under_from_surface_tree;
+use smithay::desktop::{PopupManager, WindowSurfaceType};
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::input::touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent};
 use smithay::utils::SERIAL_COUNTER;
 
-use crate::comp::Wdm;
+use crate::comp::{Wdm, popup_origin};
 
 /// A VT switch request the compositor must act on.
 ///
@@ -41,7 +43,7 @@ pub fn handle<B: InputBackend>(state: &mut Wdm, event: InputEvent<B>) -> Option<
             // last known location.
             let location = pointer.current_location() + event.delta();
             let location = clamp_to_output(state, location);
-            let focus = focus_under(state);
+            let focus = focus_under(state, location);
 
             pointer.motion(
                 state,
@@ -69,7 +71,7 @@ pub fn handle<B: InputBackend>(state: &mut Wdm, event: InputEvent<B>) -> Option<
             let size = output_size(state)?;
 
             let location = event.position_transformed(size);
-            let focus = focus_under(state);
+            let focus = focus_under(state, location);
 
             pointer.motion(
                 state,
@@ -136,14 +138,15 @@ pub fn handle<B: InputBackend>(state: &mut Wdm, event: InputEvent<B>) -> Option<
         InputEvent::TouchDown { event } => {
             let touch = state.seat.get_touch()?;
             let size = output_size(state)?;
-            let focus = focus_under(state);
+            let location = event.position_transformed(size);
+            let focus = focus_under(state, location);
 
             touch.down(
                 state,
                 focus,
                 &DownEvent {
                     slot: event.slot(),
-                    location: event.position_transformed(size),
+                    location,
                     serial: SERIAL_COUNTER.next_serial(),
                     time: event.time_msec(),
                 },
@@ -154,13 +157,14 @@ pub fn handle<B: InputBackend>(state: &mut Wdm, event: InputEvent<B>) -> Option<
         InputEvent::TouchMotion { event } => {
             let touch = state.seat.get_touch()?;
             let size = output_size(state)?;
+            let location = event.position_transformed(size);
 
             touch.motion(
                 state,
-                focus_under(state),
+                focus_under(state, location),
                 &TouchMotionEvent {
                     slot: event.slot(),
-                    location: event.position_transformed(size),
+                    location,
                     time: event.time_msec(),
                 },
             );
@@ -253,20 +257,44 @@ fn vt_for(modifiers: &ModifiersState, keysym: Keysym) -> Option<i32> {
     None
 }
 
-/// The surface pointer and touch events should go to.
+/// The surface pointer and touch events should go to, and where it starts.
+///
+/// Popups first: an `xdg_popup` is its own surface, drawn on top of the
+/// greeter, so a point inside one belongs to it and not to the layer surface
+/// underneath. Delivering the click to the layer surface instead is not merely
+/// a miss — under a popup grab the client sees a press outside its menu and
+/// dismisses it, which is why a `<select>` in the WebKit greeter used to open,
+/// take the click, and snap back to the previous choice.
+///
+/// The layer surface fills its output from the origin, so it is the fallback
+/// for anything not over a popup.
 fn focus_under(
     state: &Wdm,
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
 ) -> Option<(
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     smithay::utils::Point<f64, smithay::utils::Logical>,
 )> {
     let primary = state.outputs.first();
-    state
+    let layer = state
         .layers
         .iter()
         .find(|l| primary.is_some() && l.output.as_ref() == primary)
-        .or_else(|| state.layers.last())
-        .map(|l| (l.surface.wl_surface().clone(), (0.0, 0.0).into()))
+        .or_else(|| state.layers.last())?;
+    let parent = layer.surface.wl_surface();
+
+    for (popup, offset) in PopupManager::popups_for_surface(parent) {
+        if let Some((surface, origin)) = under_from_surface_tree(
+            popup.wl_surface(),
+            location,
+            popup_origin(offset, popup.geometry().loc),
+            WindowSurfaceType::ALL,
+        ) {
+            return Some((surface, origin.to_f64()));
+        }
+    }
+
+    Some((parent.clone(), (0.0, 0.0).into()))
 }
 
 /// The primary output's logical size.
