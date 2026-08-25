@@ -242,7 +242,9 @@ const start = () => {
   replaceText("message", "");
   replaceText("error", "");
   el("prompt").textContent = "Waiting…";
-  selectPreferredSession();
+  // Not selectPreferredSession(): the dropdown holds what the user chose,
+  // and authentication_complete starts whatever it holds. Re-preselecting
+  // here silently sent last time's session instead.
   wdm.authenticate(el("user").value);
 };
 

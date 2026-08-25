@@ -1368,6 +1368,38 @@ mod tests {
     }
 
     #[test]
+    fn the_hand_written_themes_send_the_session_the_user_chose() {
+        // The dropdown is preselected from history and the configured default,
+        // and `ready()` — the "your move" state — is the right place for that.
+        // `start()` is not: it runs from the submit handler, *after* the user
+        // has had the dropdown, and a preselection there silently replaces
+        // what they picked with what they picked last time, before
+        // authentication_complete reads the dropdown to start the session. The
+        // symptom is a choice that is never persisted, because it was never
+        // sent: wdm records what it launches, and it launched the old one.
+        //
+        // Pattern-matched for the same reason as the lockout guards above. The
+        // React theme's reducer is held to this by machine.test.js.
+        for theme in shipped_themes() {
+            if !matches!(theme.coverage, Coverage::Grep) {
+                continue;
+            }
+            let name = theme.name;
+            let start = theme
+                .code
+                .split_once("const start = ")
+                .unwrap_or_else(|| panic!("the {name} theme has no start()"))
+                .1;
+            let start_body = &start[..start.find("\n};").unwrap_or(start.len())];
+            assert!(
+                !start_body.contains("selectPreferredSession("),
+                "the {name} theme re-preselects the session from start(), discarding \
+                 the one the user chose in the dropdown"
+            );
+        }
+    }
+
+    #[test]
     fn every_asset_a_theme_references_is_present_in_it() {
         // A theme is installed by copying a list of files, and that list is
         // written by hand in three packaging files. Forgetting one does not
